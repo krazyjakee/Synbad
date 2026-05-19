@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="Synbad" width="520">
+</p>
+
 # Contributing to Synbad
 
 Thanks for your interest! Synbad is early-stage; the most useful contributions

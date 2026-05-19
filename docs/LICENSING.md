@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="../assets/logo.svg" alt="Synbad" width="520">
+</p>
+
 # Licensing & Trademark
 
 > Working notes, not legal advice. Have the final license choice and the Core's

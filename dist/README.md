@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="../assets/logo.svg" alt="Synbad" width="520">
+</p>
+
 # Packaging & autostart
 
 Per-platform installers that build Synbad and wire `synbadd` to start

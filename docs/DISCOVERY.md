@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="../assets/logo.svg" alt="Synbad" width="520">
+</p>
+
 # LAN Auto-Discovery
 
 > Independent, open implementation. The Synergy 3 discovery service is

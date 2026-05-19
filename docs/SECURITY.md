@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="../assets/logo.svg" alt="Synbad" width="520">
+</p>
+
 # Security model
 
 This document describes what Synbad protects against, what it *doesn't*

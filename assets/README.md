@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" alt="Synbad" width="520">
+</p>
+
 # Synbad brand assets
 
 Vector masters live here; raster outputs are generated on demand by

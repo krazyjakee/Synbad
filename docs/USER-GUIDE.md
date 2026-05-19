@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="../assets/logo.svg" alt="Synbad" width="520">
+</p>
+
 # Synbad user guide
 
 A walkthrough for installing Synbad, pairing two machines, and sharing

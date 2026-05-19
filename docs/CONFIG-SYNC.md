@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="../assets/logo.svg" alt="Synbad" width="520">
+</p>
+
 # LAN Config Sync
 
 > Independent, open implementation. Peer-to-peer over the LAN, no cloud, no

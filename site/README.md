@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="../assets/logo.svg" alt="Synbad" width="520">
+</p>
+
 # Landing page
 
 Static site for `https://krazyjakee.github.io/Synbad/`, deployed by

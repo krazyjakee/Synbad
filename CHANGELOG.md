@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="Synbad" width="520">
+</p>
+
 # Changelog
 
 All notable changes to Synbad land here. Format follows
