@@ -594,8 +594,8 @@ fn extract_7z_to(asset_bytes: &[u8], dest: &Path) -> Result<()> {
         }
         let name = entry.name().to_string();
         if name.ends_with("deskflow-core.exe") || name.ends_with("deskflow-core") {
-            let mut out = std::fs::File::create(dest).map_err(sevenz_rust2::Error::io)?;
-            std::io::copy(reader, &mut out).map_err(sevenz_rust2::Error::io)?;
+            let mut out = std::fs::File::create(dest)?;
+            std::io::copy(reader, &mut out)?;
             found = true;
         }
         Ok(true)

@@ -28,6 +28,11 @@ All notable changes to Synbad land here. Format follows
 - Audit workflow scoped to `main`/`master` so it doesn't double-fire on
   dependabot branch pushes.
 
+### Fixed
+- Windows release build: `synbadd`'s `sevenz` feature called
+  `sevenz_rust2::Error::io`, which is `pub(crate)` in 0.18.0. Replaced with
+  `?` (the crate's public `From<std::io::Error>` impl).
+
 ## [0.1.0] - TBD
 
 Initial public scaffold. See [docs/ROADMAP.md](docs/ROADMAP.md) for the phase
