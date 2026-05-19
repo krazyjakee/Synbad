@@ -32,7 +32,7 @@ ar = "0.9"
 tar = "0.4"
 ruzstd = "0.7"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-sevenz-rust2 = { version = "0.18", optional = true }
+sevenz-rust2 = { version = "0.21", optional = true }
 
 [features]
 default = []
