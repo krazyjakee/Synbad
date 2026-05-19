@@ -164,7 +164,10 @@ impl VersionedConfig {
     /// `(counter=1, origin)` stamp so peers that have never edited any
     /// field also have an unambiguous owner for tiebreaks.
     pub fn initial(config: Config, origin: &str) -> Self {
-        let stamp = LamportTime { counter: 1, origin: origin.to_string() };
+        let stamp = LamportTime {
+            counter: 1,
+            origin: origin.to_string(),
+        };
         VersionedConfig {
             config,
             stamps: FieldStamps::all(stamp),
@@ -176,19 +179,35 @@ impl VersionedConfig {
     /// from disk; the stamps may be partially defaulted if the sidecar is
     /// older than the current schema.
     pub fn from_parts(config: Config, stamps: FieldStamps, clock: u64) -> Self {
-        VersionedConfig { config, stamps, clock }
+        VersionedConfig {
+            config,
+            stamps,
+            clock,
+        }
     }
 
-    /// SHA-256 over the canonical JSON of `(config, stamps)`. Two peers
-    /// running the same schema produce identical hashes for identical
-    /// state. Truncated to 16 hex chars for human-readable TXT records;
-    /// callers that need full collision resistance should use the full
-    /// hash directly.
+    /// SHA-256 over the canonical JSON of the *shared* subset of the
+    /// config (the layout fields that get LWW-merged across peers, plus
+    /// their stamps). Two peers that have converged on the shared layout
+    /// produce identical hashes regardless of their local `role`,
+    /// `server_name`, etc. — otherwise discovery-driven sync would loop
+    /// forever, since per-machine fields differ by definition.
+    ///
+    /// Truncated to 16 hex chars for human-readable TXT records; callers
+    /// that need full collision resistance should use the full hash
+    /// directly.
     pub fn head_hash(&self) -> String {
-        let bytes = match serde_json::to_vec(&HashInput {
-            config: &self.config,
-            stamps: &self.stamps,
-        }) {
+        let shared = SharedHashInput {
+            port: self.config.port,
+            screens: &self.config.screens,
+            links: &self.config.links,
+            options: &self.config.options,
+            port_stamp: &self.stamps.port,
+            screens_stamp: &self.stamps.screens,
+            links_stamp: &self.stamps.links,
+            options_stamp: &self.stamps.options,
+        };
+        let bytes = match serde_json::to_vec(&shared) {
             Ok(b) => b,
             Err(_) => return String::new(),
         };
@@ -208,7 +227,10 @@ impl VersionedConfig {
         // every changed field gets the same Lamport stamp, which is fine
         // because a single user action is atomic from our point of view.
         self.clock = self.clock.max(self.stamps.max_counter()) + 1;
-        let stamp = LamportTime { counter: self.clock, origin: origin.to_string() };
+        let stamp = LamportTime {
+            counter: self.clock,
+            origin: origin.to_string(),
+        };
 
         if self.config.role != new_config.role {
             self.stamps.role = stamp.clone();
@@ -242,40 +264,42 @@ impl VersionedConfig {
         true
     }
 
-    /// Merge `other` into `self` using per-field LWW. Returns
-    /// [`MergeOutcome::NoChange`] if all of `other`'s stamps were
-    /// dominated by ours — i.e. `other` brought us nothing new.
+    /// Merge `other` into `self` using per-field LWW for *shared* fields
+    /// only. Returns [`MergeOutcome::NoChange`] if all of `other`'s stamps
+    /// for the shared fields were dominated by ours — i.e. `other` brought
+    /// us nothing new.
+    ///
+    /// ### Shared vs per-machine fields
+    ///
+    /// Only the layout (`screens`, `links`, `options`) and the Synergy
+    /// `port` are merged. Every other field describes the *local machine*
+    /// and must never be overwritten by a peer:
+    ///
+    /// * `role` — what this machine does (server vs client).
+    /// * `server_name` — the screen name this machine advertises (which
+    ///   screen in `screens` it actually *is*).
+    /// * `server_address` — only meaningful when this machine is a client.
+    ///   Syncing it would point a server at itself.
+    /// * `service_port` — the local synbad daemon's pairing port.
+    /// * `binaries.core` — a local filesystem path to the Core executable.
+    ///
+    /// We still keep the stamps for these fields in [`FieldStamps`] so
+    /// existing sidecars deserialize unchanged, but they're never compared
+    /// against `other`'s stamps and never applied.
     pub fn merge(&mut self, other: &VersionedConfig) -> MergeOutcome {
         // Lamport rule: receiving a message advances our clock past the
         // peer's so subsequent local edits get a stamp higher than
-        // anything we've ever observed.
+        // anything we've ever observed. We use the peer's full stamp range
+        // (including stamps for per-machine fields) so a peer that later
+        // promotes itself to gossip more fields can't suddenly produce
+        // stamps lower than ours.
         self.clock = self.clock.max(other.clock).max(other.stamps.max_counter());
 
         let mut changed = false;
 
-        if other.stamps.role > self.stamps.role {
-            self.config.role = other.config.role;
-            self.stamps.role = other.stamps.role.clone();
-            changed = true;
-        }
-        if other.stamps.server_name > self.stamps.server_name {
-            self.config.server_name = other.config.server_name.clone();
-            self.stamps.server_name = other.stamps.server_name.clone();
-            changed = true;
-        }
-        if other.stamps.server_address > self.stamps.server_address {
-            self.config.server_address = other.config.server_address.clone();
-            self.stamps.server_address = other.stamps.server_address.clone();
-            changed = true;
-        }
         if other.stamps.port > self.stamps.port {
             self.config.port = other.config.port;
             self.stamps.port = other.stamps.port.clone();
-            changed = true;
-        }
-        if other.stamps.service_port > self.stamps.service_port {
-            self.config.service_port = other.config.service_port;
-            self.stamps.service_port = other.stamps.service_port.clone();
             changed = true;
         }
         if other.stamps.screens > self.stamps.screens {
@@ -291,11 +315,6 @@ impl VersionedConfig {
         if other.stamps.options > self.stamps.options {
             self.config.options = other.config.options.clone();
             self.stamps.options = other.stamps.options.clone();
-            changed = true;
-        }
-        if other.stamps.binaries > self.stamps.binaries {
-            self.config.binaries = other.config.binaries.clone();
-            self.stamps.binaries = other.stamps.binaries.clone();
             changed = true;
         }
 
@@ -317,7 +336,10 @@ impl VersionedConfig {
         match fs::read(path) {
             Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(VersionedConfigError::Io { path: path.into(), source }),
+            Err(source) => Err(VersionedConfigError::Io {
+                path: path.into(),
+                source,
+            }),
         }
     }
 
@@ -360,11 +382,18 @@ pub struct SideCar {
 
 /// Helper struct used only for stable hash-input ordering. Field order
 /// here defines the canonical serialization for `head_hash`; do not
-/// reorder without bumping the protocol version.
+/// reorder without bumping the protocol version. Only the shared fields
+/// appear here — see [`VersionedConfig::head_hash`].
 #[derive(Serialize)]
-struct HashInput<'a> {
-    config: &'a Config,
-    stamps: &'a FieldStamps,
+struct SharedHashInput<'a> {
+    port: u16,
+    screens: &'a [synbad_config::Screen],
+    links: &'a [synbad_config::Link],
+    options: &'a std::collections::BTreeMap<String, String>,
+    port_stamp: &'a LamportTime,
+    screens_stamp: &'a LamportTime,
+    links_stamp: &'a LamportTime,
+    options_stamp: &'a LamportTime,
 }
 
 #[cfg(test)]
@@ -399,14 +428,24 @@ mod tests {
             aliases: vec![],
             position: GridPosition::default(),
         });
-        c.links.push(Link { from: "alpha".into(), side: Side::Right, to: "beta".into() });
+        c.links.push(Link {
+            from: "alpha".into(),
+            side: Side::Right,
+            to: "beta".into(),
+        });
         c
     }
 
     #[test]
     fn lamport_order_breaks_ties_by_origin() {
-        let a = LamportTime { counter: 5, origin: "aaa".into() };
-        let b = LamportTime { counter: 5, origin: "bbb".into() };
+        let a = LamportTime {
+            counter: 5,
+            origin: "aaa".into(),
+        };
+        let b = LamportTime {
+            counter: 5,
+            origin: "bbb".into(),
+        };
         assert!(a < b);
         assert!(b > a);
     }
@@ -421,9 +460,15 @@ mod tests {
         let new = config_b();
         assert!(v.apply_local(new, "alpha-id"));
 
-        assert_eq!(v.stamps.role, role_before, "untouched fields keep their stamps");
+        assert_eq!(
+            v.stamps.role, role_before,
+            "untouched fields keep their stamps"
+        );
         assert!(v.stamps.screens > screens_before, "changed field bumps");
-        assert!(v.stamps.links > screens_before, "links also changed → bumped");
+        assert!(
+            v.stamps.links > screens_before,
+            "links also changed → bumped"
+        );
     }
 
     #[test]
@@ -437,11 +482,12 @@ mod tests {
             origin: "beta-id".into(),
         });
 
-        // Alpha edits server_name; Beta independently adds a screen.
+        // Alpha edits a layout option; Beta independently adds a screen.
+        // Both edits touch shared fields, so both should propagate.
         let mut alpha_edit = alpha.config.clone();
-        alpha_edit.server_name = "alpha-renamed".into();
-        // server_name must also match a screen for validate() to pass,
-        // but we're testing merge directly so skip validation.
+        alpha_edit
+            .options
+            .insert("heartbeat".into(), "5000".into());
         assert!(alpha.apply_local(alpha_edit, "alpha-id"));
         assert!(beta.apply_local(config_b(), "beta-id"));
 
@@ -451,11 +497,87 @@ mod tests {
         assert_eq!(alpha.merge(&beta), MergeOutcome::Updated);
         assert_eq!(beta.merge(&alpha_pre), MergeOutcome::Updated);
 
-        assert_eq!(alpha.config.server_name, "alpha-renamed");
+        assert_eq!(
+            alpha.config.options.get("heartbeat").map(String::as_str),
+            Some("5000")
+        );
         assert_eq!(alpha.config.screens.len(), 2);
-        assert_eq!(beta.config.server_name, "alpha-renamed");
+        assert_eq!(
+            beta.config.options.get("heartbeat").map(String::as_str),
+            Some("5000")
+        );
         assert_eq!(beta.config.screens.len(), 2);
         assert_eq!(alpha.head_hash(), beta.head_hash(), "converged hashes");
+    }
+
+    /// `role`, `server_name`, `server_address`, `service_port`, and
+    /// `binaries.core` describe the local machine and must never be
+    /// overwritten by a peer. A LAN sync against an opinionated peer used
+    /// to flip a client into a server (and vice versa) — this guards
+    /// against that regression.
+    #[test]
+    fn merge_does_not_overwrite_per_machine_fields() {
+        // Local machine is a client pointing at an explicit server.
+        let mut local = VersionedConfig::initial(
+            Config {
+                role: NodeRole::Client,
+                server_name: "local-host".into(),
+                server_address: Some("homeserver.local".into()),
+                service_port: 24850,
+                binaries: BinaryPaths {
+                    core: Some(std::path::PathBuf::from("/opt/local/deskflow-core")),
+                },
+                ..config_a()
+            },
+            "local-id",
+        );
+
+        // Peer pushes a contradictory state: it's a server, it has its own
+        // name, a different service port, and an absolute binary path that
+        // only exists on its own machine.
+        let mut peer = VersionedConfig::initial(
+            Config {
+                role: NodeRole::Server,
+                server_name: "peer-host".into(),
+                server_address: None,
+                service_port: 24890,
+                binaries: BinaryPaths {
+                    core: Some(std::path::PathBuf::from("/Users/peer/deskflow")),
+                },
+                ..config_b()
+            },
+            "peer-id",
+        );
+        // Peer also bumps every field on its side so its stamps dominate
+        // any naive comparison.
+        peer.apply_local(
+            Config {
+                options: {
+                    let mut o = BTreeMap::new();
+                    o.insert("relativeMouseMoves".into(), "true".into());
+                    o
+                },
+                ..peer.config.clone()
+            },
+            "peer-id",
+        );
+
+        local.merge(&peer);
+
+        // Per-machine fields stayed put.
+        assert_eq!(local.config.role, NodeRole::Client);
+        assert_eq!(local.config.server_name, "local-host");
+        assert_eq!(local.config.server_address.as_deref(), Some("homeserver.local"));
+        assert_eq!(local.config.service_port, 24850);
+        assert_eq!(
+            local.config.binaries.core.as_deref(),
+            Some(std::path::Path::new("/opt/local/deskflow-core"))
+        );
+        // Shared layout *did* merge across.
+        assert_eq!(
+            local.config.options.get("relativeMouseMoves").map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]
@@ -472,23 +594,23 @@ mod tests {
         let mut alpha = VersionedConfig::initial(config_a(), "alpha-id");
         let mut beta = VersionedConfig::initial(config_a(), "beta-id");
 
-        // Both edit `server_name` from the same start state — counters will
-        // collide, origin breaks the tie. With `alpha-id < beta-id`, beta
-        // wins.
+        // Both edit `port` (a shared field) from the same start state —
+        // counters will collide, origin breaks the tie. With
+        // `alpha-id < beta-id`, beta wins.
         let mut a_edit = alpha.config.clone();
-        a_edit.server_name = "from-alpha".into();
+        a_edit.port = 33001;
         let mut b_edit = beta.config.clone();
-        b_edit.server_name = "from-beta".into();
+        b_edit.port = 33002;
         alpha.apply_local(a_edit, "alpha-id");
         beta.apply_local(b_edit, "beta-id");
-        assert_eq!(alpha.stamps.server_name.counter, beta.stamps.server_name.counter);
+        assert_eq!(alpha.stamps.port.counter, beta.stamps.port.counter);
 
         let alpha_pre = alpha.clone();
         alpha.merge(&beta);
         beta.merge(&alpha_pre);
 
-        assert_eq!(alpha.config.server_name, "from-beta");
-        assert_eq!(beta.config.server_name, "from-beta");
+        assert_eq!(alpha.config.port, 33002);
+        assert_eq!(beta.config.port, 33002);
     }
 
     #[test]

@@ -88,7 +88,10 @@ impl Listener {
             }
         });
 
-        Ok(Listener { rx, _socket_path: owned_path })
+        Ok(Listener {
+            rx,
+            _socket_path: owned_path,
+        })
     }
 
     pub async fn next_request(&mut self) -> Option<IncomingRequest> {
@@ -114,7 +117,9 @@ async fn handle_connection(
             Err(e) => {
                 let _ = send_response(
                     &writer,
-                    Response::Error { message: format!("malformed message: {}", e) },
+                    Response::Error {
+                        message: format!("malformed message: {}", e),
+                    },
                 )
                 .await;
                 continue;
@@ -125,7 +130,9 @@ async fn handle_connection(
             _ => {
                 let _ = send_response(
                     &writer,
-                    Response::Error { message: "expected request".into() },
+                    Response::Error {
+                        message: "expected request".into(),
+                    },
                 )
                 .await;
                 continue;
@@ -173,7 +180,11 @@ async fn handle_connection(
         };
 
         if tx
-            .send(IncomingRequest { request: req, reply: reply_tx, subscribe })
+            .send(IncomingRequest {
+                request: req,
+                reply: reply_tx,
+                subscribe,
+            })
             .await
             .is_err()
         {
@@ -183,7 +194,9 @@ async fn handle_connection(
 
         let response = match reply_rx.await {
             Ok(r) => r,
-            Err(_) => Response::Error { message: "daemon dropped request".into() },
+            Err(_) => Response::Error {
+                message: "daemon dropped request".into(),
+            },
         };
         if send_response(&writer, response).await.is_err() {
             break;
@@ -195,12 +208,8 @@ async fn handle_connection(
     }
 }
 
-async fn send_response(
-    writer: &Arc<Mutex<SendHalf>>,
-    resp: Response,
-) -> std::io::Result<()> {
-    let line = json::to_string(&Message::Response(resp))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+async fn send_response(writer: &Arc<Mutex<SendHalf>>, resp: Response) -> std::io::Result<()> {
+    let line = json::to_string(&Message::Response(resp)).map_err(std::io::Error::other)?;
     let mut w = writer.lock().await;
     w.write_all(line.as_bytes()).await?;
     w.write_all(b"\n").await?;

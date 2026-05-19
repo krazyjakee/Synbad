@@ -82,11 +82,9 @@ fn pump_events(
                 full_to_id.insert(info.get_fullname().to_string(), peer.machine_id.clone());
                 Some(DiscoveryEvent::Found(peer))
             }
-            ServiceEvent::ServiceRemoved(_kind, full_name) => {
-                full_to_id
-                    .remove(&full_name)
-                    .map(|machine_id| DiscoveryEvent::Lost { machine_id })
-            }
+            ServiceEvent::ServiceRemoved(_kind, full_name) => full_to_id
+                .remove(&full_name)
+                .map(|machine_id| DiscoveryEvent::Lost { machine_id }),
             ServiceEvent::SearchStarted(_)
             | ServiceEvent::SearchStopped(_)
             | ServiceEvent::ServiceFound(_, _) => None,
@@ -112,7 +110,12 @@ fn peer_from(info: &mdns_sd::ServiceInfo) -> Option<DiscoveredPeer> {
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
 
-    let display_name = info.get_fullname().split('.').next().unwrap_or("").to_string();
+    let display_name = info
+        .get_fullname()
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_string();
 
     // Prefer the first resolved IPv4 address as the host. Fall back to the
     // hostname mDNS associates with the record so cross-platform name
@@ -124,12 +127,7 @@ fn peer_from(info: &mdns_sd::ServiceInfo) -> Option<DiscoveredPeer> {
             std::net::IpAddr::V4(v4) => Some(v4.to_string()),
             _ => None,
         })
-        .or_else(|| {
-            info.get_addresses()
-                .iter()
-                .next()
-                .map(|a| a.to_string())
-        })
+        .or_else(|| info.get_addresses().iter().next().map(|a| a.to_string()))
         .unwrap_or_else(|| info.get_hostname().to_string());
 
     // SRV port = the Synbad daemon's pairing port (what we connect to for
@@ -150,10 +148,7 @@ fn peer_from(info: &mdns_sd::ServiceInfo) -> Option<DiscoveredPeer> {
         .get_property_val_str("sync_port")
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
-    let config_head = txt
-        .get_property_val_str("cfg")
-        .unwrap_or("")
-        .to_string();
+    let config_head = txt.get_property_val_str("cfg").unwrap_or("").to_string();
 
     Some(DiscoveredPeer {
         machine_id,

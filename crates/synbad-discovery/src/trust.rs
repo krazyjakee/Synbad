@@ -53,10 +53,16 @@ impl TrustedPeerStore {
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(source) => {
-                return Err(TrustError::Io { path: path.into(), source })
+                return Err(TrustError::Io {
+                    path: path.into(),
+                    source,
+                })
             }
         };
-        Ok(TrustedPeerStore { path: path.to_path_buf(), peers })
+        Ok(TrustedPeerStore {
+            path: path.to_path_buf(),
+            peers,
+        })
     }
 
     pub fn list(&self) -> &[TrustedPeer] {
@@ -104,9 +110,14 @@ impl TrustedPeerStore {
                 source,
             })?;
         }
-        let body = serde_json::to_vec_pretty(&TrustFile { peers: self.peers.clone() })?;
+        let body = serde_json::to_vec_pretty(&TrustFile {
+            peers: self.peers.clone(),
+        })?;
         let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, body).map_err(|source| TrustError::Io { path: tmp.clone(), source })?;
+        fs::write(&tmp, body).map_err(|source| TrustError::Io {
+            path: tmp.clone(),
+            source,
+        })?;
         fs::rename(&tmp, &self.path).map_err(|source| TrustError::Io {
             path: self.path.clone(),
             source,

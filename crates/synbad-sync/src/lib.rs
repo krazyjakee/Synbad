@@ -22,9 +22,7 @@
 pub mod protocol;
 pub mod versioned;
 
-pub use protocol::{
-    canonical_state_bytes, sign_frame, verify_frame, ProtocolError, SyncFrame,
-};
+pub use protocol::{canonical_state_bytes, sign_frame, verify_frame, ProtocolError, SyncFrame};
 pub use versioned::{
     FieldStamps, LamportTime, MergeOutcome, VersionedConfig, VersionedConfigError,
 };

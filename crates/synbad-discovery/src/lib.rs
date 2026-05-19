@@ -32,8 +32,8 @@ pub use advertiser::Advertiser;
 pub use browser::{Browser, DiscoveryEvent};
 pub use identity::{Identity, IdentityError};
 pub use pairing::{
-    canonical_transcript, sas_code, sign_transcript, verify_signature,
-    PairHello, PairConfirm, PairingError,
+    canonical_transcript, sas_code, sign_transcript, verify_signature, PairConfirm, PairHello,
+    PairingError,
 };
 pub use trust::{now_unix, TrustError, TrustedPeer, TrustedPeerStore};
 

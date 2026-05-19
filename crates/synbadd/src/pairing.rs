@@ -31,7 +31,9 @@ use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, oneshot};
 
-use synbad_crypto::{accept as crypto_accept, initiate as crypto_initiate, CipherStream, HandshakeMode};
+use synbad_crypto::{
+    accept as crypto_accept, initiate as crypto_initiate, CipherStream, HandshakeMode,
+};
 use synbad_discovery::pairing::{
     canonical_transcript, sas_code, sign_transcript, verify_signature, PairConfirm, PairHello,
 };
@@ -72,18 +74,16 @@ pub async fn spawn_listener(
                     let deps = deps.clone();
                     let session_id_for_task = session_id.clone();
                     let task = tokio::spawn(async move {
-                        let _ = run_session(
-                            session_id_for_task,
-                            stream,
-                            addr,
-                            deps,
-                            confirm_rx,
-                            None,
-                        )
-                        .await;
+                        let _ =
+                            run_session(session_id_for_task, stream, addr, deps, confirm_rx, None)
+                                .await;
                     });
                     if incoming_tx
-                        .send(IncomingSession { session_id, confirm_tx, _task: task })
+                        .send(IncomingSession {
+                            session_id,
+                            confirm_tx,
+                            _task: task,
+                        })
                         .await
                         .is_err()
                     {
@@ -107,41 +107,44 @@ pub fn spawn_outbound(peer: DiscoveredPeer, deps: Arc<SessionDeps>) -> OutboundH
     let (confirm_tx, confirm_rx) = oneshot::channel::<bool>();
     let session_id = new_session_id();
     let session_id_for_task = session_id.clone();
-    let task = tokio::spawn(async move {
-        let addr_str = format!("{}:{}", peer.host, peer.service_port);
-        let stream = match tokio::time::timeout(
-            Duration::from_secs(10),
-            TcpStream::connect(&addr_str),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                let _ = deps.events.send(Event::PairingFailed {
-                    session_id: session_id_for_task,
-                    reason: format!("connect to {}: {}", addr_str, e),
-                });
-                return;
-            }
-            Err(_) => {
-                let _ = deps.events.send(Event::PairingFailed {
-                    session_id: session_id_for_task,
-                    reason: format!("connect to {} timed out", addr_str),
-                });
-                return;
-            }
-        };
-        let _ = run_session(
-            session_id_for_task,
-            stream,
-            stream_peer_addr(&peer),
-            deps,
-            confirm_rx,
-            Some(peer.machine_id.clone()),
-        )
-        .await;
-    });
-    OutboundHandle { session_id, confirm_tx, _task: task }
+    let task =
+        tokio::spawn(async move {
+            let addr_str = format!("{}:{}", peer.host, peer.service_port);
+            let stream =
+                match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr_str))
+                    .await
+                {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        let _ = deps.events.send(Event::PairingFailed {
+                            session_id: session_id_for_task,
+                            reason: format!("connect to {}: {}", addr_str, e),
+                        });
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = deps.events.send(Event::PairingFailed {
+                            session_id: session_id_for_task,
+                            reason: format!("connect to {} timed out", addr_str),
+                        });
+                        return;
+                    }
+                };
+            let _ = run_session(
+                session_id_for_task,
+                stream,
+                stream_peer_addr(&peer),
+                deps,
+                confirm_rx,
+                Some(peer.machine_id.clone()),
+            )
+            .await;
+        });
+    OutboundHandle {
+        session_id,
+        confirm_tx,
+        _task: task,
+    }
 }
 
 fn stream_peer_addr(peer: &DiscoveredPeer) -> SocketAddr {
@@ -216,7 +219,10 @@ async fn run_session(
         Err(_) => {
             let reason = "pairing session timed out".to_string();
             tracing::warn!(?session_id, "{}", reason);
-            let _ = deps.events.send(Event::PairingFailed { session_id, reason: reason.clone() });
+            let _ = deps.events.send(Event::PairingFailed {
+                session_id,
+                reason: reason.clone(),
+            });
             bail!(reason)
         }
     }
@@ -272,7 +278,9 @@ async fn run_session_inner(
         if expected != &peer_hello.machine_id {
             bail!(
                 "peer at {} identifies as {} but we initiated against {}",
-                peer_addr, peer_hello.machine_id, expected
+                peer_addr,
+                peer_hello.machine_id,
+                expected
             );
         }
     }
@@ -289,9 +297,9 @@ async fn run_session_inner(
         session_id: session_id.to_string(),
         peer_machine_id: peer_hello.machine_id.clone(),
         peer_display_name: peer_hello.display_name.clone(),
-        peer_fingerprint: synbad_discovery::identity::fingerprint_for(
-            &pubkey_from_hex(&peer_hello.pubkey_hex)?,
-        ),
+        peer_fingerprint: synbad_discovery::identity::fingerprint_for(&pubkey_from_hex(
+            &peer_hello.pubkey_hex,
+        )?),
         verification_code: sas.clone(),
     });
 
@@ -309,7 +317,10 @@ async fn run_session_inner(
     };
     send_msg(
         &mut chan,
-        &PairMessage::Confirm(PairConfirm { accepted: our_accept, sig_hex: sig }),
+        &PairMessage::Confirm(PairConfirm {
+            accepted: our_accept,
+            sig_hex: sig,
+        }),
     )
     .await?;
 
@@ -328,9 +339,8 @@ async fn run_session_inner(
     verify_signature(&peer_hello.pubkey_hex, &transcript, &peer_confirm.sig_hex)?;
 
     // ── Step 5: persist + announce ──────────────────────────────────
-    let fingerprint = synbad_discovery::identity::fingerprint_for(&pubkey_from_hex(
-        &peer_hello.pubkey_hex,
-    )?);
+    let fingerprint =
+        synbad_discovery::identity::fingerprint_for(&pubkey_from_hex(&peer_hello.pubkey_hex)?);
     let trusted = TrustedPeer {
         machine_id: peer_hello.machine_id.clone(),
         display_name: peer_hello.display_name.clone(),
@@ -364,9 +374,7 @@ async fn recv_msg(chan: &mut CipherStream) -> Result<PairMessage> {
 
 fn pubkey_from_hex(s: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(s).map_err(|e| anyhow!("bad pubkey hex: {}", e))?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow!("pubkey wrong length"))
+    bytes.try_into().map_err(|_| anyhow!("pubkey wrong length"))
 }
 
 fn new_session_id() -> String {

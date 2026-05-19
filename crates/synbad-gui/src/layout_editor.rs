@@ -68,7 +68,11 @@ impl LayoutEditor {
             rects.push(r);
         }
         let hovered_idx = ui.input(|i| i.pointer.hover_pos()).and_then(|p| {
-            rects.iter().enumerate().rev().find_map(|(i, r)| r.contains(p).then_some(i))
+            rects
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(i, r)| r.contains(p).then_some(i))
         });
 
         // Begin / continue / end drag.
@@ -85,10 +89,7 @@ impl LayoutEditor {
         if let Some(drag) = &self.dragging {
             if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
                 let new_min = pos - drag.offset_in_screen - origin.to_vec2();
-                let snapped = Vec2::new(
-                    snap(new_min.x, GRID),
-                    snap(new_min.y, GRID),
-                );
+                let snapped = Vec2::new(snap(new_min.x, GRID), snap(new_min.y, GRID));
                 let s = &mut config.screens[drag.idx];
                 if snapped.x as i32 != s.position.x || snapped.y as i32 != s.position.y {
                     s.position.x = snapped.x as i32;
@@ -97,17 +98,15 @@ impl LayoutEditor {
                 }
             }
         }
-        if response.drag_stopped() {
-            if self.dragging.take().is_some() {
-                // Recompute rectangles after drag so adjacency uses final position.
-                for (r, s) in rects.iter_mut().zip(config.screens.iter()) {
-                    *r = Rect::from_min_size(
-                        origin + Vec2::new(s.position.x as f32, s.position.y as f32),
-                        Vec2::new(s.position.w as f32, s.position.h as f32),
-                    );
-                }
-                dirty = true;
+        if response.drag_stopped() && self.dragging.take().is_some() {
+            // Recompute rectangles after drag so adjacency uses final position.
+            for (r, s) in rects.iter_mut().zip(config.screens.iter()) {
+                *r = Rect::from_min_size(
+                    origin + Vec2::new(s.position.x as f32, s.position.y as f32),
+                    Vec2::new(s.position.w as f32, s.position.h as f32),
+                );
             }
+            dirty = true;
         }
 
         // Right-click → context menu (rename via name field outside, delete here).
@@ -126,7 +125,9 @@ impl LayoutEditor {
 
         if let Some(idx) = self.pending_delete.take() {
             let removed = config.screens.remove(idx).name;
-            config.links.retain(|l| l.from != removed && l.to != removed);
+            config
+                .links
+                .retain(|l| l.from != removed && l.to != removed);
             if config.server_name == removed {
                 config.server_name = config
                     .screens
@@ -201,22 +202,34 @@ fn draw_grid(painter: &egui::Painter, rect: Rect, origin: Pos2) {
     let start_y = origin.y - ((origin.y - rect.top()) / step).floor() * step;
     let mut x = start_x;
     while x < rect.right() {
-        painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], stroke);
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            stroke,
+        );
         x += step;
     }
     let mut y = start_y;
     while y < rect.bottom() {
-        painter.line_segment([Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)], stroke);
+        painter.line_segment(
+            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+            stroke,
+        );
         y += step;
     }
     // Origin crosshair.
     let cross = Stroke::new(1.0, Color32::from_gray(80));
     painter.line_segment(
-        [Pos2::new(rect.left(), origin.y), Pos2::new(rect.right(), origin.y)],
+        [
+            Pos2::new(rect.left(), origin.y),
+            Pos2::new(rect.right(), origin.y),
+        ],
         cross,
     );
     painter.line_segment(
-        [Pos2::new(origin.x, rect.top()), Pos2::new(origin.x, rect.bottom())],
+        [
+            Pos2::new(origin.x, rect.top()),
+            Pos2::new(origin.x, rect.bottom()),
+        ],
         cross,
     );
 }
@@ -239,7 +252,10 @@ fn draw_link_edge(painter: &egui::Painter, a: &Rect, b: &Rect, side: Side) {
         Side::Down => {
             let x0 = a.left().max(b.left());
             let x1 = a.right().min(b.right());
-            painter.line_segment([Pos2::new(x0, a.bottom()), Pos2::new(x1, a.bottom())], stroke);
+            painter.line_segment(
+                [Pos2::new(x0, a.bottom()), Pos2::new(x1, a.bottom())],
+                stroke,
+            );
         }
         Side::Up => {
             let x0 = a.left().max(b.left());
@@ -252,10 +268,7 @@ fn draw_link_edge(painter: &egui::Painter, a: &Rect, b: &Rect, side: Side) {
 /// Walk all pairs and emit a directional link per adjacent edge.
 /// `Config::generate_synergy_conf` adds the reverse, so we only emit the
 /// "outgoing" side per pair.
-fn derive_links(
-    screens: &[synbad_config::Screen],
-    rects: &[Rect],
-) -> Vec<synbad_config::Link> {
+fn derive_links(screens: &[synbad_config::Screen], rects: &[Rect]) -> Vec<synbad_config::Link> {
     let mut links = Vec::new();
     for i in 0..screens.len() {
         for j in 0..screens.len() {
@@ -265,7 +278,9 @@ fn derive_links(
             let a = &rects[i];
             let b = &rects[j];
             // a.right shares b.left
-            if (a.right() - b.left()).abs() < SNAP_PX && range_overlap(a.top(), a.bottom(), b.top(), b.bottom()) > 0.0 {
+            if (a.right() - b.left()).abs() < SNAP_PX
+                && range_overlap(a.top(), a.bottom(), b.top(), b.bottom()) > 0.0
+            {
                 links.push(Link {
                     from: screens[i].name.clone(),
                     side: Side::Right,

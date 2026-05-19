@@ -58,7 +58,13 @@ pub fn ipc_socket() -> PathBuf {
         // Sanitize: pipe names can't contain backslashes, and we keep this short.
         let safe: String = user
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         PathBuf::from(format!(r"\\.\pipe\synbadd-{}", safe))
     }

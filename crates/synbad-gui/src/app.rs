@@ -2,11 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 
 use eframe::CreationContext;
 
 use synbad_config::{paths, BinaryPaths, Config, NodeRole, Screen};
-use synbad_ipc::{DaemonState, DiscoveredPeer, TrustedPeer};
+use synbad_ipc::{DaemonState, DiscoveredPeer, SyncDirection, TrustedPeer};
 
 use crate::ipc_thread::{self, Cmd, IpcHandle, Update};
 use crate::layout_editor::LayoutEditor;
@@ -78,13 +79,39 @@ pub struct SynbadApp {
     /// User explicitly chose Quit (via tray or future menu item). Lets us
     /// distinguish a real exit from a close-to-tray click.
     quitting: bool,
+    /// Receiver fed by the single-instance listener thread. A second
+    /// launcher click ping arrives here; we react by raising and focusing
+    /// the window, same as the tray's "Show Synbad".
+    show_rx: Option<crossbeam_channel::Receiver<()>>,
+
+    /// Peers we currently have an open sync session with, keyed by
+    /// machine_id with their direction so the UI can show "syncing"
+    /// while the session is in flight.
+    active_syncs: BTreeMap<String, SyncDirection>,
+    /// Most recent sync outcome. Shown as a short-lived chip beside the
+    /// status indicator so the user knows when a layout change has
+    /// reached (or failed to reach) the other side.
+    last_sync_status: Option<SyncStatus>,
+}
+
+#[derive(Debug, Clone)]
+struct SyncStatus {
+    /// Human-readable message ("synced with macbook" / "sync to laptop failed: …").
+    message: String,
+    /// Whether the underlying event was a success or failure — drives the chip colour.
+    ok: bool,
+    /// Wall-clock time we observed the event. The chip auto-clears after a few seconds.
+    at: Instant,
 }
 
 impl SynbadApp {
-    pub fn new(cc: &CreationContext<'_>, has_tray: bool) -> Self {
+    pub fn new(
+        cc: &CreationContext<'_>,
+        has_tray: bool,
+        show_rx: Option<crossbeam_channel::Receiver<()>>,
+    ) -> Self {
         let egui_ctx = cc.egui_ctx.clone();
-        let repaint: Arc<dyn Fn() + Send + Sync> =
-            Arc::new(move || egui_ctx.request_repaint());
+        let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(move || egui_ctx.request_repaint());
         let ipc = ipc_thread::spawn(paths::ipc_socket(), repaint);
 
         SynbadApp {
@@ -108,6 +135,61 @@ impl SynbadApp {
             local_fingerprint: None,
             has_tray,
             quitting: false,
+            show_rx,
+            active_syncs: BTreeMap::new(),
+            last_sync_status: None,
+        }
+    }
+
+    /// Top-bar indicator for config-sync activity. Shows "syncing N peer(s)"
+    /// while at least one session is active, otherwise the last completed
+    /// outcome for a few seconds, then disappears. Without this, the user
+    /// has no way to know whether their layout edits actually reached the
+    /// other side.
+    fn draw_sync_chip(&mut self, ui: &mut egui::Ui) {
+        // Auto-expire stale chips so the bar doesn't permanently carry the
+        // last sync result from an hour ago.
+        const STATUS_TTL_SECS: u64 = 6;
+        if let Some(s) = &self.last_sync_status {
+            if s.at.elapsed().as_secs() >= STATUS_TTL_SECS {
+                self.last_sync_status = None;
+            }
+        }
+
+        if !self.active_syncs.is_empty() {
+            ui.separator();
+            let label = if self.active_syncs.len() == 1 {
+                let (id, _) = self.active_syncs.iter().next().unwrap();
+                format!("syncing with {}", self.peer_label(id))
+            } else {
+                format!("syncing {} peers", self.active_syncs.len())
+            };
+            ui.colored_label(egui::Color32::LIGHT_BLUE, label);
+        } else if let Some(status) = self.last_sync_status.clone() {
+            ui.separator();
+            let color = if status.ok {
+                egui::Color32::LIGHT_GREEN
+            } else {
+                egui::Color32::LIGHT_RED
+            };
+            ui.colored_label(color, status.message);
+        }
+    }
+
+    /// Drain SHOW pings from the single-instance listener and raise the
+    /// window for each one. Always called in the update loop so a second
+    /// launcher click immediately surfaces this process.
+    fn drain_show_requests(&self, ctx: &egui::Context) {
+        let Some(rx) = self.show_rx.as_ref() else {
+            return;
+        };
+        let mut raised = false;
+        while let Ok(()) = rx.try_recv() {
+            raised = true;
+        }
+        if raised {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
     }
 
@@ -116,6 +198,10 @@ impl SynbadApp {
             return;
         }
         while let Ok(ev) = tray::menu_event_receiver().try_recv() {
+            // `as_ref()` is a no-op on the no-tray stub (whose `id()` already
+            // returns `&str`), but is required when the `tray` feature is on
+            // to project `&MenuId` down to `&str` for the string match below.
+            #[allow(clippy::useless_asref)]
             match ev.id().as_ref() {
                 tray::MENU_ID_SHOW => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -202,7 +288,10 @@ impl SynbadApp {
                         self.discovered_peers.insert(p.machine_id.clone(), p);
                     }
                 }
-                Update::LocalIdentity { machine_id, fingerprint } => {
+                Update::LocalIdentity {
+                    machine_id,
+                    fingerprint,
+                } => {
                     self.local_machine_id = Some(machine_id);
                     self.local_fingerprint = Some(fingerprint);
                 }
@@ -241,8 +330,78 @@ impl SynbadApp {
                 Update::TrustRevoked(id) => {
                     self.trusted_peers.remove(&id);
                 }
+                Update::SyncStarted {
+                    peer_machine_id,
+                    direction,
+                } => {
+                    self.active_syncs.insert(peer_machine_id, direction);
+                }
+                Update::SyncCompleted {
+                    peer_machine_id,
+                    direction,
+                    updated,
+                } => {
+                    self.active_syncs.remove(&peer_machine_id);
+                    let name = self.peer_label(&peer_machine_id);
+                    let verb = match direction {
+                        SyncDirection::Outbound => "pushed to",
+                        SyncDirection::Inbound => "received from",
+                    };
+                    let detail = if updated { "merged" } else { "no changes" };
+                    self.last_sync_status = Some(SyncStatus {
+                        message: format!("config {} {} ({})", verb, name, detail),
+                        ok: true,
+                        at: Instant::now(),
+                    });
+                }
+                Update::SyncFailed {
+                    peer_machine_id,
+                    direction,
+                    reason,
+                } => {
+                    self.active_syncs.remove(&peer_machine_id);
+                    let name = self.peer_label(&peer_machine_id);
+                    let dir = match direction {
+                        SyncDirection::Outbound => "to",
+                        SyncDirection::Inbound => "from",
+                    };
+                    self.last_sync_status = Some(SyncStatus {
+                        message: format!("config sync {} {} failed: {}", dir, name, reason),
+                        ok: false,
+                        at: Instant::now(),
+                    });
+                }
             }
         }
+    }
+
+    /// Switch this machine into client mode pointed at `peer`. Replaces
+    /// the three-step Settings dance (change role → paste IP → Apply)
+    /// with a single click from the Peers tab. Also kicks Start so the
+    /// Core actually dials the new address — without this the user would
+    /// still have to bounce down to the bottom bar.
+    fn connect_as_client_to(&mut self, peer: &DiscoveredPeer) {
+        let addr = format!("{}:{}", peer.host, peer.core_port);
+        let mut new_cfg = self.config.clone();
+        new_cfg.role = NodeRole::Client;
+        new_cfg.server_address = Some(addr);
+        self.send(Cmd::SetConfig(new_cfg.clone()));
+        self.config = new_cfg;
+        self.dirty = false;
+        self.pending_remote_config = None;
+        self.send(Cmd::Start);
+    }
+
+    /// Display label for a peer, preferring the trusted/discovered display
+    /// name and falling back to the raw machine_id if we have no metadata.
+    fn peer_label(&self, machine_id: &str) -> String {
+        if let Some(p) = self.trusted_peers.get(machine_id) {
+            return p.display_name.clone();
+        }
+        if let Some(p) = self.discovered_peers.get(machine_id) {
+            return p.display_name.clone();
+        }
+        machine_id.to_string()
     }
 
     fn push_log(&mut self, line: String) {
@@ -261,6 +420,7 @@ impl eframe::App for SynbadApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_ipc();
         self.drain_tray(ctx);
+        self.drain_show_requests(ctx);
         self.handle_close(ctx);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -279,6 +439,7 @@ impl eframe::App for SynbadApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (color, text) = state_chip(&self.state, self.connected);
                     ui.colored_label(color, text);
+                    self.draw_sync_chip(ui);
                 });
             });
         });
@@ -307,8 +468,7 @@ impl eframe::App for SynbadApp {
                     self.send(Cmd::Restart);
                 }
                 ui.separator();
-                let apply = ui
-                    .add_enabled(online && self.dirty, egui::Button::new("Apply config"));
+                let apply = ui.add_enabled(online && self.dirty, egui::Button::new("Apply config"));
                 if apply.clicked() {
                     self.send(Cmd::SetConfig(self.config.clone()));
                     self.dirty = false;
@@ -332,11 +492,7 @@ impl eframe::App for SynbadApp {
                         // The "×" comes first in right-to-left layout so it
                         // sits at the far end of the bar, with the message
                         // text to its left.
-                        if ui
-                            .small_button("×")
-                            .on_hover_text("Dismiss")
-                            .clicked()
-                        {
+                        if ui.small_button("×").on_hover_text("Dismiss").clicked() {
                             self.last_error = None;
                         }
                         if let Some(err) = &self.last_error {
@@ -349,7 +505,11 @@ impl eframe::App for SynbadApp {
 
         if self.pending_remote_config.is_some() {
             egui::TopBottomPanel::top("remote-config-banner")
-                .frame(egui::Frame::none().fill(egui::Color32::from_rgb(80, 60, 0)).inner_margin(6.0))
+                .frame(
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(80, 60, 0))
+                        .inner_margin(6.0),
+                )
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.colored_label(
@@ -385,7 +545,11 @@ impl SynbadApp {
             if self.connected_peers.is_empty() {
                 "none".to_string()
             } else {
-                self.connected_peers.iter().cloned().collect::<Vec<_>>().join(", ")
+                self.connected_peers
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
             }
         ));
         ui.separator();
@@ -456,18 +620,13 @@ impl SynbadApp {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("This machine").strong());
                 if let Some(fp) = &self.local_fingerprint {
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(fp.clone()).monospace().strong(),
-                                )
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(fp.clone()).monospace().strong())
                                 .selectable(true),
-                            );
-                            ui.label("fingerprint:");
-                        },
-                    );
+                        );
+                        ui.label("fingerprint:");
+                    });
                 }
             });
             if let Some(id) = &self.local_machine_id {
@@ -494,6 +653,7 @@ impl SynbadApp {
         // dispatching inline would borrow `self` twice.
         let mut pair_request: Option<String> = None;
         let mut revoke_request: Option<String> = None;
+        let mut use_as_server: Option<DiscoveredPeer> = None;
 
         if self.discovered_peers.is_empty() {
             ui.add_space(8.0);
@@ -502,6 +662,16 @@ impl SynbadApp {
                  subnet and it should appear here within a few seconds.",
             );
         } else {
+            // Pre-compute which peer (if any) is the current server target,
+            // so we can render a "connected" badge instead of a button on
+            // that row.
+            let configured_server_host = self
+                .config
+                .server_address
+                .as_deref()
+                .map(|s| s.split(':').next().unwrap_or(s).to_string());
+            let local_is_client = matches!(self.config.role, NodeRole::Client);
+
             egui::ScrollArea::vertical()
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
@@ -519,14 +689,16 @@ impl SynbadApp {
                             ui.end_row();
 
                             for peer in self.discovered_peers.values() {
-                                let is_trusted =
-                                    self.trusted_peers.contains_key(&peer.machine_id);
+                                let is_trusted = self.trusted_peers.contains_key(&peer.machine_id);
+                                let is_active_server = local_is_client
+                                    && configured_server_host
+                                        .as_deref()
+                                        .map(|h| h == peer.host)
+                                        .unwrap_or(false);
                                 ui.label(&peer.display_name);
                                 ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&peer.host).monospace(),
-                                    )
-                                    .selectable(true),
+                                    egui::Label::new(egui::RichText::new(&peer.host).monospace())
+                                        .selectable(true),
                                 );
                                 ui.label(format!(
                                     "synbad:{} core:{}",
@@ -541,18 +713,39 @@ impl SynbadApp {
                                 if is_trusted {
                                     ui.colored_label(egui::Color32::LIGHT_GREEN, "trusted");
                                 } else {
-                                    ui.colored_label(
-                                        egui::Color32::LIGHT_YELLOW,
-                                        "unverified",
-                                    );
+                                    ui.colored_label(egui::Color32::LIGHT_YELLOW, "unverified");
                                 }
-                                if is_trusted {
-                                    if ui.button("Revoke").clicked() {
-                                        revoke_request = Some(peer.machine_id.clone());
+                                ui.horizontal(|ui| {
+                                    if is_trusted {
+                                        if is_active_server {
+                                            ui.colored_label(
+                                                egui::Color32::LIGHT_GREEN,
+                                                "← server",
+                                            );
+                                        } else {
+                                            // Connecting needs a Core port; an unstarted
+                                            // peer advertises 0 and we can't dial it.
+                                            let has_core = peer.core_port != 0;
+                                            let btn = ui.add_enabled(
+                                                has_core,
+                                                egui::Button::new("Use as server"),
+                                            );
+                                            if !has_core {
+                                                btn.on_disabled_hover_text(
+                                                    "Peer's Synergy Core isn't running yet. \
+                                                     Start it on the other machine first.",
+                                                );
+                                            } else if btn.clicked() {
+                                                use_as_server = Some(peer.clone());
+                                            }
+                                        }
+                                        if ui.button("Revoke").clicked() {
+                                            revoke_request = Some(peer.machine_id.clone());
+                                        }
+                                    } else if ui.button("Pair").clicked() {
+                                        pair_request = Some(peer.machine_id.clone());
                                     }
-                                } else if ui.button("Pair").clicked() {
-                                    pair_request = Some(peer.machine_id.clone());
-                                }
+                                });
                                 ui.end_row();
                             }
                         });
@@ -564,6 +757,9 @@ impl SynbadApp {
         }
         if let Some(id) = revoke_request {
             self.send(Cmd::RevokeTrust { machine_id: id });
+        }
+        if let Some(peer) = use_as_server {
+            self.connect_as_client_to(&peer);
         }
 
         // Trusted peers that aren't currently visible on mDNS — still show
@@ -587,10 +783,8 @@ impl SynbadApp {
                     for t in &offline_trusted {
                         ui.label(&t.display_name);
                         ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(&t.fingerprint).monospace(),
-                            )
-                            .selectable(true),
+                            egui::Label::new(egui::RichText::new(&t.fingerprint).monospace())
+                                .selectable(true),
                         );
                         if ui.button("Revoke").clicked() {
                             revoke_offline = Some(t.machine_id.clone());
@@ -636,41 +830,25 @@ impl SynbadApp {
                         );
                     });
                     ui.add_space(8.0);
-                    ui.label(format!(
-                        "Peer machine: {}",
-                        pending.peer_machine_id
-                    ));
-                    ui.label(format!(
-                        "Peer fingerprint: {}",
-                        pending.peer_fingerprint
-                    ));
+                    ui.label(format!("Peer machine: {}", pending.peer_machine_id));
+                    ui.label(format!("Peer fingerprint: {}", pending.peer_fingerprint));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         if ui
-                            .add(
-                                egui::Button::new("Decline")
-                                    .fill(egui::Color32::DARK_RED),
-                            )
+                            .add(egui::Button::new("Decline").fill(egui::Color32::DARK_RED))
                             .clicked()
                         {
                             decisions.push((pending.session_id.clone(), false));
                         }
                         if ui
-                            .add(
-                                egui::Button::new("Accept")
-                                    .fill(egui::Color32::DARK_GREEN),
-                            )
+                            .add(egui::Button::new("Accept").fill(egui::Color32::DARK_GREEN))
                             .clicked()
                         {
                             decisions.push((pending.session_id.clone(), true));
                         }
                     });
                     ui.add_space(2.0);
-                    ui.label(
-                        egui::RichText::new("Press Esc to decline.")
-                            .small()
-                            .weak(),
-                    );
+                    ui.label(egui::RichText::new("Press Esc to decline.").small().weak());
                 });
         }
         // Esc declines the topmost pending dialog. We deliberately do NOT
@@ -694,8 +872,12 @@ impl SynbadApp {
             ui.label("Role");
             ui.horizontal(|ui| {
                 let mut role = self.config.role;
-                if ui.radio_value(&mut role, NodeRole::Server, "Server").changed()
-                    || ui.radio_value(&mut role, NodeRole::Client, "Client").changed()
+                if ui
+                    .radio_value(&mut role, NodeRole::Server, "Server")
+                    .changed()
+                    || ui
+                        .radio_value(&mut role, NodeRole::Client, "Client")
+                        .changed()
                 {
                     self.config.role = role;
                     self.dirty = true;
@@ -716,7 +898,10 @@ impl SynbadApp {
 
             ui.label("Port");
             let mut port = self.config.port as i32;
-            if ui.add(egui::DragValue::new(&mut port).clamp_range(1..=65535)).changed() {
+            if ui
+                .add(egui::DragValue::new(&mut port).clamp_range(1..=65535))
+                .changed()
+            {
                 self.config.port = port.clamp(1, 65535) as u16;
                 self.dirty = true;
             }
@@ -732,8 +917,7 @@ impl SynbadApp {
                         .hint_text("host or host:port (client mode only)"),
                 );
                 if resp.changed() {
-                    self.config.server_address =
-                        if addr.is_empty() { None } else { Some(addr) };
+                    self.config.server_address = if addr.is_empty() { None } else { Some(addr) };
                     self.dirty = true;
                 }
                 if !client_mode {
@@ -754,7 +938,9 @@ impl SynbadApp {
                 .unwrap_or_default();
             let resp = ui.text_edit_singleline(&mut core_bin);
             if resp.changed() {
-                self.config.binaries = BinaryPaths { core: opt_path(&core_bin) };
+                self.config.binaries = BinaryPaths {
+                    core: opt_path(&core_bin),
+                };
                 self.dirty = true;
             }
             resp.on_hover_text(

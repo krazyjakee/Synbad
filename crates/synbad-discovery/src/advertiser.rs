@@ -34,7 +34,7 @@ impl Advertiser {
     /// pairing). `core_port` is the Synergy/Deskflow Core's input-sharing
     /// port (advertised as TXT for peers that want to wire up a layout
     /// entry directly). `config_head` is the short hash of our current
-    /// [`VersionedConfig`] — peers compare it against theirs to detect
+    /// `VersionedConfig` — peers compare it against theirs to detect
     /// divergence; pass an empty string if config sync isn't active yet.
     pub fn start(
         identity: &Identity,

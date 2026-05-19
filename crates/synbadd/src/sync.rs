@@ -23,7 +23,9 @@ use rand_core::RngCore;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use synbad_crypto::{accept as crypto_accept, initiate as crypto_initiate, CipherStream, HandshakeMode};
+use synbad_crypto::{
+    accept as crypto_accept, initiate as crypto_initiate, CipherStream, HandshakeMode,
+};
 use synbad_discovery::{Identity, TrustedPeerStore};
 use synbad_ipc::{DiscoveredPeer, Event, SyncDirection};
 use synbad_sync::{sign_frame, verify_frame, SyncFrame, VersionedConfig};
@@ -55,7 +57,9 @@ pub struct SyncDeps {
 pub enum SyncOp {
     /// Hand back the current versioned config. Used by the inbound side
     /// to compare heads and to know what state to ship back.
-    Snapshot { reply: oneshot::Sender<VersionedConfig> },
+    Snapshot {
+        reply: oneshot::Sender<VersionedConfig>,
+    },
     /// Merge an incoming peer state into the supervisor's state. The
     /// reply carries the supervisor's *post-merge* state so the session
     /// can ship it back to the peer in the same round trip.
@@ -86,9 +90,7 @@ pub async fn spawn_listener(
                 Ok((stream, addr)) => {
                     let deps = deps.clone();
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            run_session_with_timeout(stream, addr, deps).await
-                        {
+                        if let Err(e) = run_session_with_timeout(stream, addr, deps).await {
                             tracing::debug!(%addr, ?e, "sync session ended with error");
                         }
                     });
@@ -103,10 +105,7 @@ pub async fn spawn_listener(
 }
 
 /// Dial a peer and run an outbound sync session in a background task.
-pub fn spawn_outbound(
-    peer: DiscoveredPeer,
-    deps: Arc<SyncDeps>,
-) -> tokio::task::JoinHandle<()> {
+pub fn spawn_outbound(peer: DiscoveredPeer, deps: Arc<SyncDeps>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         if let Err(e) = run_outbound(peer.clone(), deps.clone()).await {
             tracing::debug!(
@@ -134,8 +133,8 @@ async fn run_outbound(peer: DiscoveredPeer, deps: Arc<SyncDeps>) -> Result<()> {
         let trust = deps.trust.lock().await;
         trust.get(&peer.machine_id).cloned()
     };
-    let trusted = trusted
-        .ok_or_else(|| anyhow!("peer {} is not in the trust store", peer.machine_id))?;
+    let trusted =
+        trusted.ok_or_else(|| anyhow!("peer {} is not in the trust store", peer.machine_id))?;
 
     let addr = format!("{}:{}", peer.host, peer.sync_port);
     let stream = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr))
@@ -201,13 +200,8 @@ async fn outbound_inner(
     let mut nonce = [0u8; 16];
     rand_core::OsRng.fill_bytes(&mut nonce);
 
-    let our_frame = sign_frame(
-        &signing_key,
-        &our_machine_id,
-        &nonce,
-        our_state,
-    )
-    .map_err(|e| anyhow!("sign outbound frame: {}", e))?;
+    let our_frame = sign_frame(&signing_key, &our_machine_id, &nonce, our_state)
+        .map_err(|e| anyhow!("sign outbound frame: {}", e))?;
     send_frame(&mut chan, &our_frame).await?;
 
     let peer_frame = recv_frame(&mut chan).await?;
@@ -227,7 +221,12 @@ async fn outbound_inner(
 
     // Hand the peer's state to the supervisor; it merges and returns
     // the new authoritative state.
-    let merged = merge(&deps, peer_frame.from_machine_id.clone(), peer_frame.state.clone()).await?;
+    let merged = merge(
+        &deps,
+        peer_frame.from_machine_id.clone(),
+        peer_frame.state.clone(),
+    )
+    .await?;
     let new_head = merged.head_hash();
     // We changed locally iff the merged state's hash differs from the
     // hash of what we sent first. The supervisor knows the previous
@@ -333,10 +332,12 @@ async fn run_inbound_inner(
     // already verified the pubkey, so this lookup is just for metadata.
     let trusted = {
         let trust = deps.trust.lock().await;
-        trust
-            .get(&peer_machine_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("trust entry for {} disappeared mid-session", peer_machine_id))?
+        trust.get(&peer_machine_id).cloned().ok_or_else(|| {
+            anyhow!(
+                "trust entry for {} disappeared mid-session",
+                peer_machine_id
+            )
+        })?
     };
 
     // Read peer's first frame.
@@ -363,19 +364,14 @@ async fn run_inbound_inner(
     let merged = merge(&deps, trusted.machine_id.clone(), peer_frame.state.clone()).await?;
     let new_head = merged.head_hash();
 
-    let nonce_bytes = hex::decode(&peer_frame.nonce_hex)
-        .map_err(|_| anyhow!("peer sent non-hex nonce"))?;
+    let nonce_bytes =
+        hex::decode(&peer_frame.nonce_hex).map_err(|_| anyhow!("peer sent non-hex nonce"))?;
     let nonce: [u8; 16] = nonce_bytes
         .as_slice()
         .try_into()
         .map_err(|_| anyhow!("peer nonce was not 16 bytes"))?;
-    let reply = sign_frame(
-        &signing_key,
-        &our_machine_id,
-        &nonce,
-        merged.clone(),
-    )
-    .map_err(|e| anyhow!("sign inbound reply: {}", e))?;
+    let reply = sign_frame(&signing_key, &our_machine_id, &nonce, merged.clone())
+        .map_err(|e| anyhow!("sign inbound reply: {}", e))?;
     send_frame(&mut chan, &reply).await?;
 
     // "Updated" here means the merge produced a different head from the
@@ -383,8 +379,8 @@ async fn run_inbound_inner(
     // post-merge state but not the pre-merge state, so we approximate
     // with "did the peer's state differ from ours?" — strictly correct
     // for an LWW merge: a no-op merge leaves the head untouched.
-    let updated = peer_frame.state.head_hash() != new_head
-        || head_of_our_pre_state(&deps).await? != new_head;
+    let updated =
+        peer_frame.state.head_hash() != new_head || head_of_our_pre_state(&deps).await? != new_head;
     Ok(InboundResult {
         peer_machine_id: trusted.machine_id,
         updated,
@@ -407,7 +403,8 @@ async fn snapshot(deps: &SyncDeps) -> Result<VersionedConfig> {
         .send(SyncOp::Snapshot { reply: tx })
         .await
         .map_err(|_| anyhow!("supervisor channel closed"))?;
-    rx.await.map_err(|_| anyhow!("supervisor dropped snapshot reply"))
+    rx.await
+        .map_err(|_| anyhow!("supervisor dropped snapshot reply"))
 }
 
 async fn merge(
@@ -424,7 +421,8 @@ async fn merge(
         })
         .await
         .map_err(|_| anyhow!("supervisor channel closed"))?;
-    rx.await.map_err(|_| anyhow!("supervisor dropped merge reply"))
+    rx.await
+        .map_err(|_| anyhow!("supervisor dropped merge reply"))
 }
 
 async fn send_frame(chan: &mut CipherStream, frame: &SyncFrame) -> Result<()> {
@@ -447,7 +445,11 @@ async fn recv_frame(chan: &mut CipherStream) -> Result<SyncFrame> {
         .await
         .map_err(|e| anyhow!("encrypted recv: {}", e))?;
     if body.len() >= MAX_FRAME_BYTES {
-        bail!("incoming frame is {} bytes (max {})", body.len(), MAX_FRAME_BYTES);
+        bail!(
+            "incoming frame is {} bytes (max {})",
+            body.len(),
+            MAX_FRAME_BYTES
+        );
     }
     serde_json::from_slice(&body).context("parsing sync frame")
 }

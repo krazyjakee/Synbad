@@ -12,9 +12,7 @@
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 
-use interprocess::local_socket::{
-    prelude::*, GenericFilePath, RecvHalf, SendHalf, Stream,
-};
+use interprocess::local_socket::{prelude::*, GenericFilePath, RecvHalf, SendHalf, Stream};
 use serde_json as json;
 
 use crate::{Message, Request, Response};

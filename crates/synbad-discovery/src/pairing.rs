@@ -156,7 +156,8 @@ pub fn verify_signature(
         .map_err(|_| PairingError::BadSignature)?;
     let sig = Signature::from_bytes(&sig_array);
 
-    pk.verify(transcript, &sig).map_err(|_| PairingError::BadSignature)
+    pk.verify(transcript, &sig)
+        .map_err(|_| PairingError::BadSignature)
 }
 
 #[cfg(test)]
@@ -165,7 +166,10 @@ mod tests {
 
     fn fresh_pair() -> (SigningKey, SigningKey) {
         let mut rng = rand_core::OsRng;
-        (SigningKey::generate(&mut rng), SigningKey::generate(&mut rng))
+        (
+            SigningKey::generate(&mut rng),
+            SigningKey::generate(&mut rng),
+        )
     }
 
     fn hello(sk: &SigningKey, machine_id: &str, name: &str, nonce: &str) -> PairHello {
@@ -182,7 +186,10 @@ mod tests {
         let (a, b) = fresh_pair();
         let ha = hello(&a, "a-id", "Alice", "1111");
         let hb = hello(&b, "b-id", "Bob", "2222");
-        assert_eq!(canonical_transcript(&ha, &hb), canonical_transcript(&hb, &ha));
+        assert_eq!(
+            canonical_transcript(&ha, &hb),
+            canonical_transcript(&hb, &ha)
+        );
     }
 
     #[test]
@@ -216,12 +223,7 @@ mod tests {
         let (a, _b) = fresh_pair();
         let t = b"transcript bytes here";
         let sig = sign_transcript(&a, t);
-        verify_signature(
-            &hex::encode(a.verifying_key().to_bytes()),
-            t,
-            &sig,
-        )
-        .unwrap();
+        verify_signature(&hex::encode(a.verifying_key().to_bytes()), t, &sig).unwrap();
     }
 
     #[test]
@@ -229,11 +231,6 @@ mod tests {
         let (a, b) = fresh_pair();
         let t = b"transcript bytes here";
         let sig = sign_transcript(&a, t);
-        assert!(verify_signature(
-            &hex::encode(b.verifying_key().to_bytes()),
-            t,
-            &sig,
-        )
-        .is_err());
+        assert!(verify_signature(&hex::encode(b.verifying_key().to_bytes()), t, &sig,).is_err());
     }
 }

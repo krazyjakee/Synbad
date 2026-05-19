@@ -23,7 +23,7 @@ use crossbeam_channel::{Receiver, Sender};
 use synbad_config::{paths, Config};
 use synbad_ipc::client::Connection;
 use synbad_ipc::{
-    DaemonState, DiscoveredPeer, Event, Message, Request, Response, TrustedPeer,
+    DaemonState, DiscoveredPeer, Event, Message, Request, Response, SyncDirection, TrustedPeer,
 };
 
 #[derive(Debug, Clone)]
@@ -36,18 +36,28 @@ pub enum Cmd {
     /// Pull the latest peer list snapshot from the daemon.
     RefreshPeers,
     /// Initiate a pairing session with the named discovered peer.
-    StartPairing { machine_id: String },
+    StartPairing {
+        machine_id: String,
+    },
     /// Reply to a `PairingProposed` event with the user's verdict.
-    ConfirmPairing { session_id: String, accept: bool },
+    ConfirmPairing {
+        session_id: String,
+        accept: bool,
+    },
     /// Forget a previously-paired peer.
-    RevokeTrust { machine_id: String },
+    RevokeTrust {
+        machine_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum Update {
     Connected,
     Disconnected(String),
-    Status { state: DaemonState, recent_log: Vec<String> },
+    Status {
+        state: DaemonState,
+        recent_log: Vec<String>,
+    },
     Config(Config),
     Log(String),
     StateChanged(DaemonState),
@@ -63,7 +73,10 @@ pub enum Update {
     PeerSnapshot(Vec<DiscoveredPeer>),
     /// The local machine's stable identity (UUID + fingerprint), used to
     /// render "this is us" in the GUI.
-    LocalIdentity { machine_id: String, fingerprint: String },
+    LocalIdentity {
+        machine_id: String,
+        fingerprint: String,
+    },
     /// A pairing handshake reached the user-confirmation step.
     PairingProposed {
         session_id: String,
@@ -75,11 +88,33 @@ pub enum Update {
     /// A pairing handshake completed; peer is now trusted.
     PairingCompleted(TrustedPeer),
     /// A pairing handshake failed.
-    PairingFailed { session_id: String, reason: String },
+    PairingFailed {
+        session_id: String,
+        reason: String,
+    },
     /// Replacement snapshot of the trusted-peer set.
     TrustedSnapshot(Vec<TrustedPeer>),
     /// A peer's trust was revoked.
     TrustRevoked(String),
+    /// A config-sync session opened with a peer. The GUI shows a chip
+    /// while at least one is active.
+    SyncStarted {
+        peer_machine_id: String,
+        direction: SyncDirection,
+    },
+    /// A config-sync session completed. `updated` is true iff the merge
+    /// actually changed something locally.
+    SyncCompleted {
+        peer_machine_id: String,
+        direction: SyncDirection,
+        updated: bool,
+    },
+    /// A config-sync session failed (connection, signature, etc.).
+    SyncFailed {
+        peer_machine_id: String,
+        direction: SyncDirection,
+        reason: String,
+    },
 }
 
 pub struct IpcHandle {
@@ -161,9 +196,7 @@ fn event_loop(
                                     None => continue,
                                 },
                                 Event::PeerConnected { name } => Update::PeerConnected(name),
-                                Event::PeerDisconnected { name } => {
-                                    Update::PeerDisconnected(name)
-                                }
+                                Event::PeerDisconnected { name } => Update::PeerDisconnected(name),
                                 Event::ActiveScreen { name } => Update::ActiveScreen(name),
                                 Event::PeerDiscovered { peer } => Update::PeerDiscovered(peer),
                                 Event::PeerLost { machine_id } => Update::PeerLost(machine_id),
@@ -187,33 +220,32 @@ fn event_loop(
                                 Event::TrustRevoked { machine_id } => {
                                     Update::TrustRevoked(machine_id)
                                 }
-                                // Config-sync events surface in the log
-                                // pane for now. A future GUI iteration
-                                // can render dedicated chips per peer.
-                                Event::SyncStarted { peer_machine_id, direction } => {
-                                    Update::Log(format!(
-                                        "[sync] {:?} session opened with {}",
-                                        direction, peer_machine_id
-                                    ))
-                                }
+                                Event::SyncStarted {
+                                    peer_machine_id,
+                                    direction,
+                                } => Update::SyncStarted {
+                                    peer_machine_id,
+                                    direction,
+                                },
                                 Event::SyncCompleted {
                                     peer_machine_id,
                                     direction,
                                     updated,
-                                    new_head,
-                                } => Update::Log(format!(
-                                    "[sync] {:?} with {} {} (head {})",
-                                    direction,
+                                    new_head: _,
+                                } => Update::SyncCompleted {
                                     peer_machine_id,
-                                    if updated { "merged updates" } else { "no-op" },
-                                    new_head
-                                )),
-                                Event::SyncFailed { peer_machine_id, direction, reason } => {
-                                    Update::Log(format!(
-                                        "[sync] {:?} with {} failed: {}",
-                                        direction, peer_machine_id, reason
-                                    ))
-                                }
+                                    direction,
+                                    updated,
+                                },
+                                Event::SyncFailed {
+                                    peer_machine_id,
+                                    direction,
+                                    reason,
+                                } => Update::SyncFailed {
+                                    peer_machine_id,
+                                    direction,
+                                    reason,
+                                },
                             };
                             let _ = update_tx.send(upd);
                             repaint();
@@ -262,7 +294,11 @@ fn event_loop(
 /// (typical for both `cargo build` layouts and installed bundles), and fall
 /// back to PATH lookup so a system-installed daemon still works.
 fn synbadd_binary() -> PathBuf {
-    let name = if cfg!(windows) { "synbadd.exe" } else { "synbadd" };
+    let name = if cfg!(windows) {
+        "synbadd.exe"
+    } else {
+        "synbadd"
+    };
     if let Ok(self_exe) = std::env::current_exe() {
         if let Some(dir) = self_exe.parent() {
             let candidate = dir.join(name);
@@ -340,9 +376,14 @@ fn command_loop(
                     Ok(Response::Peers { peers }) => {
                         let _ = update_tx.send(Update::PeerSnapshot(peers));
                     }
-                    Ok(Response::LocalIdentity { machine_id, fingerprint }) => {
-                        let _ = update_tx
-                            .send(Update::LocalIdentity { machine_id, fingerprint });
+                    Ok(Response::LocalIdentity {
+                        machine_id,
+                        fingerprint,
+                    }) => {
+                        let _ = update_tx.send(Update::LocalIdentity {
+                            machine_id,
+                            fingerprint,
+                        });
                     }
                     Ok(Response::TrustedPeers { peers }) => {
                         let _ = update_tx.send(Update::TrustedSnapshot(peers));
@@ -363,20 +404,29 @@ fn command_loop(
 }
 
 fn bootstrap(conn: &mut Connection, update_tx: &Sender<Update>) -> Result<(), String> {
-    let cfg = conn.request(Request::GetConfig).map_err(|e| e.to_string())?;
+    let cfg = conn
+        .request(Request::GetConfig)
+        .map_err(|e| e.to_string())?;
     if let Response::Config { config } = cfg {
         let _ = update_tx.send(Update::Config(config));
     }
-    let st = conn.request(Request::GetStatus).map_err(|e| e.to_string())?;
+    let st = conn
+        .request(Request::GetStatus)
+        .map_err(|e| e.to_string())?;
     if let Response::Status { state, recent_log } = st {
         let _ = update_tx.send(Update::Status { state, recent_log });
     }
     // Identity is small and never changes during the daemon's lifetime;
     // pull it once at connect time.
-    if let Ok(Response::LocalIdentity { machine_id, fingerprint }) =
-        conn.request(Request::GetLocalIdentity)
+    if let Ok(Response::LocalIdentity {
+        machine_id,
+        fingerprint,
+    }) = conn.request(Request::GetLocalIdentity)
     {
-        let _ = update_tx.send(Update::LocalIdentity { machine_id, fingerprint });
+        let _ = update_tx.send(Update::LocalIdentity {
+            machine_id,
+            fingerprint,
+        });
     }
     // Peers may already be visible if the daemon has been running a while.
     if let Ok(Response::Peers { peers }) = conn.request(Request::ListPeers) {
@@ -389,7 +439,7 @@ fn bootstrap(conn: &mut Connection, update_tx: &Sender<Update>) -> Result<(), St
     Ok(())
 }
 
-fn refetch_config(socket_path: &PathBuf) -> Option<Config> {
+fn refetch_config(socket_path: &Path) -> Option<Config> {
     let mut c = Connection::connect(socket_path).ok()?;
     let r = c.request(Request::GetConfig).ok()?;
     if let Response::Config { config } = r {

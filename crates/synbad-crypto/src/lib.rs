@@ -17,7 +17,7 @@
 //!
 //! - [`HandshakeMode::Authenticated`] — both sides know each other's
 //!   long-term ed25519 public key (e.g. from
-//!   [`synbad_discovery::TrustedPeerStore`]). Each side signs the
+//!   `synbad_discovery::TrustedPeerStore`). Each side signs the
 //!   handshake transcript and verifies the other's signature, so a
 //!   third party impersonating a trusted peer is detected before any
 //!   data frame is exchanged. This is the mode `synbadd::sync` uses.
@@ -27,7 +27,7 @@
 //!   protected against passive observers, but a network MITM that
 //!   splices the TCP connection sees plaintext. The pairing flow uses
 //!   this mode because trust is bootstrapped at a higher layer (see
-//!   [`synbad_discovery::pairing`]); the pairing transcript itself
+//!   `synbad_discovery::pairing`); the pairing transcript itself
 //!   binds the user-confirmed SAS to the static keys, so a MITM at the
 //!   transport layer surfaces as diverging SAS codes on the two
 //!   screens.
@@ -71,6 +71,4 @@ mod cipher;
 mod handshake;
 
 pub use cipher::{CipherStream, FrameError, MAX_FRAME_BYTES};
-pub use handshake::{
-    accept, initiate, HandshakeError, HandshakeMode, PeerAuth, TranscriptHash,
-};
+pub use handshake::{accept, initiate, HandshakeError, HandshakeMode, PeerAuth, TranscriptHash};

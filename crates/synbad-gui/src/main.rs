@@ -1,13 +1,18 @@
 //! `synbad-gui` — egui-based configuration and status UI for Synbad.
 
+use std::sync::{Arc, Mutex};
+
 use tracing_subscriber::EnvFilter;
 
 mod app;
 mod ipc_thread;
 mod layout_editor;
+mod single_instance;
 mod tray;
 
 use app::SynbadApp;
+
+type RepaintFn = Arc<dyn Fn() + Send + Sync>;
 
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
@@ -15,6 +20,41 @@ fn main() -> eframe::Result<()> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    // Single-instance check happens *before* we install a tray icon, so
+    // a second launcher click doesn't even briefly add a second icon to
+    // the systray. The repaint hook lives in a Mutex<Option<_>> because
+    // we don't have the egui context yet — we install the real callback
+    // once eframe gives us the CreationContext.
+    let repaint_slot: Arc<Mutex<Option<RepaintFn>>> = Arc::new(Mutex::new(None));
+    let repaint_for_instance: RepaintFn = {
+        let slot = repaint_slot.clone();
+        Arc::new(move || {
+            if let Ok(g) = slot.lock() {
+                if let Some(r) = g.as_ref() {
+                    r();
+                }
+            }
+        })
+    };
+
+    let show_rx = match single_instance::acquire(
+        single_instance::default_socket_path(),
+        repaint_for_instance,
+    ) {
+        single_instance::AcquireResult::Acquired(guard, rx) => {
+            // Leak the guard so its Drop (socket cleanup) runs only on
+            // process exit. Dropping mid-run would race with our own
+            // listener thread.
+            Box::leak(Box::new(guard));
+            Some(rx)
+        }
+        single_instance::AcquireResult::Forwarded => {
+            tracing::info!("another synbad-gui is running — raised existing window");
+            return Ok(());
+        }
+        single_instance::AcquireResult::Unsupported => None,
+    };
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -32,10 +72,19 @@ fn main() -> eframe::Result<()> {
     let result = eframe::run_native(
         "Synbad",
         options,
-        Box::new(move |cc| Box::new(SynbadApp::new(cc, has_tray))),
+        Box::new(move |cc| {
+            // Now that eframe has the egui context, plug the real repaint
+            // hook into the slot so the single-instance listener thread
+            // can wake us when a second launcher pings the socket.
+            let egui_ctx = cc.egui_ctx.clone();
+            *repaint_slot.lock().unwrap() = Some(Arc::new(move || egui_ctx.request_repaint()));
+            Box::new(SynbadApp::new(cc, has_tray, show_rx))
+        }),
     );
 
-    // Keep the tray alive until eframe returns.
-    drop(tray_handle);
+    // Keep the tray alive until eframe returns; binding holds it past the
+    // call above so the OS handle (when the `tray` feature is enabled)
+    // outlives the event loop.
+    let _keep_alive = tray_handle;
     result
 }

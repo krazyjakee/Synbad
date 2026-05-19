@@ -142,8 +142,7 @@ pub fn verify_frame(
         .as_slice()
         .try_into()
         .map_err(|_| ProtocolError::BadPublicKey)?;
-    let verifying =
-        VerifyingKey::from_bytes(&pk_array).map_err(|_| ProtocolError::BadPublicKey)?;
+    let verifying = VerifyingKey::from_bytes(&pk_array).map_err(|_| ProtocolError::BadPublicKey)?;
 
     let sig_bytes = hex::decode(&frame.sig_hex).map_err(|_| ProtocolError::BadSignature)?;
     let sig_array: [u8; 64] = sig_bytes
@@ -203,11 +202,7 @@ mod tests {
         let state = VersionedConfig::initial(Config::default(), "alpha-id");
         let frame = sign_frame(&key, "alpha-id", &nonce, state).unwrap();
         assert!(matches!(
-            verify_frame(
-                &hex::encode(other.verifying_key().to_bytes()),
-                None,
-                &frame
-            ),
+            verify_frame(&hex::encode(other.verifying_key().to_bytes()), None, &frame),
             Err(ProtocolError::BadSignature)
         ));
     }

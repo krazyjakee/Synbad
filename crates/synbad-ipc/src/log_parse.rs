@@ -27,13 +27,19 @@ pub fn parse(line: &str) -> Option<Event> {
     let body = strip_log_prefix(line);
 
     if let Some(name) = extract_quoted_after(body, "client ", " has connected") {
-        return Some(Event::PeerConnected { name: name.to_string() });
+        return Some(Event::PeerConnected {
+            name: name.to_string(),
+        });
     }
     if let Some(name) = extract_quoted_after(body, "client ", " has disconnected") {
-        return Some(Event::PeerDisconnected { name: name.to_string() });
+        return Some(Event::PeerDisconnected {
+            name: name.to_string(),
+        });
     }
     if let Some((_, to)) = extract_switch(body) {
-        return Some(Event::ActiveScreen { name: to.to_string() });
+        return Some(Event::ActiveScreen {
+            name: to.to_string(),
+        });
     }
     None
 }
@@ -46,7 +52,9 @@ fn strip_log_prefix(line: &str) -> &str {
     // a bare "2026-05-19T12:34:56" prefix.
     let trimmed = line.trim_start();
     let after_ts = if let Some(rest) = trimmed.strip_prefix('[') {
-        rest.find(']').map(|i| rest[i + 1..].trim_start()).unwrap_or(trimmed)
+        rest.find(']')
+            .map(|i| rest[i + 1..].trim_start())
+            .unwrap_or(trimmed)
     } else if trimmed
         .chars()
         .take(10)
@@ -63,7 +71,14 @@ fn strip_log_prefix(line: &str) -> &str {
 
     // Strip `LEVEL: ` (NOTE, DEBUG, DEBUG1..N, WARNING, ERROR, FATAL, INFO).
     for prefix in [
-        "NOTE: ", "WARNING: ", "ERROR: ", "FATAL: ", "INFO: ", "DEBUG: ", "DEBUG1: ", "DEBUG2: ",
+        "NOTE: ",
+        "WARNING: ",
+        "ERROR: ",
+        "FATAL: ",
+        "INFO: ",
+        "DEBUG: ",
+        "DEBUG1: ",
+        "DEBUG2: ",
     ] {
         if let Some(rest) = after_ts.strip_prefix(prefix) {
             return rest;

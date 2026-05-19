@@ -114,9 +114,10 @@ fn load_or_create_keypair(
             path: secret_path.clone(),
             source,
         })?;
-        let secret: [u8; SECRET_KEY_LENGTH] = secret
-            .try_into()
-            .map_err(|_| IdentityError::BadKeyLength { path: secret_path.clone() })?;
+        let secret: [u8; SECRET_KEY_LENGTH] =
+            secret.try_into().map_err(|_| IdentityError::BadKeyLength {
+                path: secret_path.clone(),
+            })?;
         let signing = SigningKey::from_bytes(&secret);
         let public = signing.verifying_key().to_bytes();
         // Re-cache the public key in case it was deleted.

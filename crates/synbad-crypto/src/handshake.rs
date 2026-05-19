@@ -37,7 +37,10 @@ pub type TranscriptHash = [u8; 32];
 pub enum HandshakeError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("protocol version mismatch: peer sent {0}, expected {}", PROTOCOL_VERSION)]
+    #[error(
+        "protocol version mismatch: peer sent {0}, expected {}",
+        PROTOCOL_VERSION
+    )]
     BadVersion(u8),
     #[error("peer signaled an auth mode different from ours")]
     AuthModeMismatch,
@@ -244,8 +247,8 @@ where
             // Trust-store check: the resolver returns the pubkey we
             // expect for this machine_id. A mismatch with what the
             // peer signed → reject.
-            let want_pk = resolve_pubkey(&peer_frame.machine_id)
-                .ok_or(HandshakeError::UntrustedPeer)?;
+            let want_pk =
+                resolve_pubkey(&peer_frame.machine_id).ok_or(HandshakeError::UntrustedPeer)?;
             if want_pk != peer_pk {
                 return Err(HandshakeError::BadPeerSignature);
             }
@@ -337,8 +340,7 @@ async fn send_auth_frame(
         ed25519_pub_hex: hex::encode(our_signing_key.verifying_key().to_bytes()),
         sig_hex: hex::encode(sig.to_bytes()),
     };
-    let body = serde_json::to_vec(&frame)
-        .map_err(|e| HandshakeError::Malformed(e.to_string()))?;
+    let body = serde_json::to_vec(&frame).map_err(|e| HandshakeError::Malformed(e.to_string()))?;
     cipher
         .send(&body)
         .await
@@ -361,10 +363,7 @@ async fn recv_auth_frame(cipher: &mut CipherStream) -> Result<AuthFrame, Handsha
     serde_json::from_slice(&bytes).map_err(|e| HandshakeError::AuthDecode(e.to_string()))
 }
 
-fn verify_auth_frame(
-    frame: &AuthFrame,
-    transcript: &[u8; 32],
-) -> Result<[u8; 32], HandshakeError> {
+fn verify_auth_frame(frame: &AuthFrame, transcript: &[u8; 32]) -> Result<[u8; 32], HandshakeError> {
     let pk_bytes = hex::decode(&frame.ed25519_pub_hex)
         .map_err(|_| HandshakeError::Malformed("auth ed25519_pub_hex".into()))?;
     let pk_array: [u8; 32] = pk_bytes
@@ -382,7 +381,8 @@ fn verify_auth_frame(
         .map_err(|_| HandshakeError::Malformed("sig wrong length".into()))?;
     let sig = Signature::from_bytes(&sig_array);
 
-    vk.verify(transcript, &sig).map_err(|_| HandshakeError::BadPeerSignature)?;
+    vk.verify(transcript, &sig)
+        .map_err(|_| HandshakeError::BadPeerSignature)?;
     Ok(pk_array)
 }
 
@@ -410,14 +410,18 @@ mod tests {
     async fn anonymous_handshake_roundtrip() {
         let (client, server) = pair_sockets().await;
         let init = tokio::spawn(async move {
-            let (mut s, peer) = initiate(client, HandshakeMode::Anonymous, None).await.unwrap();
+            let (mut s, peer) = initiate(client, HandshakeMode::Anonymous, None)
+                .await
+                .unwrap();
             assert!(matches!(peer, PeerAuth::Anonymous));
             s.send(b"hello server").await.unwrap();
             let resp = s.recv().await.unwrap();
             assert_eq!(resp, b"hello client");
         });
         let acc = tokio::spawn(async move {
-            let (mut s, peer) = accept(server, HandshakeMode::Anonymous, |_| None).await.unwrap();
+            let (mut s, peer) = accept(server, HandshakeMode::Anonymous, |_| None)
+                .await
+                .unwrap();
             assert!(matches!(peer, PeerAuth::Anonymous));
             let req = s.recv().await.unwrap();
             assert_eq!(req, b"hello server");
@@ -450,7 +454,10 @@ mod tests {
                 .await
                 .unwrap();
                 match peer {
-                    PeerAuth::Authenticated { machine_id, public_key } => {
+                    PeerAuth::Authenticated {
+                        machine_id,
+                        public_key,
+                    } => {
                         assert_eq!(machine_id, "resp");
                         assert_eq!(public_key, pk_resp);
                     }
@@ -482,7 +489,10 @@ mod tests {
                 .await
                 .unwrap();
                 match peer {
-                    PeerAuth::Authenticated { machine_id, public_key } => {
+                    PeerAuth::Authenticated {
+                        machine_id,
+                        public_key,
+                    } => {
                         assert_eq!(machine_id, "init");
                         assert_eq!(public_key, pk_init);
                     }

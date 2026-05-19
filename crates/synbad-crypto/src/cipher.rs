@@ -130,13 +130,7 @@ impl CipherStream {
         let nonce = build_nonce(&self.recv_prefix, self.recv_counter);
         let pt = self
             .recv_cipher
-            .decrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: &ct,
-                    aad: b"",
-                },
-            )
+            .decrypt(Nonce::from_slice(&nonce), Payload { msg: &ct, aad: b"" })
             .map_err(|_| FrameError::BadCiphertext)?;
         self.recv_counter = self
             .recv_counter

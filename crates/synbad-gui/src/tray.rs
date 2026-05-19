@@ -29,9 +29,9 @@ mod imp {
     use super::*;
 
     use tray_icon::menu::{Menu, MenuEvent, MenuEventReceiver, MenuItem, PredefinedMenuItem};
-    use tray_icon::{Icon, TrayIconBuilder};
     #[cfg(not(target_os = "linux"))]
     use tray_icon::TrayIcon;
+    use tray_icon::{Icon, TrayIconBuilder};
 
     /// Handle returned to keep the tray alive on Windows / macOS. On Linux
     /// the tray lives entirely on the GTK thread and this struct is empty.

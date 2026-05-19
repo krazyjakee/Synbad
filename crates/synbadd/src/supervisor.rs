@@ -163,15 +163,16 @@ impl Supervisor {
                 VersionedConfig::from_parts(config.clone(), sidecar.stamps, sidecar.clock)
             }
             Ok(None) => {
-                let v = VersionedConfig::initial(
-                    config.clone(),
-                    &identity.machine_id.to_string(),
-                );
+                let v = VersionedConfig::initial(config.clone(), &identity.machine_id.to_string());
                 // Persist the bootstrap stamps so a peer that asks for
                 // our state during the very first session sees a stable
                 // identity rather than counter=0/empty-origin defaults.
                 if let Err(e) = v.save_sidecar(&versions_path) {
-                    tracing::warn!(?e, ?versions_path, "could not write initial versions sidecar");
+                    tracing::warn!(
+                        ?e,
+                        ?versions_path,
+                        "could not write initial versions sidecar"
+                    );
                 }
                 v
             }
@@ -210,19 +211,16 @@ impl Supervisor {
         // would still work, but with no listener inbound, the symmetric
         // protocol can't complete — the supervisor still serves the GUI.
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingSession>(8);
-        let pairing_listener = match pairing::spawn_listener(
-            config.service_port,
-            pairing_deps.clone(),
-            incoming_tx,
-        )
-        .await
-        {
-            Ok(h) => Some(h),
-            Err(e) => {
-                tracing::warn!(?e, "pairing listener disabled");
-                None
-            }
-        };
+        let pairing_listener =
+            match pairing::spawn_listener(config.service_port, pairing_deps.clone(), incoming_tx)
+                .await
+            {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    tracing::warn!(?e, "pairing listener disabled");
+                    None
+                }
+            };
 
         // Sync listener: best-effort same as pairing. Multiple syncs can
         // be in flight at once, but the supervisor merges them serially
@@ -235,14 +233,13 @@ impl Supervisor {
             events: events.clone(),
             ops: sync_ops_tx,
         });
-        let sync_listener =
-            match sync::spawn_listener(config.sync_port, sync_deps.clone()).await {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    tracing::warn!(?e, "sync listener disabled");
-                    None
-                }
-            };
+        let sync_listener = match sync::spawn_listener(config.sync_port, sync_deps.clone()).await {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::warn!(?e, "sync listener disabled");
+                None
+            }
+        };
 
         Ok(Supervisor {
             config_path,
@@ -371,7 +368,9 @@ impl Supervisor {
                         host = %peer.host,
                         "peer discovered"
                     );
-                    let _ = self.events.send(Event::PeerDiscovered { peer: peer.clone() });
+                    let _ = self
+                        .events
+                        .send(Event::PeerDiscovered { peer: peer.clone() });
                     // If this peer is trusted and advertised a head that
                     // differs from ours, open a pull-sync so we converge
                     // even if we missed their previous push (e.g. we
@@ -397,8 +396,8 @@ impl Supervisor {
         if peer.sync_port == 0 {
             return;
         }
-        let head_match = !peer.config_head.is_empty()
-            && peer.config_head == self.versioned.head_hash();
+        let head_match =
+            !peer.config_head.is_empty() && peer.config_head == self.versioned.head_hash();
         if head_match {
             return;
         }
@@ -424,10 +423,14 @@ impl Supervisor {
                 state: self.state.clone(),
                 recent_log: self.log_tail.iter().cloned().collect(),
             },
-            Request::GetConfig => Response::Config { config: self.config.clone() },
+            Request::GetConfig => Response::Config {
+                config: self.config.clone(),
+            },
             Request::SetConfig { config } => match self.set_config(config).await {
                 Ok(()) => Response::Ok,
-                Err(e) => Response::Error { message: e.to_string() },
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
             },
             Request::Start => {
                 self.desired_running = true;
@@ -437,7 +440,9 @@ impl Supervisor {
                 self.fast_fail_count = 0;
                 match self.start_core().await {
                     Ok(()) => Response::Ok,
-                    Err(e) => Response::Error { message: e.to_string() },
+                    Err(e) => Response::Error {
+                        message: e.to_string(),
+                    },
                 }
             }
             Request::Stop => {
@@ -452,7 +457,9 @@ impl Supervisor {
                 self.stop_core().await;
                 match self.start_core().await {
                     Ok(()) => Response::Ok,
-                    Err(e) => Response::Error { message: e.to_string() },
+                    Err(e) => Response::Error {
+                        message: e.to_string(),
+                    },
                 }
             }
             Request::Subscribe => Response::Ok,
@@ -465,7 +472,9 @@ impl Supervisor {
             },
             Request::StartPairing { machine_id } => match self.start_pairing(&machine_id) {
                 Ok(()) => Response::Ok,
-                Err(e) => Response::Error { message: e.to_string() },
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
             },
             Request::ConfirmPairing { session_id, accept } => {
                 match self.pairing_confirm.remove(&session_id) {
@@ -480,21 +489,25 @@ impl Supervisor {
             }
             Request::ListTrustedPeers => {
                 let trust = self.trust.lock().await;
-                Response::TrustedPeers { peers: trust.list().to_vec() }
+                Response::TrustedPeers {
+                    peers: trust.list().to_vec(),
+                }
             }
             Request::RevokeTrust { machine_id } => {
                 let mut trust = self.trust.lock().await;
                 match trust.remove(&machine_id) {
                     Ok(true) => {
-                        let _ = self
-                            .events
-                            .send(Event::TrustRevoked { machine_id: machine_id.clone() });
+                        let _ = self.events.send(Event::TrustRevoked {
+                            machine_id: machine_id.clone(),
+                        });
                         Response::Ok
                     }
                     Ok(false) => Response::Error {
                         message: format!("peer {:?} is not trusted", machine_id),
                     },
-                    Err(e) => Response::Error { message: e.to_string() },
+                    Err(e) => Response::Error {
+                        message: e.to_string(),
+                    },
                 }
             }
         };
@@ -591,7 +604,11 @@ impl Supervisor {
         // Snapshot trust list so we don't hold the mutex across spawns.
         // The mutex is async; the snapshot itself is the common case.
         let trust = match self.trust.try_lock() {
-            Ok(g) => g.list().iter().map(|p| p.machine_id.clone()).collect::<Vec<_>>(),
+            Ok(g) => g
+                .list()
+                .iter()
+                .map(|p| p.machine_id.clone())
+                .collect::<Vec<_>>(),
             Err(_) => {
                 // Trust mutex is contended — schedule a deferred push so
                 // we don't drop the change on the floor.
@@ -622,7 +639,11 @@ impl Supervisor {
             SyncOp::Snapshot { reply } => {
                 let _ = reply.send(self.versioned.clone());
             }
-            SyncOp::Merge { peer_machine_id, incoming, reply } => {
+            SyncOp::Merge {
+                peer_machine_id,
+                incoming,
+                reply,
+            } => {
                 let incoming = *incoming;
                 let outcome = self.versioned.merge(&incoming);
                 if matches!(outcome, MergeOutcome::Updated) {
@@ -681,8 +702,10 @@ impl Supervisor {
     }
 
     async fn start_core(&mut self) -> Result<()> {
-        if matches!(self.state, DaemonState::Running { .. } | DaemonState::Starting)
-            || self.child_kill.is_some()
+        if matches!(
+            self.state,
+            DaemonState::Running { .. } | DaemonState::Starting
+        ) || self.child_kill.is_some()
         {
             return Ok(());
         }
@@ -772,9 +795,7 @@ impl Supervisor {
         // A sub-second exit usually means missing libs (exit 127), bad CLI,
         // or permission denial — restarting won't help.
         let ran_for = self.started_at.take().map(|t| t.elapsed());
-        let instant_fail = ran_for
-            .map(|d| d < FAST_FAIL_WINDOW)
-            .unwrap_or(false);
+        let instant_fail = ran_for.map(|d| d < FAST_FAIL_WINDOW).unwrap_or(false);
         if instant_fail {
             self.fast_fail_count += 1;
         } else {
@@ -806,7 +827,11 @@ impl Supervisor {
         self.set_state(DaemonState::Crashed { exit_code: code });
         let delay = self.backoff;
         self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
-        tracing::warn!(?delay, attempt = self.fast_fail_count, "core crashed, will restart");
+        tracing::warn!(
+            ?delay,
+            attempt = self.fast_fail_count,
+            "core crashed, will restart"
+        );
         tokio::time::sleep(delay).await;
         if self.desired_running {
             if let Err(e) = self.start_core().await {
@@ -864,7 +889,11 @@ impl Supervisor {
                     BE::Downloading { tag, asset, url } => {
                         format!("[synbad] downloading {} ({}) from {}", asset, tag, url)
                     }
-                    BE::Progress { asset, bytes, total } => match total {
+                    BE::Progress {
+                        asset,
+                        bytes,
+                        total,
+                    } => match total {
                         Some(t) => format!(
                             "[synbad] {}: {} / {} bytes ({:.1}%)",
                             asset,
@@ -956,9 +985,10 @@ fn build_command(
         // `ok_or_else` here is defensive — surfaces a clear error rather
         // than spawning a child that immediately exits with a usage error.
         (CoreLayout::SplitLegacy { client, .. }, NodeRole::Client) => {
-            let host = config.server_address.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("client role requires server_address")
-            })?;
+            let host = config
+                .server_address
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("client role requires server_address"))?;
             let addr = if host.contains(':') {
                 host.to_string()
             } else {
@@ -1018,8 +1048,8 @@ fn start_discovery(
         config_head,
     )
     .context("starting mDNS advertiser")?;
-    let (browser, rx) = Browser::start(&identity.machine_id.to_string())
-        .context("starting mDNS browser")?;
+    let (browser, rx) =
+        Browser::start(&identity.machine_id.to_string()).context("starting mDNS browser")?;
     Ok((advertiser, browser, rx))
 }
 
@@ -1043,19 +1073,18 @@ mod tests {
     use synbad_config::{Config, NodeRole, Screen};
 
     fn base_config(role: NodeRole) -> Config {
-        let mut cfg = Config::default();
-        cfg.role = role;
-        cfg.server_name = "alpha".into();
-        cfg.screens = vec![Screen {
-            name: "alpha".into(),
-            aliases: vec![],
-            position: Default::default(),
-        }];
-        cfg.port = 24800;
-        if matches!(role, NodeRole::Client) {
-            cfg.server_address = Some("peer.local".into());
+        Config {
+            role,
+            server_name: "alpha".into(),
+            screens: vec![Screen {
+                name: "alpha".into(),
+                aliases: vec![],
+                position: Default::default(),
+            }],
+            port: 24800,
+            server_address: matches!(role, NodeRole::Client).then(|| "peer.local".into()),
+            ..Config::default()
         }
-        cfg
     }
 
     #[test]
@@ -1146,10 +1175,7 @@ mod tests {
         .unwrap();
         assert_eq!(prog, PathBuf::from("/cache/v1.17.0/deskflow-client"));
         // Port appended when bare host given.
-        assert_eq!(
-            args,
-            vec!["-f", "-1", "-n", "alpha", "peer.local:24800"]
-        );
+        assert_eq!(args, vec!["-f", "-1", "-n", "alpha", "peer.local:24800"]);
     }
 
     #[test]

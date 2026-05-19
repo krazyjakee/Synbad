@@ -41,7 +41,7 @@ pub struct DiscoveredPeer {
     pub fingerprint: String,
     /// Synbad discovery protocol version advertised by the peer.
     pub protocol_version: u32,
-    /// Short hash of the peer's [`VersionedConfig`] head, as advertised
+    /// Short hash of the peer's `VersionedConfig` head, as advertised
     /// in the `cfg` TXT key. Empty if the peer hasn't advertised one. The
     /// daemon uses this to detect divergence and trigger a pull-sync.
     #[serde(default)]
@@ -107,12 +107,26 @@ pub enum Request {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
     Ok,
-    Status { state: DaemonState, recent_log: Vec<String> },
-    Config { config: Config },
-    Peers { peers: Vec<DiscoveredPeer> },
-    LocalIdentity { machine_id: String, fingerprint: String },
-    TrustedPeers { peers: Vec<TrustedPeer> },
-    Error { message: String },
+    Status {
+        state: DaemonState,
+        recent_log: Vec<String>,
+    },
+    Config {
+        config: Config,
+    },
+    Peers {
+        peers: Vec<DiscoveredPeer>,
+    },
+    LocalIdentity {
+        machine_id: String,
+        fingerprint: String,
+    },
+    TrustedPeers {
+        peers: Vec<TrustedPeer>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// Per-peer trust state, surfaced alongside [`DiscoveredPeer`] in the
@@ -130,7 +144,7 @@ pub enum TrustState {
 }
 
 /// A peer the user has paired with. The struct intentionally only carries
-/// public material — the local secret key never leaves [`Identity`] in
+/// public material — the local secret key never leaves `Identity` in
 /// `synbad-discovery`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrustedPeer {
