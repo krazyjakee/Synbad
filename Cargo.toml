@@ -33,6 +33,6 @@ mdns-sd = "0.11"
 uuid = { version = "1", features = ["v4", "serde"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["std"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 interprocess = { version = "2", features = ["tokio"] }
