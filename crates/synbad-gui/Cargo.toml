@@ -16,7 +16,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 directories = { workspace = true }
 eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-egui = "0.27"
+egui = "0.34"
 tray-icon = { version = "0.13", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
