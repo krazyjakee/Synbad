@@ -96,6 +96,12 @@ fn known_asset_sha(name: &str) -> Option<&'static str> {
         "deskflow-1.17.0.0-2_ubuntu_noble_amd64.deb" => {
             Some("4971d0f3b27804ef37aeccd18945985571556a22be35b83cb16d6acd28280de2")
         }
+        "deskflow-1.17.0.0_mac_x64.dmg" => {
+            Some("64fc270052c31fe0843c1c1374ccfefe0d646bd7abf600ca3a9bd978dab4ed88")
+        }
+        "deskflow-1.17.0.0_mac_arm64.dmg" => {
+            Some("cf0421257bb5c1ae1c14ec1f470c119619527e0b1f1b7f9fa1e66213c6bc88f4")
+        }
         _ => None,
     }
 }
@@ -118,6 +124,7 @@ struct StateCache {
     checked_unix: u64,
 }
 
+#[derive(Clone)]
 pub struct Resolver {
     cache_root: PathBuf,
     http: reqwest::Client,
@@ -417,22 +424,22 @@ fn pick_asset(assets: &[ReleaseAsset]) -> Result<&ReleaseAsset> {
     // distro/version permutation.
     let needles: &[&str] = match (os, arch) {
         ("linux", "x86_64") => &[
-            "_ubuntu_noble_amd64.deb",   // v1.17.0
-            "_debian_trixie_amd64.deb",  // v1.17.0
-            "debian-trixie-x86_64.deb",  // v1.19+
+            "_ubuntu_noble_amd64.deb",    // v1.17.0
+            "_debian_trixie_amd64.deb",   // v1.17.0
+            "debian-trixie-x86_64.deb",   // v1.19+
             "ubuntu-resolute-x86_64.deb", // v1.19+
         ],
         ("linux", "aarch64") => &[
-            "debian-trixie-aarch64.deb",  // v1.19+ (v1.17.0 had no aarch64 build)
+            "debian-trixie-aarch64.deb", // v1.19+ (v1.17.0 had no aarch64 build)
             "ubuntu-resolute-aarch64.deb",
         ],
         ("macos", "aarch64") => &[
-            "_mac_arm64.dmg",   // v1.17.0
-            "macos-arm64.dmg",  // v1.19+
+            "_mac_arm64.dmg",  // v1.17.0
+            "macos-arm64.dmg", // v1.19+
         ],
         ("macos", "x86_64") => &[
-            "_mac_x64.dmg",      // v1.17.0
-            "macos-x86_64.dmg",  // v1.19+
+            "_mac_x64.dmg",     // v1.17.0
+            "macos-x86_64.dmg", // v1.19+
         ],
         // v1.17.0's only Windows asset is `_win64.msi`, which we can't
         // extract in pure Rust. .7z portable archives appear from v1.19+.
@@ -851,6 +858,23 @@ mod tests {
         );
     }
 
+    /// Regression for the macOS "looking up sha256 for …" failure: v1.17.0
+    /// ships no `sums.txt`, so every platform's asset must have a baked-in
+    /// hash or `fetch_expected_sha` bails before the download starts.
+    #[test]
+    fn known_sha_covers_every_v1_17_0_extractable_asset() {
+        for name in [
+            "deskflow-1.17.0.0-2_ubuntu_noble_amd64.deb",
+            "deskflow-1.17.0.0_mac_x64.dmg",
+            "deskflow-1.17.0.0_mac_arm64.dmg",
+        ] {
+            assert!(
+                known_asset_sha(name).is_some(),
+                "missing hardcoded sha256 for {name}"
+            );
+        }
+    }
+
     #[test]
     fn layout_kind_for_v1_17_0_is_split_legacy() {
         assert_eq!(layout_kind_for("v1.17.0"), LayoutKind::SplitLegacy);
@@ -886,7 +910,10 @@ mod tests {
         // directly we instead reuse its needle table via a parallel match —
         // if the table changes here without the test changing, this fails.
         let cases: &[((&str, &str), &str)] = &[
-            (("linux", "x86_64"), "deskflow-1.17.0.0-2_ubuntu_noble_amd64.deb"),
+            (
+                ("linux", "x86_64"),
+                "deskflow-1.17.0.0-2_ubuntu_noble_amd64.deb",
+            ),
             (("macos", "x86_64"), "deskflow-1.17.0.0_mac_x64.dmg"),
             (("macos", "aarch64"), "deskflow-1.17.0.0_mac_arm64.dmg"),
         ];

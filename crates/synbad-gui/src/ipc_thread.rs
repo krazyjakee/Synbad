@@ -122,6 +122,26 @@ pub struct IpcHandle {
     pub update_rx: Receiver<Update>,
 }
 
+/// Best-effort synchronous daemon shutdown, used when the user quits the
+/// GUI so a GUI-spawned `synbadd` doesn't outlive the window. Done on a
+/// throwaway thread with a hard deadline: a missing daemon makes
+/// `connect` fail fast, and a wedged one can't stall the quit past the
+/// timeout. Errors are intentionally swallowed — we're exiting anyway.
+pub fn shutdown_daemon(socket_path: PathBuf) {
+    let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+    let spawned = thread::Builder::new()
+        .name("synbad-shutdown".into())
+        .spawn(move || {
+            if let Ok(mut conn) = Connection::connect(&socket_path) {
+                let _ = conn.request(Request::Shutdown);
+            }
+            let _ = done_tx.send(());
+        });
+    if spawned.is_ok() {
+        let _ = done_rx.recv_timeout(Duration::from_millis(1500));
+    }
+}
+
 pub fn spawn(socket_path: PathBuf, repaint: Arc<dyn Fn() + Send + Sync>) -> IpcHandle {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<Cmd>();
     let (update_tx, update_rx) = crossbeam_channel::unbounded::<Update>();

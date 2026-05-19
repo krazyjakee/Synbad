@@ -101,6 +101,10 @@ pub enum Request {
     ListTrustedPeers,
     /// Forget a previously-paired peer.
     RevokeTrust { machine_id: String },
+    /// Stop the Core process and terminate the daemon. The daemon replies
+    /// `Response::Ok`, then exits. Sent by the GUI when the user quits so a
+    /// GUI-spawned `synbadd` doesn't outlive the window.
+    Shutdown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

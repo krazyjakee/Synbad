@@ -27,6 +27,13 @@ use crate::binaries::{CoreLayout, ResolvedCore, Resolver};
 use crate::pairing::{self, IncomingSession, SessionDeps};
 use crate::sync::{self, SyncDeps, SyncOp};
 
+/// Result of resolving the Core binary off the supervisor loop. `Err`
+/// carries a human-readable reason surfaced to the GUI as a log line. The
+/// argv is *not* part of this — it's rebuilt from the live config in
+/// [`Supervisor::on_core_resolved`] so a config change during a slow
+/// download can't spawn the Core with a stale role.
+type CoreResolveOutcome = Result<ResolvedCore, String>;
+
 const LOG_TAIL: usize = 500;
 const MIN_BACKOFF: Duration = Duration::from_millis(500);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -66,6 +73,20 @@ pub struct Supervisor {
     fs_rx: mpsc::Receiver<()>,
     _fs_watcher: RecommendedWatcher,
     resolver: Resolver,
+    /// Carries the Core program+argv (or a failure reason) back from the
+    /// background resolution task into the `select!` loop. Resolving can
+    /// hit the network (GitHub API + a multi-MB asset download + archive
+    /// extraction); doing it inline would freeze the daemon — IPC,
+    /// pairing, discovery and sync would all stall until it finished. See
+    /// [`Supervisor::start_core`] / [`Supervisor::on_core_resolved`].
+    core_resolve_tx: mpsc::Sender<CoreResolveOutcome>,
+    core_resolve_rx: mpsc::Receiver<CoreResolveOutcome>,
+    /// `true` while a resolution task is in flight. Guards against firing
+    /// a second one (e.g. repeated Start clicks) before the first lands.
+    core_resolving: bool,
+    /// Set by `Request::Shutdown`; the run loop stops the Core and returns
+    /// after the response has been flushed to the client.
+    shutdown: bool,
     /// When the currently-spawned child started — used to classify exits
     /// as "instant fail" vs "ran for a while then died".
     started_at: Option<Instant>,
@@ -145,6 +166,7 @@ impl Supervisor {
 
         let resolver = Resolver::new(paths::state_dir().join("bin"))
             .context("initializing binary resolver")?;
+        let (core_resolve_tx, core_resolve_rx) = mpsc::channel::<CoreResolveOutcome>(4);
 
         let identity = Identity::load_or_create(&paths::config_dir().join("identity"))
             .context("loading machine identity")?;
@@ -259,6 +281,10 @@ impl Supervisor {
             fs_rx,
             _fs_watcher: watcher,
             resolver,
+            core_resolve_tx,
+            core_resolve_rx,
+            core_resolving: false,
+            shutdown: false,
             started_at: None,
             fast_fail_count: 0,
             identity,
@@ -301,6 +327,18 @@ impl Supervisor {
             tokio::select! {
                 Some(req) = listener.next_request() => {
                     self.handle_request(req).await;
+                    if self.shutdown {
+                        tracing::info!("shutdown requested by client, stopping");
+                        self.stop_core().await;
+                        // Give the IPC connection task a beat to flush the
+                        // `Response::Ok` we just queued before the process
+                        // exits out from under it.
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        return Ok(());
+                    }
+                }
+                Some(outcome) = self.core_resolve_rx.recv() => {
+                    self.on_core_resolved(outcome).await;
                 }
                 Some(line) = self.log_rx.recv() => {
                     self.record_log(line);
@@ -493,6 +531,12 @@ impl Supervisor {
                     peers: trust.list().to_vec(),
                 }
             }
+            Request::Shutdown => {
+                // Flip the flag; the run loop tears down after this
+                // response is flushed (see `Supervisor::run`).
+                self.shutdown = true;
+                Response::Ok
+            }
             Request::RevokeTrust { machine_id } => {
                 let mut trust = self.trust.lock().await;
                 match trust.remove(&machine_id) {
@@ -570,6 +614,11 @@ impl Supervisor {
         restart_if_running: bool,
     ) -> Result<()> {
         let origin = self.identity.machine_id.to_string();
+        // Decide before swapping `self.config`: does this edit touch any
+        // input the Core actually consumes? Layout-only churn (e.g. a
+        // service/sync port tweak) should apply silently rather than
+        // bouncing active input sharing.
+        let core_inputs_differ = self.config.core_inputs_differ(&new_config);
         let changed = self.versioned.apply_local(new_config.clone(), &origin);
         self.config = new_config;
         if changed {
@@ -582,9 +631,13 @@ impl Supervisor {
         }
         let _ = self.events.send(Event::ConfigChanged);
         if restart_if_running && self.desired_running {
-            self.stop_core().await;
-            if let Err(e) = self.start_core().await {
-                tracing::warn!(?e, "restart after config change failed");
+            if core_inputs_differ {
+                self.stop_core().await;
+                if let Err(e) = self.start_core().await {
+                    tracing::warn!(?e, "restart after config change failed");
+                }
+            } else {
+                tracing::info!("config changed but Core inputs unchanged; applied without restart");
             }
         }
         // Only push when our edit produced a new head. A no-op edit
@@ -673,6 +726,7 @@ impl Supervisor {
                         let _ = reply.send(self.versioned.clone());
                         return;
                     }
+                    let core_inputs_differ = self.config.core_inputs_differ(&self.versioned.config);
                     self.config = self.versioned.config.clone();
                     // Persist both the config TOML and the sidecar.
                     if let Err(e) = self.config.save(&self.config_path) {
@@ -683,12 +737,16 @@ impl Supervisor {
                     }
                     let _ = self.events.send(Event::ConfigChanged);
                     // Regenerate Core artefacts + restart if running so
-                    // the new screen layout / options take effect.
-                    if self.desired_running {
+                    // the new screen layout / options take effect. A
+                    // peer pushing a daemon-only change (e.g. a sync
+                    // port) shouldn't bounce our active input sharing.
+                    if self.desired_running && core_inputs_differ {
                         self.stop_core().await;
                         if let Err(e) = self.start_core().await {
                             tracing::warn!(?e, "restart after sync merge failed");
                         }
+                    } else if self.desired_running {
+                        tracing::info!("merged config left Core inputs unchanged; no restart");
                     }
                     tracing::info!(
                         from = %peer_machine_id,
@@ -701,11 +759,21 @@ impl Supervisor {
         }
     }
 
+    /// Begin starting the Core. Writes the generated artefacts, then kicks
+    /// binary resolution onto a background task and returns immediately —
+    /// the child is actually spawned later in [`Self::on_core_resolved`]
+    /// when the result lands on `core_resolve_rx`.
+    ///
+    /// This indirection is the fix for the daemon freezing while a Core
+    /// download is in flight: `ensure_core` can take many seconds (GitHub
+    /// API, a ~27 MB asset, archive extraction), and the supervisor's
+    /// `select!` loop also services IPC, pairing, discovery and sync.
+    /// Awaiting the download here used to block all of them — pairing in
+    /// particular looked like "clicking Pair does nothing".
     async fn start_core(&mut self) -> Result<()> {
-        if matches!(
-            self.state,
-            DaemonState::Running { .. } | DaemonState::Starting
-        ) || self.child_kill.is_some()
+        if matches!(self.state, DaemonState::Running { .. })
+            || self.child_kill.is_some()
+            || self.core_resolving
         {
             return Ok(());
         }
@@ -724,9 +792,24 @@ impl Supervisor {
         )
         .with_context(|| format!("writing {:?}", settings_path))?;
 
-        let (program, args) = self
-            .resolve_program_and_args(&conf_path, &settings_path)
-            .await?;
+        self.core_resolving = true;
+        let resolver = self.resolver.clone();
+        let config = self.config.clone();
+        let events = self.events.clone();
+        let tx = self.core_resolve_tx.clone();
+        tokio::spawn(async move {
+            let outcome = resolve_core(&resolver, &config, &events)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(outcome).await;
+        });
+        Ok(())
+    }
+
+    /// Spawn the Core child from a resolved binary, wiring up log readers,
+    /// the kill channel, and the exit watcher. Synchronous and fast — all
+    /// the slow work happened in the resolution task.
+    fn spawn_child(&mut self, program: PathBuf, args: Vec<String>) -> Result<()> {
         tracing::info!(program = %program.display(), ?args, "starting core");
 
         let mut cmd = Command::new(&program);
@@ -735,17 +818,13 @@ impl Supervisor {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                self.set_state(DaemonState::Crashed { exit_code: None });
-                return Err(anyhow::anyhow!(
-                    "failed to spawn {}: {}. Is the binary on PATH?",
-                    program.display(),
-                    e
-                ));
-            }
-        };
+        let mut child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!(
+                "failed to spawn {}: {}. Is the binary on PATH?",
+                program.display(),
+                e
+            )
+        })?;
 
         let pid = child.id().unwrap_or(0);
 
@@ -775,6 +854,58 @@ impl Supervisor {
         self.backoff = MIN_BACKOFF;
         self.started_at = Some(Instant::now());
         Ok(())
+    }
+
+    /// Handle the result of an off-loop Core resolution. Spawns the child
+    /// if we still want one; otherwise surfaces the failure as a log line
+    /// and `Crashed` state without retrying (matching the old inline
+    /// behaviour where a failed Start didn't auto-retry).
+    async fn on_core_resolved(&mut self, outcome: CoreResolveOutcome) {
+        self.core_resolving = false;
+
+        // The user may have hit Stop, or a Restart may have superseded
+        // this resolution while it was downloading. Don't spawn a child
+        // nobody asked for.
+        if !self.desired_running {
+            return;
+        }
+        if matches!(self.state, DaemonState::Running { .. }) || self.child_kill.is_some() {
+            return;
+        }
+
+        let resolved = match outcome {
+            Ok(r) => r,
+            Err(reason) => {
+                let msg = format!("[synbad] could not obtain Deskflow Core: {reason}");
+                tracing::error!("{}", msg);
+                self.record_log(msg);
+                self.set_state(DaemonState::Crashed { exit_code: None });
+                return;
+            }
+        };
+
+        // Rebuild argv from the *current* config so a role/address change
+        // that landed while the download ran is honoured.
+        let conf_path = paths::generated_conf();
+        let settings_path = paths::generated_settings();
+        let (program, args) =
+            match build_command(&resolved, &self.config, &conf_path, &settings_path) {
+                Ok(pa) => pa,
+                Err(e) => {
+                    let msg = format!("[synbad] bad Core command line: {e:#}");
+                    tracing::error!("{}", msg);
+                    self.record_log(msg);
+                    self.set_state(DaemonState::Crashed { exit_code: None });
+                    return;
+                }
+            };
+
+        if let Err(e) = self.spawn_child(program, args) {
+            let msg = format!("[synbad] {e:#}");
+            tracing::error!("{}", msg);
+            self.record_log(msg);
+            self.set_state(DaemonState::Crashed { exit_code: None });
+        }
     }
 
     async fn stop_core(&mut self) {
@@ -840,84 +971,6 @@ impl Supervisor {
         }
     }
 
-    /// Resolve the Deskflow Core executable (fetching from upstream on
-    /// first use) and build the CLI for the current role + release layout.
-    ///
-    /// Modern Deskflow (≥ v1.19) ships a unified `deskflow-core` that takes
-    /// `server|client` as a subcommand and reads its settings from a
-    /// QSettings INI passed via `-s`. v1.17.0 ships split daemons with the
-    /// classic Synergy CLI: the server reads a screen-layout `.conf` via
-    /// `-c`; the client takes the server address as a positional argument.
-    /// See [`CoreLayout`] and `Config::generate_deskflow_settings` /
-    /// `Config::generate_synergy_conf`.
-    async fn resolve_program_and_args(
-        &self,
-        conf_path: &Path,
-        settings_path: &Path,
-    ) -> Result<(PathBuf, Vec<String>)> {
-        // User override: always treated as a unified `deskflow-core`.
-        // Anyone wanting to point at v1.17.0-style split daemons should
-        // leave this unset and let the resolver fetch them.
-        if let Some(p) = self.config.binaries.core.clone() {
-            let mode = match self.config.role {
-                NodeRole::Server => "server",
-                NodeRole::Client => "client",
-            };
-            return Ok((
-                p,
-                vec![
-                    mode.into(),
-                    "-s".into(),
-                    settings_path.to_string_lossy().into_owned(),
-                ],
-            ));
-        }
-        let resolved = self.fetch_binary().await?;
-        build_command(&resolved, &self.config, conf_path, settings_path)
-    }
-
-    /// Fetch (or cache-hit) the Deskflow Core release, forwarding upstream
-    /// resolver events to the IPC bus as human-readable log lines.
-    async fn fetch_binary(&self) -> Result<ResolvedCore> {
-        let (tx, mut rx) = mpsc::channel::<crate::binaries::Event>(64);
-        let events = self.events.clone();
-        let forwarder = tokio::spawn(async move {
-            use crate::binaries::Event as BE;
-            while let Some(ev) = rx.recv().await {
-                let line = match ev {
-                    BE::CheckingLatest => "[synbad] checking deskflow releases/latest".to_string(),
-                    BE::Downloading { tag, asset, url } => {
-                        format!("[synbad] downloading {} ({}) from {}", asset, tag, url)
-                    }
-                    BE::Progress {
-                        asset,
-                        bytes,
-                        total,
-                    } => match total {
-                        Some(t) => format!(
-                            "[synbad] {}: {} / {} bytes ({:.1}%)",
-                            asset,
-                            bytes,
-                            t,
-                            (bytes as f64 / t as f64) * 100.0
-                        ),
-                        None => format!("[synbad] {}: {} bytes", asset, bytes),
-                    },
-                    BE::Extracting { tag, asset } => {
-                        format!("[synbad] extracting deskflow core from {} ({})", asset, tag)
-                    }
-                    BE::Ready { tag, path } => {
-                        format!("[synbad] deskflow core {} ready at {}", tag, path.display())
-                    }
-                };
-                let _ = events.send(Event::Log { line });
-            }
-        });
-        let result = self.resolver.ensure_core(tx).await;
-        forwarder.abort();
-        result
-    }
-
     fn record_log(&mut self, line: String) {
         if self.log_tail.len() >= LOG_TAIL {
             self.log_tail.pop_front();
@@ -939,6 +992,71 @@ impl Supervisor {
             let _ = self.events.send(Event::State { state: new_state });
         }
     }
+}
+
+/// Resolve the Deskflow Core binary, fetching from upstream on first use.
+///
+/// Runs on a detached task (see [`Supervisor::start_core`]) so the network
+/// work never blocks the supervisor loop. A user-set `binaries.core`
+/// override short-circuits the fetch and is always treated as a unified
+/// `deskflow-core`; argv for both paths is built later by [`build_command`]
+/// from the live config.
+async fn resolve_core(
+    resolver: &Resolver,
+    config: &Config,
+    events: &broadcast::Sender<Event>,
+) -> Result<ResolvedCore> {
+    if let Some(path) = config.binaries.core.clone() {
+        return Ok(ResolvedCore {
+            layout: CoreLayout::Unified { path },
+        });
+    }
+    fetch_binary(resolver, events).await
+}
+
+/// Fetch (or cache-hit) the Deskflow Core release, forwarding upstream
+/// resolver events to the IPC bus as human-readable log lines.
+async fn fetch_binary(
+    resolver: &Resolver,
+    events: &broadcast::Sender<Event>,
+) -> Result<ResolvedCore> {
+    let (tx, mut rx) = mpsc::channel::<crate::binaries::Event>(64);
+    let events = events.clone();
+    let forwarder = tokio::spawn(async move {
+        use crate::binaries::Event as BE;
+        while let Some(ev) = rx.recv().await {
+            let line = match ev {
+                BE::CheckingLatest => "[synbad] checking deskflow releases/latest".to_string(),
+                BE::Downloading { tag, asset, url } => {
+                    format!("[synbad] downloading {} ({}) from {}", asset, tag, url)
+                }
+                BE::Progress {
+                    asset,
+                    bytes,
+                    total,
+                } => match total {
+                    Some(t) => format!(
+                        "[synbad] {}: {} / {} bytes ({:.1}%)",
+                        asset,
+                        bytes,
+                        t,
+                        (bytes as f64 / t as f64) * 100.0
+                    ),
+                    None => format!("[synbad] {}: {} bytes", asset, bytes),
+                },
+                BE::Extracting { tag, asset } => {
+                    format!("[synbad] extracting deskflow core from {} ({})", asset, tag)
+                }
+                BE::Ready { tag, path } => {
+                    format!("[synbad] deskflow core {} ready at {}", tag, path.display())
+                }
+            };
+            let _ = events.send(Event::Log { line });
+        }
+    });
+    let result = resolver.ensure_core(tx).await;
+    forwarder.abort();
+    result
 }
 
 /// Construct the program + argv for spawning the Deskflow Core child,

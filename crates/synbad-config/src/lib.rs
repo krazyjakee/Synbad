@@ -265,6 +265,27 @@ impl Config {
         Ok(())
     }
 
+    /// Does `other` differ from `self` in any field the Synergy/Deskflow
+    /// Core actually consumes?
+    ///
+    /// The Core only ever sees what flows into `generate_synergy_conf` /
+    /// `generate_deskflow_settings` plus which binary we launch. The
+    /// daemon-only ports — `service_port` (pairing) and `sync_port`
+    /// (config sync) — drive mDNS/pairing/sync and never reach the Core,
+    /// so an edit that touches only those should apply silently instead
+    /// of bouncing active input sharing. Everything else (role,
+    /// server_name, server_address, port, screens, links, options,
+    /// binary override) is a Core input.
+    pub fn core_inputs_differ(&self, other: &Config) -> bool {
+        let core_view = |c: &Config| {
+            let mut c = c.clone();
+            c.service_port = 0;
+            c.sync_port = 0;
+            c
+        };
+        core_view(self) != core_view(other)
+    }
+
     /// Render this config as a Synergy Core `.conf` file body. Always emits
     /// both directions of every link (Synergy requires explicit reverse
     /// edges) and adds a generated-file banner.
@@ -475,6 +496,26 @@ mod tests {
         assert!(c.validate().is_err());
         c.server_address = Some("alpha.local:24800".into());
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn core_inputs_differ_ignores_daemon_only_ports() {
+        let a = sample();
+        let mut b = a.clone();
+        b.service_port = a.service_port + 1;
+        b.sync_port = a.sync_port + 1;
+        assert!(
+            !a.core_inputs_differ(&b),
+            "pairing/sync port tweaks must not count as Core input changes"
+        );
+
+        b.port = a.port + 1;
+        assert!(a.core_inputs_differ(&b), "Core port is a Core input");
+
+        let mut c = a.clone();
+        c.role = NodeRole::Client;
+        c.server_address = Some("peer.local:24800".into());
+        assert!(a.core_inputs_differ(&c), "role change is a Core input");
     }
 
     #[test]

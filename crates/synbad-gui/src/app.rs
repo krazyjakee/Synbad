@@ -80,6 +80,10 @@ pub struct SynbadApp {
     /// User explicitly chose Quit (via tray or future menu item). Lets us
     /// distinguish a real exit from a close-to-tray click.
     quitting: bool,
+    /// Set once we've told the daemon to shut down, so a multi-frame close
+    /// (tray Quit queues a Close that lands next frame) doesn't fire the
+    /// blocking shutdown request more than once.
+    daemon_shutdown_sent: bool,
     /// Receiver fed by the single-instance listener thread. A second
     /// launcher click ping arrives here; we react by raising and focusing
     /// the window, same as the tray's "Show Synbad".
@@ -143,6 +147,7 @@ impl SynbadApp {
             local_fingerprint: None,
             has_tray,
             quitting: false,
+            daemon_shutdown_sent: false,
             show_rx,
             active_syncs: BTreeMap::new(),
             last_sync_status: None,
@@ -245,14 +250,31 @@ impl SynbadApp {
 
     /// Intercept the window close to minimize-to-tray, unless the user
     /// explicitly chose Quit. Tray-less builds get default close behavior.
-    fn handle_close(&self, ctx: &egui::Context) {
-        if !self.has_tray || self.quitting {
+    /// On a real exit (no tray, or Quit chosen) we take the daemon down
+    /// with us so a GUI-spawned `synbadd` doesn't linger.
+    fn handle_close(&mut self, ctx: &egui::Context) {
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if self.has_tray && !self.quitting {
+            if close_requested {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
             return;
         }
-        if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        if close_requested || self.quitting {
+            self.shutdown_daemon_once();
         }
+    }
+
+    /// Tell the daemon to exit, at most once per process. Blocking but
+    /// bounded (see [`ipc_thread::shutdown_daemon`]); only ever called on
+    /// the way out.
+    fn shutdown_daemon_once(&mut self) {
+        if self.daemon_shutdown_sent {
+            return;
+        }
+        self.daemon_shutdown_sent = true;
+        ipc_thread::shutdown_daemon(paths::ipc_socket());
     }
 
     fn drain_ipc(&mut self) {
