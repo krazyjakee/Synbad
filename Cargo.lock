@@ -3634,7 +3634,7 @@ version = "0.1.0"
 dependencies = [
  "directories",
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "toml",
 ]
 
@@ -3650,7 +3650,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "x25519-dalek",
@@ -3668,7 +3668,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "synbad-ipc",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uuid",
@@ -3702,7 +3702,7 @@ dependencies = [
  "serde",
  "serde_json",
  "synbad-config",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -3721,7 +3721,7 @@ dependencies = [
  "synbad-config",
  "synbad-discovery",
  "synbad-ipc",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
