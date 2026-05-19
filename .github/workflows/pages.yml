@@ -38,7 +38,7 @@ jobs:
           # via GitHub's rendered URLs. For richer rendering, swap in mdBook or Zola later.
 
       - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: _site
 
