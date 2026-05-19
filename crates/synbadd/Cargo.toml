@@ -30,7 +30,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # macOS ships .dmg (shelled out to hdiutil — see binaries.rs).
 ar = "0.9"
 tar = "0.4"
-ruzstd = "0.7"
+ruzstd = "0.8"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 sevenz-rust2 = { version = "0.18", optional = true }
 
