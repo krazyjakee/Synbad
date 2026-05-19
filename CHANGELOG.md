@@ -10,6 +10,8 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] - 2026-05-19
+
 ### Added
 - GitHub Actions: CI (fmt/clippy/test on Linux/macOS/Windows), release
   artifact build matrix, weekly `cargo-audit` + `cargo-deny`, GitHub Pages
@@ -18,6 +20,13 @@ All notable changes to Synbad land here. Format follows
 - Project hygiene: dependabot, issue and PR templates, `CONTRIBUTING.md`,
   `rust-toolchain.toml`, `deny.toml`.
 - Landing page scaffold under `site/` for GitHub Pages.
+- Wordmark logo header on every top-level doc and the landing page hero.
+
+### Changed
+- Dependabot: group minor + patch updates into one weekly PR; skip major
+  bumps to stop the per-major PR flood.
+- Audit workflow scoped to `main`/`master` so it doesn't double-fire on
+  dependabot branch pushes.
 
 ## [0.1.0] - TBD
 
