@@ -8,6 +8,7 @@ members = [
     "crates/synbad-discovery",
     "crates/synbad-sync",
     "crates/synbad-crypto",
+    "crates/synbad-update",
 ]
 
 [workspace.package]

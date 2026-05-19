@@ -9,12 +9,33 @@ mod ipc_thread;
 mod layout_editor;
 mod single_instance;
 mod tray;
+mod update;
 
 use app::SynbadApp;
 
 type RepaintFn = Arc<dyn Fn() + Send + Sync>;
 
 fn main() -> eframe::Result<()> {
+    // Privileged-helper short-circuit. When the user has the GUI installed
+    // alone (no sibling synbadd next to it) and the install dir isn't
+    // writable, the updater re-launches *this* binary under elevation with
+    // `__apply-update --plan <path>`. Handle it before the single-instance
+    // guard so the elevated copy doesn't forward to the running GUI and
+    // immediately exit without doing the file moves.
+    let mut args = std::env::args_os().skip(1);
+    if let Some(plan_path) = synbad_update::parse_apply_update_args(&mut args) {
+        match synbad_update::apply_plan(&plan_path) {
+            Ok(plan) => {
+                eprintln!("synbad-gui: installed {}", plan.tag);
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("synbad-gui: apply-update failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

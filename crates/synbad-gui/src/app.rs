@@ -12,6 +12,7 @@ use synbad_ipc::{DaemonState, DiscoveredPeer, SyncDirection, TrustedPeer};
 use crate::ipc_thread::{self, Cmd, IpcHandle, Update};
 use crate::layout_editor::LayoutEditor;
 use crate::tray;
+use crate::update::{self, UpdateState};
 
 const LOG_CAP: usize = 1000;
 
@@ -92,6 +93,13 @@ pub struct SynbadApp {
     /// status indicator so the user knows when a layout change has
     /// reached (or failed to reach) the other side.
     last_sync_status: Option<SyncStatus>,
+
+    /// Whether the Updates modal is currently visible. Toggled by the tray
+    /// menu's "Check for updates…" entry and the Settings tab button.
+    show_update_dialog: bool,
+    /// State machine for the in-progress update flow (check or install).
+    /// `None` means we haven't opened the dialog yet this session.
+    update_state: Option<UpdateState>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +146,8 @@ impl SynbadApp {
             show_rx,
             active_syncs: BTreeMap::new(),
             last_sync_status: None,
+            show_update_dialog: false,
+            update_state: None,
         }
     }
 
@@ -203,12 +213,33 @@ impl SynbadApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
+                tray::MENU_ID_CHECK_UPDATES => {
+                    // Bring the window forward so the user sees the modal
+                    // even if they clicked from a hidden/minimized state.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.open_update_dialog(ctx);
+                }
                 tray::MENU_ID_QUIT => {
                     self.quitting = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Open the Updates modal and auto-kick a check if we don't already
+    /// have a result on screen. Re-clicking while the modal is open is a
+    /// no-op other than ensuring it's visible.
+    fn open_update_dialog(&mut self, ctx: &egui::Context) {
+        self.show_update_dialog = true;
+        let needs_check = matches!(
+            self.update_state,
+            None | Some(UpdateState::CheckFailed(_)) | Some(UpdateState::InstallFailed(_))
+        );
+        if needs_check {
+            self.update_state = Some(update::spawn_check(ctx));
         }
     }
 
@@ -418,6 +449,12 @@ impl eframe::App for SynbadApp {
         self.drain_tray(ctx);
         self.drain_show_requests(ctx);
         self.handle_close(ctx);
+        update::poll(&mut self.update_state);
+        // While a worker is running, ask egui to repaint at ~30 Hz so the
+        // progress bar moves on its own without depending on user input.
+        if update::in_flight(&self.update_state) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -527,6 +564,30 @@ impl eframe::App for SynbadApp {
         // Floating pairing dialogs — rendered last so they layer above the
         // central panel regardless of which tab is active.
         self.draw_pairing_dialogs(ctx);
+
+        // Updates modal — same layering reason, plus it has its own state
+        // machine so we always poll/draw it even when the user is on the
+        // Status tab.
+        if self.show_update_dialog {
+            let action = update::draw_modal(
+                ctx,
+                &mut self.show_update_dialog,
+                &self.update_state,
+                env!("CARGO_PKG_VERSION"),
+            );
+            match action {
+                update::Action::None => {}
+                update::Action::Close => {
+                    self.show_update_dialog = false;
+                }
+                update::Action::Check => {
+                    self.update_state = Some(update::spawn_check(ctx));
+                }
+                update::Action::Install(info) => {
+                    self.update_state = Some(update::spawn_install(ctx, info));
+                }
+            }
+        }
     }
 }
 
@@ -944,6 +1005,14 @@ impl SynbadApp {
                  github.com/deskflow/deskflow on first start.",
             );
             ui.end_row();
+        });
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(format!("Synbad version {}", env!("CARGO_PKG_VERSION")));
+            if ui.button("Check for updates…").clicked() {
+                self.open_update_dialog(ui.ctx());
+            }
         });
 
         ui.separator();

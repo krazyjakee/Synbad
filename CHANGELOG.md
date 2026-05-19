@@ -10,7 +10,17 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.3] - 2026-05-19
+
 ### Added
+- In-app auto-updater under [`crates/synbad-update`](crates/synbad-update/),
+  reachable from the tray menu and the Settings tab. Queries the GitHub
+  Releases API for the latest tag, downloads the matching archive for the
+  host triple, and atomically swaps both `synbadd` and `synbad-gui` in
+  place. When the install directory isn't writable (e.g. `/usr/bin` on
+  Linux), the file-swap step re-launches the sibling binary under
+  `pkexec` / `sudo` / `osascript` / UAC with a hidden
+  `__apply-update --plan <path>` subcommand.
 - Release pipeline now produces native installers alongside the existing
   archives: `.deb` and `.AppImage` for Linux, `.dmg` for macOS (per
   architecture), and `.msi` for Windows. Each ships with a SHA-256 sidecar.

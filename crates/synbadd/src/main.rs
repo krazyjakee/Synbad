@@ -18,8 +18,38 @@ mod sync;
 
 use supervisor::Supervisor;
 
+fn main() -> Result<()> {
+    // Privileged-helper short-circuit. When the auto-updater can't write the
+    // install directory as the calling user (typical for `/usr/bin/synbadd`),
+    // it re-launches this binary under `pkexec` / `sudo` / `osascript` / UAC
+    // with `__apply-update --plan <path>`. We answer that here, *before* we
+    // touch tokio / the ipc socket / config, so the helper does nothing but
+    // perform the file moves the plan describes and exit.
+    let mut args = std::env::args_os().skip(1);
+    if let Some(plan_path) = synbad_update::parse_apply_update_args(&mut args) {
+        return apply_update_helper(&plan_path);
+    }
+
+    run_daemon()
+}
+
+fn apply_update_helper(plan_path: &std::path::Path) -> Result<()> {
+    // Plain stderr — the helper has no logger configured yet and may be
+    // running under pkexec where tracing-subscriber's defaults aren't useful.
+    match synbad_update::apply_plan(plan_path) {
+        Ok(plan) => {
+            eprintln!("synbadd: installed {}", plan.tag);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("synbadd: apply-update failed: {e:#}");
+            Err(e)
+        }
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run_daemon() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

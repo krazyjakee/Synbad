@@ -9,6 +9,7 @@ description = "Synbad GUI — supervisor and tray UI for keyboard/mouse/clipboar
 [dependencies]
 synbad-config = { path = "../synbad-config" }
 synbad-ipc = { path = "../synbad-ipc" }
+synbad-update = { path = "../synbad-update" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

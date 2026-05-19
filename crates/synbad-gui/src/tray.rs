@@ -34,6 +34,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 /// Menu-item ID for the "Show Window" action.
 pub const MENU_ID_SHOW: &str = "synbad.show";
+/// Menu-item ID for the "Check for updates…" action.
+pub const MENU_ID_CHECK_UPDATES: &str = "synbad.check-updates";
 /// Menu-item ID for the "Quit" action.
 pub const MENU_ID_QUIT: &str = "synbad.quit";
 
@@ -92,10 +94,13 @@ mod imp {
     fn build_menu() -> Menu {
         let menu = Menu::new();
         let show = MenuItem::with_id(MENU_ID_SHOW, "Show Synbad", true, None);
+        let check = MenuItem::with_id(MENU_ID_CHECK_UPDATES, "Check for updates…", true, None);
         let quit = MenuItem::with_id(MENU_ID_QUIT, "Quit", true, None);
         // Ignore errors — the only failure mode here is OS-level menu setup
         // and we'd rather have a partially-populated menu than panic at boot.
         let _ = menu.append(&show);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&check);
         let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&quit);
         menu

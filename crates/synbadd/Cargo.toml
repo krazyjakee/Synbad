@@ -11,6 +11,7 @@ synbad-ipc = { path = "../synbad-ipc", features = ["tokio-server"] }
 synbad-discovery = { path = "../synbad-discovery" }
 synbad-sync = { path = "../synbad-sync" }
 synbad-crypto = { path = "../synbad-crypto" }
+synbad-update = { path = "../synbad-update" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
