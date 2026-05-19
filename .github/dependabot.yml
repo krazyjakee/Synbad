@@ -5,10 +5,21 @@ updates:
     schedule:
       interval: weekly
       day: monday
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
     groups:
-      patch-and-minor:
+      # Single weekly PR for all non-major cargo updates — quiet and
+      # easy to merge. Security updates always come as their own PR.
+      cargo-non-major:
         update-types: ["minor", "patch"]
+    ignore:
+      # Skip non-security major bumps. The fresh-repo cron opens one PR per
+      # major-version cliff (and our 0.x deps treat minor as major), which
+      # produces a flood that almost always needs source changes. Re-enable
+      # per-crate by removing this rule or scoping `dependency-name` when
+      # you're ready to do the upgrade work; dependabot still raises
+      # security advisories regardless of this filter.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     labels: ["dependencies", "rust"]
     commit-message:
       prefix: "deps"
@@ -19,6 +30,13 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    open-pull-requests-limit: 3
+    groups:
+      gha-non-major:
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     labels: ["dependencies", "ci"]
     commit-message:
       prefix: "ci(deps)"
