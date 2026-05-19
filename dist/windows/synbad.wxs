@@ -48,6 +48,16 @@
 
     <Icon Id='SynbadIcon.exe' SourceFile='$(var.IconPath)'/>
 
+    <!-- Per-user installs (HKCU) trip two WiX ICE checks unless we handle
+         them deliberately:
+           ICE38 — every component under the user profile must use an HKCU
+                   RegistryValue as its KeyPath, not a File. We add a tiny
+                   `Software\Synbad\Components\<name>` flag per component for
+                   exactly that purpose.
+           ICE64 — every directory under the user profile must show up in
+                   the RemoveFile/RemoveFolder table. The `CleanupInstallDir`
+                   component below carries the RemoveFolder entries for the
+                   install dir + its parent. -->
     <Directory Id='TARGETDIR' Name='SourceDir'>
       <Directory Id='LocalAppDataFolder'>
         <Directory Id='ProgramsFolder' Name='Programs'>
@@ -56,7 +66,13 @@
               <File
                   Id='SynbaddExe'
                   Name='synbadd.exe'
-                  Source='$(var.TargetDir)\synbadd.exe'
+                  Source='$(var.TargetDir)\synbadd.exe'/>
+              <RegistryValue
+                  Root='HKCU'
+                  Key='Software\Synbad\Components'
+                  Name='SynbaddExe'
+                  Type='integer'
+                  Value='1'
                   KeyPath='yes'/>
               <!-- Autostart the daemon at login. Per-user Run key — no admin
                    needed and no scheduled-task custom action required. -->
@@ -72,12 +88,40 @@
               <File
                   Id='SynbadGuiExe'
                   Name='synbad-gui.exe'
-                  Source='$(var.TargetDir)\synbad-gui.exe'
+                  Source='$(var.TargetDir)\synbad-gui.exe'/>
+              <RegistryValue
+                  Root='HKCU'
+                  Key='Software\Synbad\Components'
+                  Name='SynbadGuiExe'
+                  Type='integer'
+                  Value='1'
                   KeyPath='yes'/>
             </Component>
 
             <Component Id='LicenseFile' Guid='*'>
-              <File Id='LicenseFile' Name='LICENSE.txt' Source='$(var.LicensePath)' KeyPath='yes'/>
+              <File Id='LicenseFile' Name='LICENSE.txt' Source='$(var.LicensePath)'/>
+              <RegistryValue
+                  Root='HKCU'
+                  Key='Software\Synbad\Components'
+                  Name='LicenseFile'
+                  Type='integer'
+                  Value='1'
+                  KeyPath='yes'/>
+            </Component>
+
+            <Component Id='CleanupInstallDir' Guid='*'>
+              <RegistryValue
+                  Root='HKCU'
+                  Key='Software\Synbad\Components'
+                  Name='CleanupInstallDir'
+                  Type='integer'
+                  Value='1'
+                  KeyPath='yes'/>
+              <!-- RemoveFolder runs at uninstall and only removes empty
+                   directories, so the Programs entry is safe even when
+                   other apps share %LOCALAPPDATA%\Programs. -->
+              <RemoveFolder Id='RemoveInstallDir' On='uninstall'/>
+              <RemoveFolder Id='RemoveProgramsFolder' Directory='ProgramsFolder' On='uninstall'/>
             </Component>
           </Directory>
         </Directory>
@@ -110,6 +154,7 @@
       <ComponentRef Id='SynbaddExe'/>
       <ComponentRef Id='SynbadGuiExe'/>
       <ComponentRef Id='LicenseFile'/>
+      <ComponentRef Id='CleanupInstallDir'/>
       <ComponentRef Id='ApplicationShortcut'/>
     </Feature>
   </Product>

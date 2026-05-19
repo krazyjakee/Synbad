@@ -189,11 +189,16 @@ jobs:
           # need (GTK/appindicator from the tray feature), and writes a
           # working AppRun. We pass synbad-gui as the main executable and
           # synbadd as a sidecar; both end up under usr/bin.
+          # `--icon-filename synbad` overrides the in-AppDir basename so it
+          # matches `Icon=synbad` in the desktop file (linuxdeploy otherwise
+          # keeps the source filename `synbad-256.png` and bails with
+          # "Could not find suitable icon for Icon entry").
           /tmp/linuxdeploy --appdir "$appdir" \
             --executable target/${{ matrix.target }}/release/synbad-gui \
             --executable target/${{ matrix.target }}/release/synbadd \
             --desktop-file dist/linux/synbad.desktop \
-            --icon-file assets/png/synbad-256.png
+            --icon-file assets/png/synbad-256.png \
+            --icon-filename synbad
           out="dist/Synbad-${version}-x86_64.AppImage"
           ARCH=x86_64 /tmp/appimagetool "$appdir" "$out"
           shasum -a 256 "$out" > "${out}.sha256"
