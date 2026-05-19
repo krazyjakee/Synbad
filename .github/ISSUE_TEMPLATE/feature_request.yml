@@ -1,0 +1,39 @@
+name: Feature request
+description: Propose a new feature or enhancement
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you solving?
+      description: Describe the user-facing problem, not the implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What you'd like Synbad to do. Sketches and mockups welcome.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Affected component
+      multiple: true
+      options:
+        - synbad-gui
+        - synbadd (daemon)
+        - synbad-discovery (LAN)
+        - synbad-sync (config sync)
+        - synbad-crypto (pairing/transport)
+        - packaging / installers
+        - docs
+        - other
+    validations:
+      required: true

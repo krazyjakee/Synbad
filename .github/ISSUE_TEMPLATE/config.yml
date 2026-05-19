@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security disclosure
+    url: https://github.com/krazyjakee/Synbad/security/advisories/new
+    about: Report security vulnerabilities privately via GitHub Security Advisories. Do not file public issues for security bugs.
+  - name: Read the docs first
+    url: https://github.com/krazyjakee/Synbad/tree/main/docs
+    about: Architecture, security model, roadmap, and user guide.

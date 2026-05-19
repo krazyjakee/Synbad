@@ -1,0 +1,31 @@
+[package]
+name = "synbad-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+synbad-config = { path = "../synbad-config" }
+synbad-ipc = { path = "../synbad-ipc" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+crossbeam-channel = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+directories = { workspace = true }
+eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.27"
+tray-icon = { version = "0.13", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# tray-icon on Linux is driven by GTK + appindicator. We need our own gtk dep
+# (matching tray-icon's vendored version) so we can spawn the GTK main loop
+# on a dedicated thread, since eframe uses winit and never runs gtk::main()
+# itself.
+gtk = { version = "0.18", optional = true }
+
+[features]
+default = []
+tray = ["dep:tray-icon", "dep:gtk"]

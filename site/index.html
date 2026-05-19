@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Synbad — one keyboard, every machine</title>
+  <meta name="description" content="Free, open-source desktop client for sharing one keyboard, mouse, and clipboard across nearby computers. LAN auto-discovery, peer-to-peer config sync, no cloud account.">
+  <link rel="icon" type="image/svg+xml" href="assets/icon.svg">
+  <link rel="alternate icon" href="assets/icon.svg">
+  <link rel="stylesheet" href="styles.css">
+  <meta property="og:title" content="Synbad">
+  <meta property="og:description" content="Share one keyboard, mouse, and clipboard across nearby computers — open-source, peer-to-peer, no cloud.">
+  <meta property="og:image" content="assets/logo.svg">
+  <meta property="og:type" content="website">
+  <meta name="theme-color" content="#7c3aed">
+</head>
+<body>
+  <header class="hero">
+    <nav class="nav">
+      <a class="brand" href="./">
+        <img src="assets/icon.svg" alt="" width="36" height="36">
+        <span>Synbad</span>
+      </a>
+      <ul class="nav-links">
+        <li><a href="#features">Features</a></li>
+        <li><a href="#install">Install</a></li>
+        <li><a href="#docs">Docs</a></li>
+        <li><a href="https://github.com/krazyjakee/Synbad" rel="noopener">GitHub</a></li>
+      </ul>
+    </nav>
+
+    <div class="hero-inner">
+      <img class="hero-mark" src="assets/icon.svg" alt="Synbad logo" width="128" height="128">
+      <h1>One keyboard. Every machine.</h1>
+      <p class="lede">
+        Synbad is a free, open-source desktop client for sharing one keyboard,
+        mouse, and clipboard across nearby computers. LAN auto-discovery,
+        peer-to-peer config sync — no cloud account, no telemetry.
+      </p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/krazyjakee/Synbad/releases" rel="noopener">Download</a>
+        <a class="btn ghost" href="https://github.com/krazyjakee/Synbad" rel="noopener">View on GitHub</a>
+      </div>
+      <p class="micro">
+        Built on the open-source Synergy Core (GPLv2, upstream of
+        <a href="https://github.com/deskflow/deskflow" rel="noopener">Deskflow</a>).
+        Not affiliated with or endorsed by Symless.
+      </p>
+    </div>
+  </header>
+
+  <main>
+    <section id="features" class="section">
+      <h2>What it does</h2>
+      <div class="grid">
+        <article class="card">
+          <h3>Shared input</h3>
+          <p>Move your cursor between machines like they're one display. Keyboard, mouse, and clipboard follow.</p>
+        </article>
+        <article class="card">
+          <h3>LAN auto-discovery</h3>
+          <p>Peers find each other over mDNS — no manual IPs, hostnames, or accounts. Pair once, stay paired.</p>
+        </article>
+        <article class="card">
+          <h3>Config sync, peer-to-peer</h3>
+          <p>Edit your screen layout on any machine; every peer converges. No central server, no cloud.</p>
+        </article>
+        <article class="card">
+          <h3>Cross-platform GUI</h3>
+          <p>Native client for Linux, macOS, and Windows. Modern config UI, optional system tray.</p>
+        </article>
+        <article class="card">
+          <h3>Encrypted transport</h3>
+          <p>Pairing handshake plus authenticated, encrypted peer-to-peer channels — see the security model.</p>
+        </article>
+        <article class="card">
+          <h3>Open source</h3>
+          <p>MIT-licensed client; supervises the GPLv2 Core fetched on first run. No bundled binaries, no surprises.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="install" class="section alt">
+      <h2>Install</h2>
+      <p>
+        Pre-built binaries land on the
+        <a href="https://github.com/krazyjakee/Synbad/releases" rel="noopener">GitHub releases page</a>
+        once tagged. Until then, build from source:
+      </p>
+<pre><code>git clone https://github.com/krazyjakee/Synbad
+cd Synbad
+cargo build --release --workspace</code></pre>
+      <p>Per-platform autostart installers live in
+        <a href="https://github.com/krazyjakee/Synbad/tree/main/dist" rel="noopener"><code>dist/</code></a>:
+        systemd user unit (Linux), launchd agent (macOS), Task Scheduler entry (Windows).</p>
+    </section>
+
+    <section id="docs" class="section">
+      <h2>Documentation</h2>
+      <ul class="doc-list">
+        <li><a href="docs/USER-GUIDE.md">User guide</a> — install, pair, share input</li>
+        <li><a href="docs/ARCHITECTURE.md">Architecture</a> — component layout and Core integration</li>
+        <li><a href="docs/SECURITY.md">Security</a> — threat model, identity, pairing, transport</li>
+        <li><a href="docs/DISCOVERY.md">Discovery</a> — LAN auto-discovery design</li>
+        <li><a href="docs/CONFIG-SYNC.md">Config sync</a> — peer-to-peer replication</li>
+        <li><a href="docs/ROADMAP.md">Roadmap</a> — phased delivery plan</li>
+        <li><a href="docs/LICENSING.md">Licensing</a> — MIT client, GPLv2 Core, trademark notes</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      &copy; <span id="year"></span> Synbad contributors —
+      <a href="https://github.com/krazyjakee/Synbad/blob/main/LICENSE" rel="noopener">MIT</a> ·
+      <a href="https://github.com/krazyjakee/Synbad" rel="noopener">Source</a> ·
+      <a href="https://github.com/krazyjakee/Synbad/security/advisories/new" rel="noopener">Report a vulnerability</a>
+    </p>
+    <p class="micro">
+      "Synergy" is a trademark of Symless. Synbad is not affiliated with
+      Symless and uses only the open-source Synergy Core under GPLv2.
+    </p>
+  </footer>
+
+  <script>document.getElementById('year').textContent = new Date().getFullYear();</script>
+</body>
+</html>

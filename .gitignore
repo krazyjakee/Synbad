@@ -9,7 +9,19 @@ Cargo.lock.orig
 *.swp
 .DS_Store
 
+# Claude Code local state
+.claude/
+
 # Local config / runtime
 *.log
 /run/
 synbad.conf.local
+
+# Generated brand assets (regenerate with assets/scripts/generate-icons.sh)
+/assets/png/
+/assets/synbad.ico
+/assets/synbad.icns
+/assets/synbad.iconset/
+
+# Local Pages preview
+/site/_site/

@@ -1,0 +1,41 @@
+[package]
+name = "synbadd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+synbad-config = { path = "../synbad-config" }
+synbad-ipc = { path = "../synbad-ipc", features = ["tokio-server"] }
+synbad-discovery = { path = "../synbad-discovery" }
+synbad-sync = { path = "../synbad-sync" }
+synbad-crypto = { path = "../synbad-crypto" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+notify = { workspace = true }
+directories = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+sha2 = "0.10"
+hex = "0.4"
+rand_core = { workspace = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Archive formats for extracting deskflow-core from upstream release assets.
+# Linux ships .deb (ar -> data.tar.zst -> tar); Windows ships portable .7z;
+# macOS ships .dmg (shelled out to hdiutil — see binaries.rs).
+ar = "0.9"
+tar = "0.4"
+ruzstd = "0.7"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+sevenz-rust2 = { version = "0.18", optional = true }
+
+[features]
+default = []
+# Pure-Rust 7z extraction adds ~1MB of code; gate behind a feature so Linux
+# builds don't pay for it. Enable for Windows.
+sevenz = ["dep:sevenz-rust2"]

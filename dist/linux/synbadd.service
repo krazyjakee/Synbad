@@ -1,0 +1,34 @@
+[Unit]
+Description=Synbad daemon (keyboard/mouse/clipboard sharing supervisor)
+Documentation=https://github.com/krazyjakee/Synbad
+# Ensure the user's graphical session is up before we try to start the Core
+# (which talks to the display server). systemd-user "graphical-session.target"
+# is the right anchor on most modern distros (GNOME / KDE / sway). If you run
+# a bespoke session that doesn't emit that target, drop this line.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# `synbadd` is a long-running supervisor; restart on crash but back off so a
+# tight crash loop doesn't pin a CPU.
+ExecStart=%h/.local/bin/synbadd
+Restart=on-failure
+RestartSec=5s
+# `synbadd` writes logs to stderr; capture them into the journal so
+# `journalctl --user -u synbadd` shows everything.
+StandardOutput=journal
+StandardError=journal
+# Reasonable filesystem sandbox for a user service: no network exception
+# because we *do* need LAN access for discovery + sync. Adjust if you
+# install into a non-default prefix.
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+# Synbad reads/writes:
+#   ~/.config/synbad/   — identity, trust store, config
+#   ~/.local/share/synbad/ — cached deskflow-core binary
+# Keep them writable; everything else is read-only.
+
+[Install]
+WantedBy=default.target

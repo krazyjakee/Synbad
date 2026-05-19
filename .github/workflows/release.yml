@@ -1,0 +1,159 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0). Leave blank to build HEAD without publishing."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            gui_features: tray
+            daemon_features: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            gui_features: ""
+            daemon_features: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            gui_features: ""
+            daemon_features: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            gui_features: ""
+            daemon_features: sevenz
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+
+      - name: Build synbadd
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.daemon_features }}" ]; then
+            cargo build --release --target ${{ matrix.target }} -p synbadd --features "${{ matrix.daemon_features }}"
+          else
+            cargo build --release --target ${{ matrix.target }} -p synbadd
+          fi
+
+      - name: Build synbad-gui
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.gui_features }}" ]; then
+            cargo build --release --target ${{ matrix.target }} -p synbad-gui --features "${{ matrix.gui_features }}"
+          else
+            cargo build --release --target ${{ matrix.target }} -p synbad-gui
+          fi
+
+      - name: Stage artifacts
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [ -z "$version" ] || [ "$version" = "${GITHUB_REF_NAME}" ]; then
+            version="$(git rev-parse --short HEAD)"
+          fi
+          stage="synbad-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${stage}"
+          ext=""
+          if [ "${{ runner.os }}" = "Windows" ]; then ext=".exe"; fi
+          cp "target/${{ matrix.target }}/release/synbadd${ext}"     "dist/${stage}/"
+          cp "target/${{ matrix.target }}/release/synbad-gui${ext}"  "dist/${stage}/"
+          cp README.md LICENSE "dist/${stage}/"
+          # Installer + service files
+          case "${{ runner.os }}" in
+            Linux)   cp -r dist/linux   "dist/${stage}/install" ;;
+            macOS)   cp -r dist/macos   "dist/${stage}/install" ;;
+            Windows) cp -r dist/windows "dist/${stage}/install" ;;
+          esac
+          echo "stage=${stage}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Archive (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          cd dist
+          tar -czf "${{ steps.stage.outputs.stage }}.tar.gz" "${{ steps.stage.outputs.stage }}"
+          shasum -a 256 "${{ steps.stage.outputs.stage }}.tar.gz" > "${{ steps.stage.outputs.stage }}.tar.gz.sha256"
+
+      - name: Archive (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          cd dist
+          Compress-Archive -Path "${{ steps.stage.outputs.stage }}" -DestinationPath "${{ steps.stage.outputs.stage }}.zip"
+          (Get-FileHash "${{ steps.stage.outputs.stage }}.zip" -Algorithm SHA256).Hash + "  ${{ steps.stage.outputs.stage }}.zip" `
+            | Out-File -Encoding ascii "${{ steps.stage.outputs.stage }}.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.stage.outputs.stage }}
+          path: |
+            dist/${{ steps.stage.outputs.stage }}.${{ matrix.archive }}
+            dist/${{ steps.stage.outputs.stage }}.${{ matrix.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -lR artifacts
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
+            artifacts/*.zip
+            artifacts/*.zip.sha256
+          generate_release_notes: true
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

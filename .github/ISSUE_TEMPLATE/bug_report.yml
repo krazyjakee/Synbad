@@ -1,0 +1,74 @@
+name: Bug report
+description: Report a defect in Synbad (GUI, daemon, sync, discovery, or installers)
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please include enough detail that we can
+        reproduce. **Do not** include peer identity keys, pairing secrets, or
+        anything from `~/.config/synbad/identity.*` — share fingerprints only.
+
+  - type: input
+    id: version
+    attributes:
+      label: Synbad version
+      description: "Output of `synbadd --version` (or commit hash if built from source)."
+      placeholder: "0.1.0 / abc1234"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux (X11)
+        - Linux (Wayland)
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      placeholder: "Ubuntu 24.04 / macOS 14.5 / Windows 11 23H2"
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what did you observe?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        Daemon logs are under `$XDG_STATE_HOME/synbad/` on Linux/macOS or
+        `%LOCALAPPDATA%\synbad\` on Windows. Trim to the relevant section.
+      render: shell
+
+  - type: checkboxes
+    id: hygiene
+    attributes:
+      label: Hygiene
+      options:
+        - label: I searched existing issues and didn't find a duplicate.
+          required: true
+        - label: I removed identity keys, pairing secrets, and other secrets from the report.
+          required: true

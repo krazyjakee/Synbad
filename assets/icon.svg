@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Synbad">
+  <title>Synbad</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+    <linearGradient id="screenA" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.98"/>
+      <stop offset="100%" stop-color="#e0e7ff" stop-opacity="0.92"/>
+    </linearGradient>
+    <linearGradient id="screenB" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#c7d2fe" stop-opacity="0.78"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+      <feOffset dx="0" dy="3" result="o"/>
+      <feComponentTransfer in="o" result="oa"><feFuncA type="linear" slope="0.35"/></feComponentTransfer>
+      <feMerge><feMergeNode in="oa"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+
+  <g filter="url(#shadow)">
+    <!-- back screen -->
+    <g>
+      <rect x="40" y="66" width="116" height="80" rx="10" fill="url(#screenA)"/>
+      <rect x="40" y="66" width="116" height="80" rx="10" fill="none" stroke="#312e81" stroke-opacity="0.15" stroke-width="1.5"/>
+      <!-- stand -->
+      <rect x="86" y="146" width="24" height="8" fill="#ffffff" fill-opacity="0.9"/>
+      <rect x="74" y="152" width="48" height="6" rx="2" fill="#ffffff" fill-opacity="0.9"/>
+      <!-- cursor -->
+      <path d="M118 112 L132 122 L124 124 L122 134 Z" fill="#7c3aed"/>
+    </g>
+    <!-- front screen -->
+    <g>
+      <rect x="100" y="110" width="116" height="80" rx="10" fill="url(#screenB)"/>
+      <rect x="100" y="110" width="116" height="80" rx="10" fill="none" stroke="#312e81" stroke-opacity="0.18" stroke-width="1.5"/>
+      <rect x="146" y="190" width="24" height="8" fill="#ffffff" fill-opacity="0.95"/>
+      <rect x="134" y="196" width="48" height="6" rx="2" fill="#ffffff" fill-opacity="0.95"/>
+      <!-- cursor (mirrored, showing handoff) -->
+      <path d="M118 132 L132 142 L124 144 L122 154 Z" fill="#2563eb" opacity="0.85"/>
+    </g>
+  </g>
+
+  <!-- bridging chevrons: bidirectional input handoff -->
+  <g fill="none" stroke="#ffffff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round" opacity="0.95">
+    <path d="M86 56 L66 44 L86 32"/>
+    <path d="M170 224 L190 212 L170 200"/>
+  </g>
+</svg>

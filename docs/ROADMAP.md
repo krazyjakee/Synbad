@@ -27,15 +27,17 @@ Delivery is phased so each phase is independently usable.
 - [ ] Pairing/trust handshake before a peer can join
 
 ## Phase 4 — LAN config sync
-- [ ] `synbad-sync`: peer-to-peer replication of the config model
+- [x] `synbad-sync`: peer-to-peer replication of the config model
        (see CONFIG-SYNC.md)
-- [ ] Conflict resolution + convergence across all peers
-- [ ] Config changes on any node propagate and regenerate the Core `.conf`
+- [x] Conflict resolution + convergence across all peers
+- [x] Config changes on any node propagate and regenerate the Core `.conf`
 
 ## Phase 5 — Hardening
-- [ ] Transport encryption + authenticated pairing for discovery/sync
-- [ ] Packaging/installers per platform; autostart of `synbadd`
-- [ ] Docs: user guide, security model
+- [x] Transport encryption + authenticated pairing for discovery/sync
+       (see SECURITY.md; implementation in `synbad-crypto`)
+- [x] Packaging/installers per platform; autostart of `synbadd`
+       (see `dist/` — systemd user unit, launchd plist, scheduled task)
+- [x] Docs: user guide, security model (USER-GUIDE.md, SECURITY.md)
 
 ## Possible future
 - [ ] Native-Rust protocol implementation to drop the Core-binary dependency

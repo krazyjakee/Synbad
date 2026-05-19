@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 200" width="720" height="200" role="img" aria-label="Synbad">
+  <title>Synbad</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+    <linearGradient id="screenA" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.98"/>
+      <stop offset="100%" stop-color="#e0e7ff" stop-opacity="0.92"/>
+    </linearGradient>
+    <linearGradient id="screenB" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#c7d2fe" stop-opacity="0.78"/>
+    </linearGradient>
+    <linearGradient id="wordmark" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+  </defs>
+
+  <!-- mark (scaled copy of icon, no background) -->
+  <g transform="translate(20,20) scale(0.625)">
+    <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+    <g>
+      <rect x="40" y="66" width="116" height="80" rx="10" fill="url(#screenA)"/>
+      <rect x="86" y="146" width="24" height="8" fill="#ffffff" fill-opacity="0.9"/>
+      <rect x="74" y="152" width="48" height="6" rx="2" fill="#ffffff" fill-opacity="0.9"/>
+      <path d="M118 112 L132 122 L124 124 L122 134 Z" fill="#7c3aed"/>
+    </g>
+    <g>
+      <rect x="100" y="110" width="116" height="80" rx="10" fill="url(#screenB)"/>
+      <rect x="146" y="190" width="24" height="8" fill="#ffffff" fill-opacity="0.95"/>
+      <rect x="134" y="196" width="48" height="6" rx="2" fill="#ffffff" fill-opacity="0.95"/>
+      <path d="M118 132 L132 142 L124 144 L122 154 Z" fill="#2563eb" opacity="0.85"/>
+    </g>
+  </g>
+
+  <!-- wordmark -->
+  <g transform="translate(200,0)">
+    <text x="0" y="118"
+          font-family="Inter, 'SF Pro Display', 'Helvetica Neue', Arial, sans-serif"
+          font-weight="800"
+          font-size="92"
+          letter-spacing="-2"
+          fill="url(#wordmark)">Synbad</text>
+    <text x="4" y="158"
+          font-family="Inter, 'SF Pro Text', 'Helvetica Neue', Arial, sans-serif"
+          font-weight="500"
+          font-size="22"
+          letter-spacing="0.5"
+          fill="#475569">one keyboard. every machine.</text>
+  </g>
+</svg>

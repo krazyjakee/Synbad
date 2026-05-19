@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Per-user launchd agent for Synbad. Install into
+  ~/Library/LaunchAgents/dev.synbad.synbadd.plist and load with
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.synbad.synbadd.plist
+  See dist/macos/install.sh for the wrapper that does this end-to-end.
+
+  Why a LaunchAgent and not a LaunchDaemon: synbadd uses input-sharing APIs
+  that need to live in the user's GUI session. Daemons run pre-login with
+  no graphical context and would fail to attach.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.synbad.synbadd</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/synbadd</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <!-- Restart only on non-zero exit; a clean shutdown (Stop in the GUI)
+         shouldn't trigger an immediate respawn loop. -->
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <!-- launchd will throttle restarts to once per ThrottleInterval seconds.
+       10s matches our internal MIN_BACKOFF and avoids hammering the system
+       if the binary instant-fails (missing Core deps, etc). -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/synbadd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/synbadd.err.log</string>
+
+  <!-- Run only when a user is graphically logged in. -->
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+</dict>
+</plist>
