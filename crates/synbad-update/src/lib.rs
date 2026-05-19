@@ -143,21 +143,44 @@ pub fn is_newer(tag: &str, current: &str) -> bool {
     lhs > rhs
 }
 
-/// Query the GitHub Releases API for the latest published release and pick
+/// Query the GitHub Releases API for the newest published release and pick
 /// the asset matching this host. `current_version` is the version the running
 /// binary was built with (caller passes `env!("CARGO_PKG_VERSION")`).
+///
+/// We list releases rather than calling `/releases/latest`: that endpoint
+/// only ever returns the latest *stable* release and 404s when every release
+/// is a prerelease — which is exactly Synbad's situation while tags carry an
+/// `-alpha.N` suffix. Listing returns drafts + prereleases too, so we filter
+/// drafts and pick the highest semver tag ourselves.
 pub fn check(current_version: &str) -> Result<CheckResult> {
-    let url =
-        format!("https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest");
+    let url = format!(
+        "https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases?per_page=30"
+    );
     let resp = ureq::get(&url)
         .set("User-Agent", USER_AGENT)
         .set("Accept", "application/vnd.github+json")
         .timeout(std::time::Duration::from_secs(20))
         .call()
         .with_context(|| format!("GET {url}"))?;
-    let release: GhRelease = resp
+    let releases: Vec<GhRelease> = resp
         .into_json()
         .context("parse GitHub releases JSON")?;
+
+    let release = releases
+        .into_iter()
+        .filter(|r| !r.draft)
+        .filter_map(|r| {
+            let ver = semver::Version::parse(
+                r.tag_name.trim().trim_start_matches('v'),
+            )
+            .ok()?;
+            Some((ver, r))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0))
+        .map(|(_, r)| r)
+        .ok_or_else(|| {
+            anyhow!("no published (non-draft) releases with a semver tag found")
+        })?;
 
     let target = host_target()?;
     let asset = pick_asset(&release.assets, target)
@@ -676,6 +699,8 @@ struct GhRelease {
     html_url: String,
     body: Option<String>,
     assets: Vec<GhAsset>,
+    #[serde(default)]
+    draft: bool,
 }
 
 #[derive(Deserialize, Debug)]

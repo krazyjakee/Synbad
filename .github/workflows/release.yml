@@ -322,5 +322,10 @@ jobs:
             artifacts/*.msi
             artifacts/*.msi.sha256
           generate_release_notes: true
-          draft: true
+          # Publish immediately (not a draft): the in-app auto-updater queries
+          # the GitHub API unauthenticated, and draft releases are invisible to
+          # anonymous requests. Prereleases (`-alpha.N` tags) stay flagged as
+          # prerelease but are still publicly listed, which is what the updater
+          # needs.
+          draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
