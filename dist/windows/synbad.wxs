@@ -62,7 +62,11 @@
       <Directory Id='LocalAppDataFolder'>
         <Directory Id='ProgramsFolder' Name='Programs'>
           <Directory Id='INSTALLDIR' Name='Synbad'>
-            <Component Id='SynbaddExe' Guid='*'>
+            <!-- File+Registry-keypath components need explicit, stable GUIDs
+                 (WiX 3 CNDL0230); '*' auto-gen only works for single-keypath
+                 components. Generated once with uuidgen; never change these
+                 across versions or upgrades break. -->
+            <Component Id='SynbaddExe' Guid='9B86752F-D81D-4D1B-A9A4-D82C422B3B11'>
               <File
                   Id='SynbaddExe'
                   Name='synbadd.exe'
@@ -84,7 +88,7 @@
                   Value='"[INSTALLDIR]synbadd.exe"'/>
             </Component>
 
-            <Component Id='SynbadGuiExe' Guid='*'>
+            <Component Id='SynbadGuiExe' Guid='A761E683-48A7-494E-8C37-5ABEE613D4D8'>
               <File
                   Id='SynbadGuiExe'
                   Name='synbad-gui.exe'
@@ -98,7 +102,7 @@
                   KeyPath='yes'/>
             </Component>
 
-            <Component Id='LicenseFile' Guid='*'>
+            <Component Id='LicenseFile' Guid='E1EC2720-B994-4072-B31E-AADEE75D9557'>
               <File Id='LicenseFile' Name='LICENSE.txt' Source='$(var.LicensePath)'/>
               <RegistryValue
                   Root='HKCU'
