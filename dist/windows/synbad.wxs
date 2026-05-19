@@ -1,0 +1,116 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  WiX 3 source for the Synbad MSI.
+
+  We ship a per-user installer (no UAC prompt) that mirrors what
+  `install.ps1` does manually:
+    - Drop `synbadd.exe` and `synbad-gui.exe` under %LOCALAPPDATA%\Programs\Synbad
+    - Add a Start Menu shortcut to the GUI
+    - Register `synbadd` for login autostart via HKCU\…\Run
+
+  Why per-user: `synbadd` needs the user's graphical session. A per-machine
+  install (running as SYSTEM via Task Scheduler) can't share input with the
+  logged-in user reliably; this matches the rationale in dist/README.md.
+
+  Built by `cargo-wix` in the release pipeline. cargo-wix passes the build
+  target directory in via `-d TargetDir=…` and the version via `-d Version=…`.
+-->
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+  <Product
+      Id='*'
+      Name='Synbad'
+      UpgradeCode='D7C3AED0-2563-4EB0-8C3A-7C3AED2563EB'
+      Manufacturer='Synbad Contributors'
+      Language='1033'
+      Codepage='1252'
+      Version='$(var.Version)'>
+
+    <Package
+        Id='*'
+        Keywords='Installer'
+        Description='Synbad — keyboard, mouse, and clipboard sharing'
+        Manufacturer='Synbad Contributors'
+        InstallerVersion='500'
+        Languages='1033'
+        Compressed='yes'
+        InstallScope='perUser'
+        SummaryCodepage='1252'/>
+
+    <MajorUpgrade
+        Schedule='afterInstallInitialize'
+        DowngradeErrorMessage='A newer version of Synbad is already installed.'/>
+
+    <Media Id='1' Cabinet='synbad.cab' EmbedCab='yes'/>
+
+    <Property Id='ALLUSERS' Value='2'/>
+    <Property Id='MSIINSTALLPERUSER' Value='1'/>
+    <Property Id='ARPPRODUCTICON' Value='SynbadIcon.exe'/>
+
+    <Icon Id='SynbadIcon.exe' SourceFile='$(var.IconPath)'/>
+
+    <Directory Id='TARGETDIR' Name='SourceDir'>
+      <Directory Id='LocalAppDataFolder'>
+        <Directory Id='ProgramsFolder' Name='Programs'>
+          <Directory Id='INSTALLDIR' Name='Synbad'>
+            <Component Id='SynbaddExe' Guid='*'>
+              <File
+                  Id='SynbaddExe'
+                  Name='synbadd.exe'
+                  Source='$(var.TargetDir)\synbadd.exe'
+                  KeyPath='yes'/>
+              <!-- Autostart the daemon at login. Per-user Run key — no admin
+                   needed and no scheduled-task custom action required. -->
+              <RegistryValue
+                  Root='HKCU'
+                  Key='Software\Microsoft\Windows\CurrentVersion\Run'
+                  Name='SynbadDaemon'
+                  Type='string'
+                  Value='"[INSTALLDIR]synbadd.exe"'/>
+            </Component>
+
+            <Component Id='SynbadGuiExe' Guid='*'>
+              <File
+                  Id='SynbadGuiExe'
+                  Name='synbad-gui.exe'
+                  Source='$(var.TargetDir)\synbad-gui.exe'
+                  KeyPath='yes'/>
+            </Component>
+
+            <Component Id='LicenseFile' Guid='*'>
+              <File Id='LicenseFile' Name='LICENSE.txt' Source='$(var.LicensePath)' KeyPath='yes'/>
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+
+      <Directory Id='ProgramMenuFolder'>
+        <Directory Id='ApplicationProgramsFolder' Name='Synbad'>
+          <Component Id='ApplicationShortcut' Guid='*'>
+            <Shortcut
+                Id='GuiShortcut'
+                Name='Synbad'
+                Description='Launch the Synbad GUI'
+                Target='[INSTALLDIR]synbad-gui.exe'
+                WorkingDirectory='INSTALLDIR'
+                Icon='SynbadIcon.exe'/>
+            <RemoveFolder Id='RemoveAppShortcutFolder' On='uninstall'/>
+            <RegistryValue
+                Root='HKCU'
+                Key='Software\Synbad'
+                Name='installed'
+                Type='integer'
+                Value='1'
+                KeyPath='yes'/>
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id='Complete' Title='Synbad' Level='1'>
+      <ComponentRef Id='SynbaddExe'/>
+      <ComponentRef Id='SynbadGuiExe'/>
+      <ComponentRef Id='LicenseFile'/>
+      <ComponentRef Id='ApplicationShortcut'/>
+    </Feature>
+  </Product>
+</Wix>

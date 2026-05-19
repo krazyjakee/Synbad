@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Synbad
+GenericName=Keyboard and Mouse Sharing
+Comment=Share keyboard, mouse, and clipboard across nearby computers
+Exec=synbad-gui
+Icon=synbad
+Terminal=false
+Categories=Network;
+Keywords=keyboard;mouse;clipboard;sharing;kvm;synergy;deskflow;
+StartupNotify=true
+StartupWMClass=synbad-gui

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Synbad GUI — supervisor and tray UI for keyboard/mouse/clipboard sharing."
 
 [dependencies]
 synbad-config = { path = "../synbad-config" }
@@ -29,3 +30,36 @@ gtk = { version = "0.18", optional = true }
 [features]
 default = []
 tray = ["dep:tray-icon", "dep:gtk"]
+
+# `cargo deb` reads this section to build a .deb that bundles both binaries,
+# the systemd user unit, and a desktop entry. Paths under `target/release/`
+# are auto-rewritten to the right `--target` directory by cargo-deb; other
+# paths are relative to this Cargo.toml. The actual build is driven from the
+# release workflow (with `--no-build` because the matrix already produced
+# the binaries).
+[package.metadata.deb]
+name = "synbad"
+maintainer = "Jake Cattrall <krazyjakee@gmail.com>"
+copyright = "2026, Jake Cattrall and Synbad contributors"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+Synbad shares a keyboard, mouse, and clipboard across nearby computers over
+the LAN. This package installs the synbadd supervisor daemon and the
+synbad-gui control surface, plus a per-user systemd unit that autostarts the
+daemon at login.\
+"""
+section = "net"
+priority = "optional"
+depends = "$auto, libgtk-3-0, libayatana-appindicator3-1"
+assets = [
+    ["target/release/synbad-gui", "usr/bin/synbad-gui", "755"],
+    ["target/release/synbadd", "usr/bin/synbadd", "755"],
+    ["../../dist/linux/synbad.desktop", "usr/share/applications/synbad.desktop", "644"],
+    ["../../dist/linux/synbadd.service", "usr/lib/systemd/user/synbadd.service", "644"],
+    ["../../assets/png/synbad-256.png", "usr/share/icons/hicolor/256x256/apps/synbad.png", "644"],
+    ["../../assets/png/synbad-128.png", "usr/share/icons/hicolor/128x128/apps/synbad.png", "644"],
+    ["../../assets/png/synbad-64.png",  "usr/share/icons/hicolor/64x64/apps/synbad.png",   "644"],
+    ["../../assets/png/synbad-48.png",  "usr/share/icons/hicolor/48x48/apps/synbad.png",   "644"],
+    ["../../assets/png/synbad-32.png",  "usr/share/icons/hicolor/32x32/apps/synbad.png",   "644"],
+    ["../../README.md", "usr/share/doc/synbad/README.md", "644"],
+]

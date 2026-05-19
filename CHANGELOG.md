@@ -10,6 +10,18 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+### Added
+- Release pipeline now produces native installers alongside the existing
+  archives: `.deb` and `.AppImage` for Linux, `.dmg` for macOS (per
+  architecture), and `.msi` for Windows. Each ships with a SHA-256 sidecar.
+  Installers are unsigned for now — Gatekeeper and SmartScreen will warn
+  on first launch until code signing and notarization are wired up.
+- WiX source under [`dist/windows/synbad.wxs`](dist/windows/synbad.wxs),
+  macOS `Info.plist` under [`dist/macos/Info.plist`](dist/macos/Info.plist),
+  and a `synbad.desktop` entry under
+  [`dist/linux/synbad.desktop`](dist/linux/synbad.desktop) — used by the
+  per-platform packaging steps in the release workflow.
+
 ## [0.1.0-alpha.2] - 2026-05-19
 
 ### Added

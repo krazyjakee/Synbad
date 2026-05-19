@@ -62,7 +62,15 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev \
+                                  librsvg2-bin file desktop-file-utils
+
+      - name: Install macOS deps
+        if: runner.os == 'macOS'
+        run: |
+          # rsvg-convert powers assets/scripts/generate-icons.sh; iconutil
+          # ships with Xcode CLT (already on the runner).
+          brew install librsvg
 
       - name: Build synbadd
         shell: bash
@@ -124,13 +132,159 @@ jobs:
           (Get-FileHash "${{ steps.stage.outputs.stage }}.zip" -Algorithm SHA256).Hash + "  ${{ steps.stage.outputs.stage }}.zip" `
             | Out-File -Encoding ascii "${{ steps.stage.outputs.stage }}.zip.sha256"
 
+      # --- Native installers ----------------------------------------------
+      # Raster + per-platform icons (.ico / .icns) are produced from the SVG
+      # master on demand; we don't commit the binary outputs.
+      - name: Generate icons (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash assets/scripts/generate-icons.sh
+
+      - name: Install cargo-deb + AppImage tools (Linux)
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Download appimagetool + linuxdeploy (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          curl -fsSL -o /tmp/linuxdeploy \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x /tmp/appimagetool /tmp/linuxdeploy
+
+      - name: Build .deb (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # cargo-deb resolves `target/release/...` paths against the actual
+          # --target dir, so we don't need to mangle the metadata for cross.
+          # --deb-version overrides the workspace version (e.g. "0.1.0") with
+          # the tag-derived value so prereleases get the right filename.
+          deb_version="${{ steps.stage.outputs.version }}"
+          # Debian sorts '~' before '', so map semver "-alpha.2" → "~alpha.2".
+          deb_version="${deb_version//-/\~}"
+          cargo deb -p synbad-gui --no-build \
+            --target ${{ matrix.target }} \
+            --deb-version "$deb_version" \
+            --output "dist/synbad_${deb_version}_amd64.deb"
+          shasum -a 256 "dist/synbad_${deb_version}_amd64.deb" \
+            > "dist/synbad_${deb_version}_amd64.deb.sha256"
+
+      - name: Build .AppImage (Linux)
+        if: runner.os == 'Linux'
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.stage.outputs.version }}"
+          appdir="$(pwd)/AppDir"
+          rm -rf "$appdir"
+          # linuxdeploy populates AppDir, copies the libraries the binaries
+          # need (GTK/appindicator from the tray feature), and writes a
+          # working AppRun. We pass synbad-gui as the main executable and
+          # synbadd as a sidecar; both end up under usr/bin.
+          /tmp/linuxdeploy --appdir "$appdir" \
+            --executable target/${{ matrix.target }}/release/synbad-gui \
+            --executable target/${{ matrix.target }}/release/synbadd \
+            --desktop-file dist/linux/synbad.desktop \
+            --icon-file assets/png/synbad-256.png
+          out="dist/Synbad-${version}-x86_64.AppImage"
+          ARCH=x86_64 /tmp/appimagetool "$appdir" "$out"
+          shasum -a 256 "$out" > "${out}.sha256"
+
+      - name: Build .app + .dmg (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.stage.outputs.version }}"
+          arch_suffix="${{ matrix.target }}"
+          arch_suffix="${arch_suffix%-apple-darwin}"
+          app="dist/Synbad.app"
+          rm -rf "$app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/synbad-gui" "$app/Contents/MacOS/"
+          cp "target/${{ matrix.target }}/release/synbadd"    "$app/Contents/MacOS/"
+          chmod +x "$app/Contents/MacOS/synbad-gui" "$app/Contents/MacOS/synbadd"
+          cp assets/synbad.icns "$app/Contents/Resources/synbad.icns"
+          sed "s/@VERSION@/${version}/g" dist/macos/Info.plist > "$app/Contents/Info.plist"
+          dmg="dist/Synbad-${version}-${arch_suffix}.dmg"
+          # UDZO = compressed; -ov overwrites if the file exists from a retry.
+          # The DMG is unsigned — first launch will require a right-click
+          # "Open" to bypass Gatekeeper until we wire up notarization.
+          hdiutil create -volname "Synbad" -srcfolder "$app" -ov -format UDZO "$dmg"
+          shasum -a 256 "$dmg" > "${dmg}.sha256"
+
+      - name: Generate icon (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # ImageMagick is preinstalled on windows-latest. The SVG -> ICO step
+          # is the only thing we need from the icon pipeline; the bash script
+          # uses tools we don't have here.
+          $sizes = 16, 32, 48, 64, 128, 256
+          $pngs = @()
+          foreach ($s in $sizes) {
+            $out = "assets\synbad-$s.png"
+            magick -background none -density 384 assets\icon.svg `
+              -resize "${s}x${s}" $out
+            $pngs += $out
+          }
+          magick @pngs assets\synbad.ico
+
+      - name: Build .msi (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ steps.stage.outputs.version }}'
+          # MSI ProductVersion accepts only `major.minor.build` numerics, so
+          # we strip any semver prerelease tail and fall back to 0.0.0 for
+          # non-tag builds (workflow_dispatch puts a git short-sha here).
+          if ($version -match '^(\d+\.\d+\.\d+)') {
+            $msiVersion = $matches[1]
+          } else {
+            $msiVersion = '0.0.0'
+          }
+          $target = "target\${{ matrix.target }}\release"
+          $candle = Join-Path $env:WIX 'bin\candle.exe'
+          $light  = Join-Path $env:WIX 'bin\light.exe'
+          & $candle -arch x64 `
+            "-dVersion=$msiVersion" `
+            "-dTargetDir=$target" `
+            "-dIconPath=assets\synbad.ico" `
+            "-dLicensePath=LICENSE" `
+            dist\windows\synbad.wxs -out dist\synbad.wixobj
+          if ($LASTEXITCODE -ne 0) { throw "candle failed" }
+          $msi = "dist\Synbad-$version-x86_64.msi"
+          & $light dist\synbad.wixobj -out $msi
+          if ($LASTEXITCODE -ne 0) { throw "light failed" }
+          $hash = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLower()
+          "$hash  $(Split-Path $msi -Leaf)" | Out-File -Encoding ascii "$msi.sha256"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.stage.outputs.stage }}
           path: |
             dist/${{ steps.stage.outputs.stage }}.${{ matrix.archive }}
             dist/${{ steps.stage.outputs.stage }}.${{ matrix.archive }}.sha256
-          if-no-files-found: error
+            dist/*.deb
+            dist/*.deb.sha256
+            dist/*.AppImage
+            dist/*.AppImage.sha256
+            dist/*.dmg
+            dist/*.dmg.sha256
+            dist/*.msi
+            dist/*.msi.sha256
+          # Per-platform globs only resolve on their own runner; `warn` keeps
+          # the step green when (e.g.) *.deb has nothing to match on macOS.
+          if-no-files-found: warn
           retention-days: 14
 
   publish:
@@ -154,6 +308,14 @@ jobs:
             artifacts/*.tar.gz.sha256
             artifacts/*.zip
             artifacts/*.zip.sha256
+            artifacts/*.deb
+            artifacts/*.deb.sha256
+            artifacts/*.AppImage
+            artifacts/*.AppImage.sha256
+            artifacts/*.dmg
+            artifacts/*.dmg.sha256
+            artifacts/*.msi
+            artifacts/*.msi.sha256
           generate_release_notes: true
           draft: true
           prerelease: ${{ contains(github.ref_name, '-') }}

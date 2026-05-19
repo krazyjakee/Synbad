@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>Synbad</string>
+  <key>CFBundleDisplayName</key>
+  <string>Synbad</string>
+  <key>CFBundleIdentifier</key>
+  <string>dev.synbad.synbad</string>
+  <key>CFBundleVersion</key>
+  <string>@VERSION@</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@VERSION@</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleSignature</key>
+  <string>SYNB</string>
+  <key>CFBundleExecutable</key>
+  <string>synbad-gui</string>
+  <key>CFBundleIconFile</key>
+  <string>synbad.icns</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>10.13</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.utilities</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <!-- The bundled daemon is invoked as a child process by the GUI; flag it as
+       a helper so the dock/window-server doesn't try to make it foreground. -->
+  <key>LSUIElement</key>
+  <false/>
+</dict>
+</plist>

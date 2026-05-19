@@ -4,15 +4,30 @@
 
 # Packaging & autostart
 
-Per-platform installers that build Synbad and wire `synbadd` to start
-automatically when the user logs in. Each script is idempotent — re-run it
-to upgrade an existing install in place.
+Two ways to install Synbad:
 
-| Platform | Installer | Mechanism |
-|----------|-----------|-----------|
-| Linux    | [`linux/install.sh`](linux/install.sh)     | systemd **user** service (`synbadd.service`) |
-| macOS    | [`macos/install.sh`](macos/install.sh)     | per-user launchd agent (`dev.synbad.synbadd.plist`) |
-| Windows  | [`windows/install.ps1`](windows/install.ps1) | Task Scheduler entry triggered `AtLogOn` |
+1. **Prebuilt installers** from the [GitHub Releases page][releases] —
+   `.deb` / `.AppImage` for Linux, `.dmg` for macOS, `.msi` for Windows.
+   These are produced by [`.github/workflows/release.yml`](../.github/workflows/release.yml)
+   and wire up autostart the same way the scripts below do. **Unsigned**
+   for now: Gatekeeper / SmartScreen will warn on first launch.
+2. **From-source scripts** in this directory — useful for dev installs and
+   for distros where the prebuilt artifacts don't fit. Each script is
+   idempotent; re-run it to upgrade an existing install in place.
+
+| Platform | Prebuilt | From source | Autostart mechanism |
+|----------|----------|-------------|---------------------|
+| Linux    | `.deb`, `.AppImage` | [`linux/install.sh`](linux/install.sh)     | systemd **user** service ([`synbadd.service`](linux/synbadd.service)) |
+| macOS    | `.dmg`              | [`macos/install.sh`](macos/install.sh)     | per-user launchd agent ([`dev.synbad.synbadd.plist`](macos/dev.synbad.synbadd.plist)) |
+| Windows  | `.msi`              | [`windows/install.ps1`](windows/install.ps1) | `HKCU\…\Run` registry entry (`.msi`) or Task Scheduler `AtLogOn` (`install.ps1`) |
+
+The packaging templates that drive the MSI/DMG/AppImage builds live next to
+the install scripts:
+[`linux/synbad.desktop`](linux/synbad.desktop),
+[`macos/Info.plist`](macos/Info.plist),
+[`windows/synbad.wxs`](windows/synbad.wxs).
+
+[releases]: https://github.com/krazyjakee/Synbad/releases
 
 All three are **per-user**, not system-wide:
 
