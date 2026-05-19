@@ -9,26 +9,75 @@
 //! eframe drives a winit event loop, but `tray-icon` on Linux requires a
 //! GTK event loop to deliver tray clicks. We resolve this by spawning a
 //! dedicated thread that calls `gtk::init()` + `gtk::main()`, owns the
-//! `TrayIcon`, and lets `tray-icon` route events into the global
-//! `MenuEvent` channel. The main thread polls
-//! [`menu_event_receiver`] from inside the egui frame loop.
+//! `TrayIcon`, and lets `tray-icon` route events into a channel we own.
 //!
 //! On Windows / macOS the tray icon lives on the main thread (eframe's
 //! winit event loop pumps the necessary platform events).
 //!
+//! ## Waking egui when the window is hidden
+//!
+//! When the user closes the window to tray, eframe parks the event loop
+//! until a wakeup. Tray clicks arrive on a background thread (GTK on
+//! Linux, the OS thread on macOS/Windows) and would otherwise pile up
+//! in their channel with nobody draining them — neither Show nor Quit
+//! would ever take effect.
+//!
+//! [`set_repaint`] wires `egui::Context::request_repaint` into the
+//! [`MenuEvent`] handler. Every tray click now nudges the egui loop, so
+//! [`try_recv_menu_id`] inside `update()` actually runs and the command
+//! (Visible/Close) is dispatched.
+//!
 //! Menu items are keyed by stable string IDs so the GUI can match them
 //! without sharing a `MenuItem` handle across threads.
+
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Menu-item ID for the "Show Window" action.
 pub const MENU_ID_SHOW: &str = "synbad.show";
 /// Menu-item ID for the "Quit" action.
 pub const MENU_ID_QUIT: &str = "synbad.quit";
 
+pub type RepaintFn = Arc<dyn Fn() + Send + Sync>;
+
+/// Slot for the egui-repaint callback. Populated from main after eframe
+/// hands us the `egui::Context`; the tray handler reads through this
+/// to wake the UI loop even if the window is hidden in close-to-tray.
+fn repaint_slot() -> &'static Mutex<Option<RepaintFn>> {
+    static SLOT: OnceLock<Mutex<Option<RepaintFn>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Channel carrying tray-menu IDs. Set up once at first access so both
+/// the install-side handler and `try_recv_menu_id` see the same channel.
+type MenuChannel = (
+    crossbeam_channel::Sender<String>,
+    crossbeam_channel::Receiver<String>,
+);
+fn menu_channel() -> &'static MenuChannel {
+    static CHAN: OnceLock<MenuChannel> = OnceLock::new();
+    CHAN.get_or_init(crossbeam_channel::unbounded)
+}
+
+/// Install the egui repaint callback used to wake the UI when a tray
+/// menu item is clicked. Must be called once `eframe` has handed us a
+/// usable [`egui::Context`] (i.e. from inside the app-creator closure).
+pub fn set_repaint(repaint: RepaintFn) {
+    if let Ok(mut g) = repaint_slot().lock() {
+        *g = Some(repaint);
+    }
+}
+
+/// Drain one queued tray menu-item ID, if any. Non-blocking. Returns
+/// strings matching [`MENU_ID_SHOW`] / [`MENU_ID_QUIT`].
+pub fn try_recv_menu_id() -> Option<String> {
+    menu_channel().1.try_recv().ok()
+}
+
 #[cfg(feature = "tray")]
 mod imp {
     use super::*;
 
-    use tray_icon::menu::{Menu, MenuEvent, MenuEventReceiver, MenuItem, PredefinedMenuItem};
+    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     #[cfg(not(target_os = "linux"))]
     use tray_icon::TrayIcon;
     use tray_icon::{Icon, TrayIconBuilder};
@@ -72,6 +121,25 @@ mod imp {
         Icon::from_rgba(rgba, W, H).expect("16x16 RGBA must be a valid icon")
     }
 
+    /// Install a global menu-event handler that forwards each click's ID
+    /// into our channel and pokes the egui loop so it wakes up to process
+    /// it. Replaces muda's default channel-only delivery — without the
+    /// repaint nudge, clicks arriving while the window is hidden would
+    /// sit in the channel forever.
+    fn install_event_handler() {
+        let tx = super::menu_channel().0.clone();
+        MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
+            // `id().as_ref()` projects &MenuId down to &str.
+            let id = ev.id.as_ref().to_string();
+            let _ = tx.send(id);
+            if let Ok(slot) = super::repaint_slot().lock() {
+                if let Some(repaint) = slot.as_ref() {
+                    repaint();
+                }
+            }
+        }));
+    }
+
     /// Install the tray. Returns a handle that must be kept alive for the
     /// lifetime of the app (on Linux the tray lives on its own thread and
     /// the handle is a no-op; on Windows / macOS it owns the `TrayIcon`).
@@ -79,6 +147,11 @@ mod imp {
     /// Failures here are intentionally non-fatal — the app still works
     /// without a tray, so we log and continue.
     pub fn install() -> Option<TrayHandle> {
+        // Register the menu-event bridge before the tray exists so the
+        // very first click is captured. set_event_handler is safe to call
+        // before any UI is up — it just rewires muda's static dispatch.
+        install_event_handler();
+
         #[cfg(target_os = "linux")]
         {
             // Channel so we can surface init failures back to the caller.
@@ -139,15 +212,6 @@ mod imp {
             }
         }
     }
-
-    /// Borrow the global menu-event receiver. Each emitted `MenuEvent` has
-    /// `event.id.0` matching one of our `MENU_ID_*` constants.
-    pub fn menu_event_receiver() -> &'static MenuEventReceiver {
-        MenuEvent::receiver()
-    }
-
-    /// Re-export so callers don't need a direct `tray_icon` dep.
-    pub use tray_icon::menu::MenuEvent as TrayMenuEvent;
 }
 
 #[cfg(not(feature = "tray"))]
@@ -158,30 +222,10 @@ mod imp {
     pub fn install() -> Option<TrayHandle> {
         None
     }
-
-    /// A receiver that never delivers anything — keeps the polling code
-    /// at the call site uniform whether or not the feature is enabled.
-    pub struct NoopRecv;
-    impl NoopRecv {
-        pub fn try_recv(&self) -> Result<TrayMenuEvent, ()> {
-            Err(())
-        }
-    }
-    pub fn menu_event_receiver() -> NoopRecv {
-        NoopRecv
-    }
-
-    /// Stand-in event type whose `id.as_ref()` always fails to match.
-    pub struct TrayMenuEvent;
-    impl TrayMenuEvent {
-        pub fn id(&self) -> &str {
-            ""
-        }
-    }
 }
 
 // Re-export so external code can refer to `tray::install()` etc. The handle
-// and event type are only named transitively (via Option<_> bindings), so
-// silence the otherwise-noisy unused-import warning.
+// is only named transitively (via Option<_> bindings), so silence the
+// otherwise-noisy unused-import warning.
 #[allow(unused_imports)]
-pub use imp::{install, menu_event_receiver, TrayHandle, TrayMenuEvent};
+pub use imp::{install, TrayHandle};

@@ -74,10 +74,15 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             // Now that eframe has the egui context, plug the real repaint
-            // hook into the slot so the single-instance listener thread
-            // can wake us when a second launcher pings the socket.
+            // hook into every background source that needs to wake the UI
+            // loop: the single-instance listener (SHOW pings from a second
+            // launcher) and the tray menu handler (clicks that arrive
+            // while the window is hidden in close-to-tray — without the
+            // wake-up, Show/Quit would never reach `update()`).
             let egui_ctx = cc.egui_ctx.clone();
-            *repaint_slot.lock().unwrap() = Some(Arc::new(move || egui_ctx.request_repaint()));
+            let repaint: RepaintFn = Arc::new(move || egui_ctx.request_repaint());
+            *repaint_slot.lock().unwrap() = Some(repaint.clone());
+            tray::set_repaint(repaint);
             Box::new(SynbadApp::new(cc, has_tray, show_rx))
         }),
     );

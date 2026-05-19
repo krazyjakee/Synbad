@@ -197,12 +197,8 @@ impl SynbadApp {
         if !self.has_tray {
             return;
         }
-        while let Ok(ev) = tray::menu_event_receiver().try_recv() {
-            // `as_ref()` is a no-op on the no-tray stub (whose `id()` already
-            // returns `&str`), but is required when the `tray` feature is on
-            // to project `&MenuId` down to `&str` for the string match below.
-            #[allow(clippy::useless_asref)]
-            match ev.id().as_ref() {
+        while let Some(id) = tray::try_recv_menu_id() {
+            match id.as_str() {
                 tray::MENU_ID_SHOW => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
