@@ -485,9 +485,7 @@ mod tests {
         // Alpha edits a layout option; Beta independently adds a screen.
         // Both edits touch shared fields, so both should propagate.
         let mut alpha_edit = alpha.config.clone();
-        alpha_edit
-            .options
-            .insert("heartbeat".into(), "5000".into());
+        alpha_edit.options.insert("heartbeat".into(), "5000".into());
         assert!(alpha.apply_local(alpha_edit, "alpha-id"));
         assert!(beta.apply_local(config_b(), "beta-id"));
 
@@ -567,7 +565,10 @@ mod tests {
         // Per-machine fields stayed put.
         assert_eq!(local.config.role, NodeRole::Client);
         assert_eq!(local.config.server_name, "local-host");
-        assert_eq!(local.config.server_address.as_deref(), Some("homeserver.local"));
+        assert_eq!(
+            local.config.server_address.as_deref(),
+            Some("homeserver.local")
+        );
         assert_eq!(local.config.service_port, 24850);
         assert_eq!(
             local.config.binaries.core.as_deref(),
@@ -575,7 +576,11 @@ mod tests {
         );
         // Shared layout *did* merge across.
         assert_eq!(
-            local.config.options.get("relativeMouseMoves").map(String::as_str),
+            local
+                .config
+                .options
+                .get("relativeMouseMoves")
+                .map(String::as_str),
             Some("true")
         );
     }

@@ -26,7 +26,7 @@
 //! When the install directory is owned by another user — the canonical case
 //! is a system-managed `/usr/bin/synbadd` on Linux — `download_and_apply`
 //! detects this up-front (before downloading) and routes the file-swap step
-//! through [`elevate::apply_with_elevation`], which re-launches the sibling
+//! through an internal elevation helper, which re-launches the sibling
 //! `synbadd` daemon with the hidden subcommand `__apply-update --plan <path>`
 //! under the platform's auth dialog (polkit / sudo / osascript / UAC). The
 //! plan is a small JSON file describing the moves the privileged helper must
@@ -153,41 +153,33 @@ pub fn is_newer(tag: &str, current: &str) -> bool {
 /// `-alpha.N` suffix. Listing returns drafts + prereleases too, so we filter
 /// drafts and pick the highest semver tag ourselves.
 pub fn check(current_version: &str) -> Result<CheckResult> {
-    let url = format!(
-        "https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases?per_page=30"
-    );
+    let url = format!("https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases?per_page=30");
     let resp = ureq::get(&url)
         .set("User-Agent", USER_AGENT)
         .set("Accept", "application/vnd.github+json")
         .timeout(std::time::Duration::from_secs(20))
         .call()
         .with_context(|| format!("GET {url}"))?;
-    let releases: Vec<GhRelease> = resp
-        .into_json()
-        .context("parse GitHub releases JSON")?;
+    let releases: Vec<GhRelease> = resp.into_json().context("parse GitHub releases JSON")?;
 
     let release = releases
         .into_iter()
         .filter(|r| !r.draft)
         .filter_map(|r| {
-            let ver = semver::Version::parse(
-                r.tag_name.trim().trim_start_matches('v'),
-            )
-            .ok()?;
+            let ver = semver::Version::parse(r.tag_name.trim().trim_start_matches('v')).ok()?;
             Some((ver, r))
         })
         .max_by(|a, b| a.0.cmp(&b.0))
         .map(|(_, r)| r)
-        .ok_or_else(|| {
-            anyhow!("no published (non-draft) releases with a semver tag found")
-        })?;
+        .ok_or_else(|| anyhow!("no published (non-draft) releases with a semver tag found"))?;
 
     let target = host_target()?;
-    let asset = pick_asset(&release.assets, target)
-        .ok_or_else(|| anyhow!(
+    let asset = pick_asset(&release.assets, target).ok_or_else(|| {
+        anyhow!(
             "no release asset matches host target `{target}` in release {}",
             release.tag_name
-        ))?;
+        )
+    })?;
 
     let info = UpdateInfo {
         tag: release.tag_name.clone(),
@@ -229,20 +221,19 @@ pub fn download_and_apply(
     info: &UpdateInfo,
     mut on_progress: impl FnMut(Progress),
 ) -> Result<Applied> {
-    let current_exe =
-        std::env::current_exe().context("locate current executable")?;
+    let current_exe = std::env::current_exe().context("locate current executable")?;
     // Canonicalise so the sibling lookup below compares apples to apples
     // (Windows symlinked /Program Files paths in particular).
-    let current_exe = current_exe
-        .canonicalize()
-        .unwrap_or(current_exe);
+    let current_exe = current_exe.canonicalize().unwrap_or(current_exe);
 
     let install_dir = current_exe
         .parent()
-        .ok_or_else(|| anyhow!(
-            "current executable has no parent directory: {}",
-            current_exe.display()
-        ))?
+        .ok_or_else(|| {
+            anyhow!(
+                "current executable has no parent directory: {}",
+                current_exe.display()
+            )
+        })?
         .to_path_buf();
 
     // Pre-flight permission probe. Failing here turns a wasted MB-scale
@@ -253,12 +244,17 @@ pub fn download_and_apply(
     on_progress(Progress::Stage("downloading".into()));
     let tmp_dir = tempdir_for_update()?;
     let archive_path = tmp_dir.join(&info.asset_name);
-    download_to(&info.asset_url, &archive_path, info.asset_size, |downloaded| {
-        on_progress(Progress::Download {
-            downloaded,
-            total: info.asset_size,
-        })
-    })?;
+    download_to(
+        &info.asset_url,
+        &archive_path,
+        info.asset_size,
+        |downloaded| {
+            on_progress(Progress::Download {
+                downloaded,
+                total: info.asset_size,
+            })
+        },
+    )?;
 
     on_progress(Progress::Stage("extracting".into()));
     let extract_dir = tmp_dir.join("extract");
@@ -266,14 +262,8 @@ pub fn download_and_apply(
     archive::extract(&archive_path, &extract_dir)?;
 
     let self_basename = binary_basename_for_path(&current_exe);
-    let new_self =
-        find_binary(&extract_dir, self_basename)
-            .ok_or_else(|| {
-                anyhow!(
-                    "release archive did not contain `{}`",
-                    self_basename
-                )
-            })?;
+    let new_self = find_binary(&extract_dir, self_basename)
+        .ok_or_else(|| anyhow!("release archive did not contain `{}`", self_basename))?;
 
     // Sibling: if we are `synbad-gui`, look for `synbadd` next to us; vice
     // versa. The daemon and GUI ship together so updating one without the
@@ -321,8 +311,7 @@ pub fn download_and_apply(
         moves,
     };
     let plan_path = tmp_dir.join("plan.json");
-    let plan_bytes = serde_json::to_vec_pretty(&plan)
-        .context("serialize update plan")?;
+    let plan_bytes = serde_json::to_vec_pretty(&plan).context("serialize update plan")?;
     fs::write(&plan_path, &plan_bytes)
         .with_context(|| format!("write plan to {}", plan_path.display()))?;
 
@@ -349,9 +338,8 @@ fn install_inline(
     tag: String,
 ) -> Result<Applied> {
     if let (Some(target), Some(source)) = (sibling_dest, new_sibling) {
-        replace_sibling(source, target).with_context(|| {
-            format!("replace sibling binary at {}", target.display())
-        })?;
+        replace_sibling(source, target)
+            .with_context(|| format!("replace sibling binary at {}", target.display()))?;
     }
     // Replace ourselves last. `self_replace` handles the platform-specific
     // dance: on Unix it relies on the kernel keeping the open inode alive so
@@ -387,8 +375,7 @@ fn download_to(
         .call()
         .with_context(|| format!("GET {url}"))?;
     let mut reader = resp.into_reader();
-    let mut file = fs::File::create(dest)
-        .with_context(|| format!("create {}", dest.display()))?;
+    let mut file = fs::File::create(dest).with_context(|| format!("create {}", dest.display()))?;
     let mut buf = [0u8; 64 * 1024];
     let mut total: u64 = 0;
     loop {
@@ -453,8 +440,7 @@ fn replace_sibling(source: &Path, dest: &Path) -> Result<()> {
     // Cross-device fallback: copy with a `.new` suffix, then atomic rename
     // over the destination so we never leave a half-written binary visible.
     let staging = dest.with_extension("synbad-update.new");
-    fs::copy(source, &staging)
-        .with_context(|| format!("copy to staging {}", staging.display()))?;
+    fs::copy(source, &staging).with_context(|| format!("copy to staging {}", staging.display()))?;
     #[cfg(unix)]
     ensure_executable(&staging);
     fs::rename(&staging, dest)
@@ -491,10 +477,10 @@ fn check_dir_writable(dir: &Path) -> Result<()> {
             let _ = fs::remove_file(&probe);
             Ok(())
         }
-        Err(e) => Err(anyhow::Error::new(e).context(format!(
-            "writable probe failed for {}",
-            dir.display()
-        ))),
+        Err(e) => {
+            Err(anyhow::Error::new(e)
+                .context(format!("writable probe failed for {}", dir.display())))
+        }
     }
 }
 
@@ -506,10 +492,9 @@ fn check_dir_writable(dir: &Path) -> Result<()> {
 /// inode alive while it's open. On Windows we have to rename the destination
 /// out of the way first (the OS holds an exclusive lock on running .exes).
 pub fn apply_plan(plan_path: &Path) -> Result<Plan> {
-    let bytes = fs::read(plan_path)
-        .with_context(|| format!("read plan from {}", plan_path.display()))?;
-    let plan: Plan =
-        serde_json::from_slice(&bytes).context("parse plan JSON")?;
+    let bytes =
+        fs::read(plan_path).with_context(|| format!("read plan from {}", plan_path.display()))?;
+    let plan: Plan = serde_json::from_slice(&bytes).context("parse plan JSON")?;
     for mv in &plan.moves {
         external_replace(&mv.src, &mv.dst)
             .with_context(|| format!("install {}", mv.dst.display()))?;
@@ -528,13 +513,8 @@ fn external_replace(source: &Path, dest: &Path) -> Result<()> {
         // canonical name. The aside file lives until next reboot or manual
         // cleanup — same trade-off the `self_replace` crate makes.
         if dest.is_file() {
-            let aside = dest.with_extension(format!(
-                "synbad-old-{}",
-                nano_unique()
-            ));
-            fs::rename(dest, &aside).with_context(|| {
-                format!("rename {} aside", dest.display())
-            })?;
+            let aside = dest.with_extension(format!("synbad-old-{}", nano_unique()));
+            fs::rename(dest, &aside).with_context(|| format!("rename {} aside", dest.display()))?;
         }
     }
 
@@ -548,21 +528,19 @@ fn external_replace(source: &Path, dest: &Path) -> Result<()> {
     // Cross-device fallback: stage in dest's directory (which we now have
     // write access to, by construction — we're either root or already past
     // the writability check), then atomic rename onto dest.
-    let dest_dir = dest.parent().ok_or_else(|| {
-        anyhow!("destination has no parent directory: {}", dest.display())
-    })?;
+    let dest_dir = dest
+        .parent()
+        .ok_or_else(|| anyhow!("destination has no parent directory: {}", dest.display()))?;
     let staging = dest_dir.join(format!(
         ".synbad-update-stage-{}-{}",
         std::process::id(),
         nano_unique(),
     ));
-    fs::copy(source, &staging)
-        .with_context(|| format!("stage copy to {}", staging.display()))?;
+    fs::copy(source, &staging).with_context(|| format!("stage copy to {}", staging.display()))?;
     #[cfg(unix)]
     ensure_executable(&staging);
-    fs::rename(&staging, dest).with_context(|| {
-        format!("rename staging {} -> {}", staging.display(), dest.display())
-    })?;
+    fs::rename(&staging, dest)
+        .with_context(|| format!("rename staging {} -> {}", staging.display(), dest.display()))?;
     Ok(())
 }
 
@@ -583,10 +561,7 @@ fn sibling_basename(current_exe: &Path) -> String {
     // separator. Strip both separators manually so the same code matches
     // `/usr/bin/synbadd` and `C:\bin\synbadd.exe` regardless of host OS.
     let name = binary_basename_for_path(current_exe);
-    let trimmed: &str = name
-        .rsplit(|c| c == '/' || c == '\\')
-        .next()
-        .unwrap_or(name);
+    let trimmed: &str = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let (stem, ext) = match trimmed.rsplit_once('.') {
         Some((s, "exe")) => (s, ".exe"),
         _ => (trimmed, ""),
@@ -654,8 +629,7 @@ fn tempdir_for_update() -> Result<PathBuf> {
     let pid = std::process::id();
     let nanos = nano_unique();
     let dir = base.join(format!("synbad-update-{pid}-{nanos}"));
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("create temp dir {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("create temp dir {}", dir.display()))?;
     Ok(dir)
 }
 
@@ -782,7 +756,10 @@ mod tests {
 
     #[test]
     fn sibling_swap() {
-        assert_eq!(sibling_basename(Path::new("/usr/bin/synbadd")), "synbad-gui");
+        assert_eq!(
+            sibling_basename(Path::new("/usr/bin/synbadd")),
+            "synbad-gui"
+        );
         assert_eq!(sibling_basename(Path::new("/x/synbad-gui")), "synbadd");
         assert_eq!(
             sibling_basename(Path::new(r"C:\bin\synbadd.exe")),
@@ -888,8 +865,14 @@ mod tests {
         let plan = Plan {
             tag: "v0.0.1".into(),
             moves: vec![
-                PlanMove { src: src_a, dst: dst_a.clone() },
-                PlanMove { src: src_b, dst: dst_b.clone() },
+                PlanMove {
+                    src: src_a,
+                    dst: dst_a.clone(),
+                },
+                PlanMove {
+                    src: src_b,
+                    dst: dst_b.clone(),
+                },
             ],
         };
         let plan_path = base.join("plan.json");

@@ -68,7 +68,11 @@ pub(crate) fn helper_path_for(current_exe: &Path) -> PathBuf {
     if stem == "synbadd" {
         return current_exe.to_path_buf();
     }
-    let helper_name = if cfg!(windows) { "synbadd.exe" } else { "synbadd" };
+    let helper_name = if cfg!(windows) {
+        "synbadd.exe"
+    } else {
+        "synbadd"
+    };
     let candidate = parent.join(helper_name);
     if candidate.is_file() {
         candidate
@@ -89,8 +93,8 @@ mod linux {
         // pops a polkit auth dialog the user can answer without a terminal.
         // The DISPLAY/WAYLAND_DISPLAY check keeps us from invoking pkexec on
         // a headless session where it would block forever.
-        let has_display = std::env::var_os("DISPLAY").is_some()
-            || std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let has_display =
+            std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
         let pkexec_ok = which("pkexec").is_some();
         if has_display && pkexec_ok {
             // pkexec wipes most of the environment; that's fine, the helper
@@ -176,10 +180,7 @@ mod windows {
         // prompt. The call returns once the new process is spawned, so we
         // need to wait on the resulting process handle ourselves.
         let exe_w = wide(helper.as_os_str());
-        let params = format!(
-            "__apply-update --plan \"{}\"",
-            plan_path.display()
-        );
+        let params = format!("__apply-update --plan \"{}\"", plan_path.display());
         let params_w = wide(OsStr::new(&params));
         let verb_w = wide(OsStr::new("runas"));
 

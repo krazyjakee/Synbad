@@ -30,8 +30,8 @@ pub(crate) fn extract(archive: &Path, dest: &Path) -> Result<()> {
 }
 
 fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
-    let f = fs::File::open(archive)
-        .with_context(|| format!("open archive {}", archive.display()))?;
+    let f =
+        fs::File::open(archive).with_context(|| format!("open archive {}", archive.display()))?;
     let gz = flate2::read::GzDecoder::new(f);
     let mut tar = tar::Archive::new(gz);
     tar.set_preserve_permissions(true);
@@ -42,10 +42,10 @@ fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
-    let f = fs::File::open(archive)
-        .with_context(|| format!("open archive {}", archive.display()))?;
-    let mut zip = zip::ZipArchive::new(f)
-        .with_context(|| format!("read zip {}", archive.display()))?;
+    let f =
+        fs::File::open(archive).with_context(|| format!("open archive {}", archive.display()))?;
+    let mut zip =
+        zip::ZipArchive::new(f).with_context(|| format!("read zip {}", archive.display()))?;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).context("read zip entry")?;
         let rel = match entry.enclosed_name() {
