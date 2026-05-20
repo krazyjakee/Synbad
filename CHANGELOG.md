@@ -10,6 +10,48 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-20
+
+### Added
+- LAN audio bridge under [`crates/synbad-audio`](crates/synbad-audio/):
+  streams mic + system audio between paired peers over webrtc-rs
+  (RTP/DTLS/SRTP) with cpal device I/O, reusing the existing
+  `synbad-crypto` authenticated transport for SDP/ICE signaling on a
+  separate port. Includes rubato resampling to 48 kHz on both capture
+  and playback paths, RFC 3551 §4.5.7 L16 packetisation, glare-rule
+  offerer selection, and per-peer routing config. mDNS peers advertise
+  `audio_port` in their TXT record so the supervisor knows when
+  outbound dial is possible. Opt-in subsystem with GUI controls, IPC
+  plumbing for device enumeration and per-peer status, and config-sync
+  schema additions. On macOS, surfaces a `LoopbackUnavailable` error
+  with a link to the BlackHole installer when no loopback-capable
+  input device exists. Bumps workspace MSRV to 1.85 and adds
+  `libasound2` to the Debian package depends.
+- "Share clipboard" checkbox on the Settings tab, backed by a new
+  top-level `clipboard_sharing: bool` on `Config` (default `true`,
+  serde-defaulted so existing configs upgrade silently). Off-state
+  emits `clipboardSharing = false` into the generated `synergy.conf`,
+  which the Synergy/Deskflow Core honours to suppress clipboard relay
+  in both directions. The field syncs across trusted peers via LWW
+  and triggers a Core restart when toggled.
+
+### Changed
+- Layout editor is now monitor-aware: each `Screen` carries a
+  `MonitorInfo` list (populated from `display-info` on startup and a
+  5s reconcile pass) so screens are sized by the real bounding box of
+  their monitors and multi-monitor setups draw per-display sub-rects.
+  The reconcile loop also appends any trusted peer not already in
+  `config.screens`, with an immediate trigger on `PairingCompleted`,
+  so paired machines slot into the layout without manual intervention.
+- Client-role Core now reconnects indefinitely instead of giving up
+  after 5 sub-2-second exits. A fast-exit in client role is almost
+  always "server unreachable" (DNS miss, server down, network drop) —
+  exactly the case where the user wants us to keep retrying. Server
+  role keeps the fast-fail cap since fast-exit there usually means
+  port-in-use or missing libs that won't self-resolve. Each reconnect
+  attempt records a user-visible log line so the GUI doesn't look
+  frozen on the Crashed chip during the backoff window.
+
 ## [0.1.0-alpha.4] - 2026-05-20
 
 ### Changed
