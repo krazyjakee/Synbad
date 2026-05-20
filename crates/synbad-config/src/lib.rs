@@ -57,6 +57,9 @@ pub struct Config {
     /// Where to find the Synergy Core executables.
     #[serde(default)]
     pub binaries: BinaryPaths,
+    /// LAN audio bridge settings. Off by default.
+    #[serde(default)]
+    pub audio: AudioConfig,
 }
 
 fn default_port() -> u16 {
@@ -73,6 +76,10 @@ fn default_sync_port() -> u16 {
 
 fn default_clipboard_sharing() -> bool {
     true
+}
+
+fn default_audio_signal_port() -> u16 {
+    24852
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -205,6 +212,62 @@ pub struct BinaryPaths {
     pub core: Option<PathBuf>,
 }
 
+/// LAN audio bridge configuration. Disabled by default; opting in surfaces
+/// device dropdowns in the GUI and starts the audio signaling listener.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AudioConfig {
+    /// Master switch. When `false`, the audio subsystem doesn't bind its
+    /// signaling listener and won't accept incoming sessions.
+    #[serde(default)]
+    pub enabled: bool,
+    /// User-chosen input device name. `None` means "OS default."
+    #[serde(default)]
+    pub input_device: Option<String>,
+    /// User-chosen output device name. `None` means "OS default."
+    #[serde(default)]
+    pub output_device: Option<String>,
+    /// Globally allow capturing the local mic and sending to peers.
+    #[serde(default)]
+    pub send_mic_to_peers: bool,
+    /// Globally allow receiving peer audio and playing it locally.
+    #[serde(default)]
+    pub receive_peer_audio: bool,
+    /// Per-peer overrides keyed by `machine_id`. Absent = use globals.
+    #[serde(default)]
+    pub per_peer: BTreeMap<String, PeerAudioRouting>,
+    /// TCP port the audio signaling listener binds. Defaults to
+    /// `sync_port + 1`.
+    #[serde(default = "default_audio_signal_port")]
+    pub signal_port: u16,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            input_device: None,
+            output_device: None,
+            send_mic_to_peers: false,
+            receive_peer_audio: false,
+            per_peer: BTreeMap::new(),
+            signal_port: default_audio_signal_port(),
+        }
+    }
+}
+
+/// Per-peer override for the global audio routing toggles.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PeerAudioRouting {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub send_to_peer: bool,
+    #[serde(default)]
+    pub receive_from_peer: bool,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -229,6 +292,7 @@ impl Default for Config {
             options: BTreeMap::new(),
             clipboard_sharing: default_clipboard_sharing(),
             binaries: BinaryPaths::default(),
+            audio: AudioConfig::default(),
         }
     }
 }
@@ -523,6 +587,7 @@ mod tests {
             options: BTreeMap::from([("heartbeat".to_string(), "5000".to_string())]),
             clipboard_sharing: true,
             binaries: BinaryPaths::default(),
+            audio: AudioConfig::default(),
         }
     }
 
@@ -644,5 +709,52 @@ name = "alpha"
         // Port appended when missing.
         assert!(ini.contains("remoteHost=alpha.local:24800"));
         assert!(!ini.contains("externalConfig=true"));
+    }
+
+    #[test]
+    fn audio_defaults_round_trip_through_toml() {
+        let mut c = sample();
+        c.audio.enabled = true;
+        c.audio.send_mic_to_peers = true;
+        c.audio.input_device = Some("Built-in Microphone".into());
+        c.audio.per_peer.insert(
+            "peer-uuid-123".into(),
+            PeerAudioRouting {
+                enabled: true,
+                send_to_peer: true,
+                receive_from_peer: false,
+            },
+        );
+        let body = toml::to_string_pretty(&c).expect("serialize");
+        let round: Config = toml::from_str(&body).expect("deserialize");
+        assert_eq!(round.audio, c.audio);
+        assert_eq!(round.audio.signal_port, default_audio_signal_port());
+    }
+
+    #[test]
+    fn audio_section_missing_uses_defaults() {
+        // Config from before this feature existed must still load.
+        let pre_audio = r#"
+            role = "server"
+            server_name = "host"
+            port = 24800
+            service_port = 24850
+            sync_port = 24851
+
+            [[screens]]
+            name = "host"
+            aliases = []
+
+            [screens.position]
+            x = 0
+            y = 0
+            w = 160
+            h = 120
+
+            [binaries]
+        "#;
+        let c: Config = toml::from_str(pre_audio).expect("legacy config still parses");
+        assert!(!c.audio.enabled);
+        assert_eq!(c.audio.signal_port, default_audio_signal_port());
     }
 }

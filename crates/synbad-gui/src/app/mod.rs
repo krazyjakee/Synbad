@@ -19,7 +19,9 @@ use std::time::Instant;
 use eframe::CreationContext;
 
 use synbad_config::{paths, Config, MonitorInfo, NodeRole, Screen};
-use synbad_ipc::{DaemonState, DiscoveredPeer, SyncDirection, TrustedPeer};
+use synbad_ipc::{
+    AudioDeviceInfo, DaemonState, DiscoveredPeer, PeerAudioStatus, SyncDirection, TrustedPeer,
+};
 
 use crate::ipc_thread::{self, Cmd, IpcHandle, Update};
 use crate::layout_editor::LayoutEditor;
@@ -41,6 +43,7 @@ pub(super) enum Tab {
     Status,
     Layout,
     Peers,
+    Audio,
     Settings,
 }
 
@@ -132,6 +135,18 @@ pub struct SynbadApp {
     /// Wall-clock of the most recent monitor / auto-populate pass. Drives
     /// the [`RECONCILE_INTERVAL_SECS`] tick from inside `update`.
     pub(super) last_reconcile: Option<Instant>,
+
+    /// Cached audio device list, refreshed on entering the Audio tab and
+    /// when the daemon reports a `DevicesChanged` event.
+    pub(super) audio_input_devices: Vec<AudioDeviceInfo>,
+    pub(super) audio_output_devices: Vec<AudioDeviceInfo>,
+    /// Per-peer audio session status, keyed by machine_id.
+    pub(super) audio_peer_status: BTreeMap<String, PeerAudioStatus>,
+    /// Sticky audio error from the daemon, dismissable in the Audio tab.
+    pub(super) audio_last_error: Option<String>,
+    /// True once we've fetched the device list at least once. Lets the
+    /// tab show "loading…" until the daemon replies.
+    pub(super) audio_devices_loaded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +198,11 @@ impl SynbadApp {
             update_state: None,
             local_monitors: monitors::enumerate(),
             last_reconcile: None,
+            audio_input_devices: Vec::new(),
+            audio_output_devices: Vec::new(),
+            audio_peer_status: BTreeMap::new(),
+            audio_last_error: None,
+            audio_devices_loaded: false,
         }
     }
 
@@ -419,6 +439,33 @@ impl SynbadApp {
                         at: Instant::now(),
                     });
                 }
+                Update::AudioDevices { input, output } => {
+                    self.audio_input_devices = input;
+                    self.audio_output_devices = output;
+                    self.audio_devices_loaded = true;
+                }
+                Update::AudioDevicesChanged => {
+                    // Eagerly refresh — the daemon's heads-up doesn't carry
+                    // the new list, and a stale dropdown is worse than a
+                    // small extra IPC call.
+                    self.send(Cmd::ListAudioDevices);
+                }
+                Update::AudioPeerStatus(status) => {
+                    self.audio_peer_status
+                        .insert(status.machine_id.clone(), status);
+                }
+                Update::AudioStatusSnapshot(peers) => {
+                    self.audio_peer_status.clear();
+                    for p in peers {
+                        self.audio_peer_status.insert(p.machine_id.clone(), p);
+                    }
+                }
+                Update::AudioError { peer, message } => {
+                    self.audio_last_error = Some(match peer {
+                        Some(p) => format!("{}: {}", self.peer_label(&p), message),
+                        None => message,
+                    });
+                }
             }
         }
     }
@@ -601,6 +648,7 @@ impl eframe::App for SynbadApp {
                     format!("Peers ({})", self.discovered_peers.len())
                 };
                 ui.selectable_value(&mut self.tab, Tab::Peers, peers_label);
+                ui.selectable_value(&mut self.tab, Tab::Audio, "Audio");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (color, text) = views::state_chip(&self.state, self.connected);
@@ -691,6 +739,7 @@ impl eframe::App for SynbadApp {
             Tab::Status => self.draw_status(ui),
             Tab::Layout => self.draw_layout(ui),
             Tab::Peers => self.draw_peers(ui),
+            Tab::Audio => self.draw_audio(ui),
             Tab::Settings => self.draw_settings(ui),
         });
 

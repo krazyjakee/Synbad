@@ -9,12 +9,13 @@ members = [
     "crates/synbad-sync",
     "crates/synbad-crypto",
     "crates/synbad-update",
+    "crates/synbad-audio",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/krazyjakee/Synbad"
 

@@ -12,6 +12,7 @@
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
 /// Per-frame ciphertext cap. Frames larger than this are rejected before
@@ -145,4 +146,103 @@ fn build_nonce(prefix: &[u8; 4], counter: u64) -> [u8; 12] {
     n[..4].copy_from_slice(prefix);
     n[4..].copy_from_slice(&counter.to_be_bytes());
     n
+}
+
+impl CipherStream {
+    /// Split into independently-owned read and write halves.
+    ///
+    /// Useful when two tokio tasks need to read and write concurrently —
+    /// [`Self::send`] and [`Self::recv`] both take `&mut self`, so a
+    /// single owner can only do one at a time. The signaling protocol in
+    /// `synbad-audio` needs a long-lived `recv` loop on the same channel
+    /// it must write trickled ICE candidates into; splitting avoids
+    /// cancelling a partial read mid-frame.
+    pub fn split(self) -> (CipherReader, CipherWriter) {
+        let (read_half, write_half) = self.stream.into_split();
+        let reader = CipherReader {
+            stream: read_half,
+            cipher: self.recv_cipher,
+            prefix: self.recv_prefix,
+            counter: self.recv_counter,
+        };
+        let writer = CipherWriter {
+            stream: write_half,
+            cipher: self.send_cipher,
+            prefix: self.send_prefix,
+            counter: self.send_counter,
+        };
+        (reader, writer)
+    }
+}
+
+/// Read half of a split [`CipherStream`].
+pub struct CipherReader {
+    stream: OwnedReadHalf,
+    cipher: ChaCha20Poly1305,
+    prefix: [u8; 4],
+    counter: u64,
+}
+
+impl CipherReader {
+    /// Read and decrypt one frame. Same wire format as
+    /// [`CipherStream::recv`].
+    pub async fn recv(&mut self) -> Result<Vec<u8>, FrameError> {
+        let mut len_be = [0u8; 4];
+        self.stream.read_exact(&mut len_be).await?;
+        let ct_len = u32::from_be_bytes(len_be) as usize;
+        if !(16..=MAX_FRAME_BYTES).contains(&ct_len) {
+            return Err(FrameError::Oversize(ct_len));
+        }
+        let mut ct = vec![0u8; ct_len];
+        self.stream.read_exact(&mut ct).await?;
+
+        let nonce = build_nonce(&self.prefix, self.counter);
+        let pt = self
+            .cipher
+            .decrypt(Nonce::from_slice(&nonce), Payload { msg: &ct, aad: b"" })
+            .map_err(|_| FrameError::BadCiphertext)?;
+        self.counter = self
+            .counter
+            .checked_add(1)
+            .ok_or(FrameError::NonceExhaustion)?;
+        Ok(pt)
+    }
+}
+
+/// Write half of a split [`CipherStream`].
+pub struct CipherWriter {
+    stream: OwnedWriteHalf,
+    cipher: ChaCha20Poly1305,
+    prefix: [u8; 4],
+    counter: u64,
+}
+
+impl CipherWriter {
+    /// Encrypt and frame `payload`. Same wire format as
+    /// [`CipherStream::send`].
+    pub async fn send(&mut self, payload: &[u8]) -> Result<(), FrameError> {
+        if payload.len() > MAX_FRAME_BYTES {
+            return Err(FrameError::Oversize(payload.len()));
+        }
+        let nonce = build_nonce(&self.prefix, self.counter);
+        let ct = self
+            .cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: payload,
+                    aad: b"",
+                },
+            )
+            .map_err(|_| FrameError::EncryptFailed)?;
+        let len_be = (ct.len() as u32).to_be_bytes();
+        self.stream.write_all(&len_be).await?;
+        self.stream.write_all(&ct).await?;
+        self.stream.flush().await?;
+        self.counter = self
+            .counter
+            .checked_add(1)
+            .ok_or(FrameError::NonceExhaustion)?;
+        Ok(())
+    }
 }

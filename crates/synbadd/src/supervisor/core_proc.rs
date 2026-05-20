@@ -419,12 +419,22 @@ pub(super) fn start_discovery(
     config_head: &str,
 ) -> Result<(Advertiser, Browser, mpsc::Receiver<DiscoveryEvent>)> {
     let display = sanitize_display_name(&config.server_name);
+    // Only advertise the audio port when the user has actually opted
+    // into the audio bridge — a peer that sees an `audio_port` of zero
+    // would attempt to dial and fail. Keeping the key absent matches
+    // the "no audio here" reading on the consumer side.
+    let advertised_audio_port = if config.audio.enabled {
+        config.audio.signal_port
+    } else {
+        0
+    };
     let advertiser = Advertiser::start(
         identity,
         &display,
         config.service_port,
         config.sync_port,
         config.port,
+        advertised_audio_port,
         config_head,
     )
     .context("starting mDNS advertiser")?;

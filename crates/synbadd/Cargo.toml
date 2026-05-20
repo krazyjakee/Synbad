@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+synbad-audio = { path = "../synbad-audio" }
 synbad-config = { path = "../synbad-config" }
 synbad-ipc = { path = "../synbad-ipc", features = ["tokio-server"] }
 synbad-discovery = { path = "../synbad-discovery" }

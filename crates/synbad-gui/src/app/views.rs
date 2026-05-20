@@ -6,7 +6,7 @@
 //! IPC channel. No long-lived state lives in this file — by design.
 
 use synbad_config::{BinaryPaths, NodeRole, Screen};
-use synbad_ipc::{DaemonState, DiscoveredPeer};
+use synbad_ipc::{AudioDeviceInfo, DaemonState, DiscoveredPeer};
 
 use crate::ipc_thread::Cmd;
 
@@ -381,6 +381,156 @@ impl SynbadApp {
         }
     }
 
+    pub(super) fn draw_audio(&mut self, ui: &mut egui::Ui) {
+        // Lazy-load the device list when the tab is first opened so we
+        // don't probe cpal until the user actually wants it. Also pull a
+        // fresh status snapshot so the per-peer table isn't stale from
+        // before we joined this tab.
+        if !self.audio_devices_loaded {
+            self.send(Cmd::ListAudioDevices);
+            self.send(Cmd::GetAudioStatus);
+            self.audio_devices_loaded = true;
+        }
+
+        ui.horizontal(|ui| {
+            ui.heading("Audio bridge");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("Refresh devices").clicked() {
+                    self.send(Cmd::ListAudioDevices);
+                }
+            });
+        });
+        ui.label(
+            "Streams microphone audio between paired peers over WebRTC. \
+             Toggling the master switch requires a daemon restart.",
+        );
+
+        if let Some(err) = self.audio_last_error.clone() {
+            ui.horizontal(|ui| {
+                ui.colored_label(egui::Color32::LIGHT_RED, format!("⚠ {err}"));
+                // The capture-side LoopbackUnavailable error has no
+                // actionable fix without a virtual audio device — drop
+                // a link to BlackHole right next to the message so the
+                // user knows what to install rather than guessing.
+                if err.contains("loopback capture not available")
+                    || err.contains("virtual audio device")
+                {
+                    ui.hyperlink_to("Install BlackHole", "https://existential.audio/blackhole/");
+                }
+                if ui.small_button("Dismiss").clicked() {
+                    self.audio_last_error = None;
+                }
+            });
+        }
+
+        ui.separator();
+
+        let mut audio = self.config.audio.clone();
+        let mut audio_changed = false;
+
+        egui::Grid::new("audio-settings")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("Enabled");
+                if ui
+                    .checkbox(&mut audio.enabled, "")
+                    .on_hover_text("Master switch. Requires a daemon restart to take effect.")
+                    .changed()
+                {
+                    audio_changed = true;
+                }
+                ui.end_row();
+
+                ui.label("Send local mic to peers");
+                if ui.checkbox(&mut audio.send_mic_to_peers, "").changed() {
+                    audio_changed = true;
+                }
+                ui.end_row();
+
+                ui.label("Play peer audio locally");
+                if ui.checkbox(&mut audio.receive_peer_audio, "").changed() {
+                    audio_changed = true;
+                }
+                ui.end_row();
+
+                ui.label("Input device");
+                if device_combo(
+                    ui,
+                    "audio-input",
+                    &self.audio_input_devices,
+                    &mut audio.input_device,
+                ) {
+                    audio_changed = true;
+                }
+                ui.end_row();
+
+                ui.label("Output device");
+                if device_combo(
+                    ui,
+                    "audio-output",
+                    &self.audio_output_devices,
+                    &mut audio.output_device,
+                ) {
+                    audio_changed = true;
+                }
+                ui.end_row();
+
+                ui.label("Signaling port");
+                let mut port = audio.signal_port as i32;
+                if ui
+                    .add(egui::DragValue::new(&mut port).clamp_range(1..=65535))
+                    .changed()
+                {
+                    audio.signal_port = port.clamp(1, 65535) as u16;
+                    audio_changed = true;
+                }
+                ui.end_row();
+            });
+
+        if audio_changed {
+            self.config.audio = audio.clone();
+            self.dirty = true;
+            // Push immediately — the daemon de-bounces same-value writes
+            // and the rest of the Config is unchanged.
+            self.send(Cmd::SetAudioConfig(audio));
+        }
+
+        ui.separator();
+        ui.heading("Per-peer status");
+        if self.audio_peer_status.is_empty() {
+            ui.label("No active audio sessions.");
+        } else {
+            egui::Grid::new("audio-peer-status")
+                .num_columns(5)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.label("Peer");
+                    ui.label("→ peer");
+                    ui.label("← peer");
+                    ui.label("RTT");
+                    ui.label("Error");
+                    ui.end_row();
+                    for status in self.audio_peer_status.values() {
+                        ui.label(&status.display_name);
+                        ui.label(if status.sending_to_peer { "✓" } else { "—" });
+                        ui.label(if status.receiving_from_peer {
+                            "✓"
+                        } else {
+                            "—"
+                        });
+                        ui.label(
+                            status
+                                .rtt_ms
+                                .map(|r| format!("{r} ms"))
+                                .unwrap_or_else(|| "—".into()),
+                        );
+                        ui.label(status.last_error.clone().unwrap_or_default());
+                        ui.end_row();
+                    }
+                });
+        }
+    }
+
     pub(super) fn draw_settings(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("settings").num_columns(2).show(ui, |ui| {
             ui.label("Role");
@@ -516,6 +666,46 @@ fn opt_path(s: &str) -> Option<std::path::PathBuf> {
     } else {
         Some(std::path::PathBuf::from(t))
     }
+}
+
+/// Combo-box of audio devices. `selected` holds the chosen device name or
+/// `None` for "OS default." Returns `true` if the selection changed.
+fn device_combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    devices: &[AudioDeviceInfo],
+    selected: &mut Option<String>,
+) -> bool {
+    let mut changed = false;
+    let label = selected
+        .clone()
+        .unwrap_or_else(|| "(OS default)".to_string());
+    egui::ComboBox::from_id_source(id)
+        .selected_text(label)
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_value(selected, None, "(OS default)")
+                .clicked()
+            {
+                changed = true;
+            }
+            for dev in devices {
+                let mut display = dev.name.clone();
+                if dev.is_loopback {
+                    display.push_str("  (loopback)");
+                }
+                if dev.is_default {
+                    display.push_str("  *");
+                }
+                if ui
+                    .selectable_value(selected, Some(dev.name.clone()), display)
+                    .clicked()
+                {
+                    changed = true;
+                }
+            }
+        });
+    changed
 }
 
 pub(super) fn state_chip(s: &DaemonState, connected: bool) -> (egui::Color32, String) {

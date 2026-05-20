@@ -416,7 +416,7 @@ struct SharedHashInput<'a> {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use synbad_config::{BinaryPaths, GridPosition, Link, NodeRole, Screen, Side};
+    use synbad_config::{AudioConfig, BinaryPaths, GridPosition, Link, NodeRole, Screen, Side};
 
     fn config_a() -> Config {
         Config {
@@ -436,6 +436,7 @@ mod tests {
             options: BTreeMap::new(),
             clipboard_sharing: true,
             binaries: BinaryPaths::default(),
+            audio: AudioConfig::default(),
         }
     }
 

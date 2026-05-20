@@ -148,6 +148,13 @@ fn peer_from(info: &mdns_sd::ServiceInfo) -> Option<DiscoveredPeer> {
         .get_property_val_str("sync_port")
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
+    // TXT `audio_port` = the Synbad daemon's audio-bridge signaling port.
+    // Absent / zero when the peer hasn't opted into audio; the supervisor
+    // skips outbound audio dial in that case.
+    let audio_port = txt
+        .get_property_val_str("audio_port")
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
     let config_head = txt.get_property_val_str("cfg").unwrap_or("").to_string();
 
     Some(DiscoveredPeer {
@@ -157,6 +164,7 @@ fn peer_from(info: &mdns_sd::ServiceInfo) -> Option<DiscoveredPeer> {
         service_port: info.get_port(),
         core_port,
         sync_port,
+        audio_port,
         fingerprint,
         protocol_version,
         config_head,
