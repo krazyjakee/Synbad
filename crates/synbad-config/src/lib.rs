@@ -48,6 +48,12 @@ pub struct Config {
     /// Free-form Core options (rendered into `section: options`).
     #[serde(default)]
     pub options: BTreeMap<String, String>,
+    /// Whether the Synergy Core should share clipboard contents between
+    /// connected machines. When `false`, emits `clipboardSharing = false`
+    /// into the generated `synergy.conf` options section so the Core
+    /// suppresses clipboard relay in both directions.
+    #[serde(default = "default_clipboard_sharing")]
+    pub clipboard_sharing: bool,
     /// Where to find the Synergy Core executables.
     #[serde(default)]
     pub binaries: BinaryPaths,
@@ -63,6 +69,10 @@ fn default_service_port() -> u16 {
 
 fn default_sync_port() -> u16 {
     24851
+}
+
+fn default_clipboard_sharing() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -172,6 +182,7 @@ impl Default for Config {
             }],
             links: vec![],
             options: BTreeMap::new(),
+            clipboard_sharing: default_clipboard_sharing(),
             binaries: BinaryPaths::default(),
         }
     }
@@ -342,8 +353,12 @@ impl Config {
             let _ = writeln!(out);
         }
 
-        if !self.options.is_empty() {
+        let emit_clipboard = !self.clipboard_sharing;
+        if !self.options.is_empty() || emit_clipboard {
             let _ = writeln!(out, "section: options");
+            if emit_clipboard {
+                let _ = writeln!(out, "\tclipboardSharing = false");
+            }
             for (k, v) in &self.options {
                 let _ = writeln!(out, "\t{} = {}", k, v);
             }
@@ -453,6 +468,7 @@ mod tests {
                 to: "beta".into(),
             }],
             options: BTreeMap::from([("heartbeat".to_string(), "5000".to_string())]),
+            clipboard_sharing: true,
             binaries: BinaryPaths::default(),
         }
     }
@@ -527,6 +543,42 @@ mod tests {
         assert!(ini.contains("port=24800"));
         assert!(ini.contains("externalConfig=true"));
         assert!(ini.contains("externalConfigFile=/tmp/x.conf"));
+    }
+
+    #[test]
+    fn clipboard_sharing_disabled_emits_option() {
+        let mut c = sample();
+        c.clipboard_sharing = false;
+        let conf = c.generate_synergy_conf();
+        assert!(conf.contains("section: options"));
+        assert!(conf.contains("clipboardSharing = false"));
+    }
+
+    #[test]
+    fn clipboard_sharing_enabled_omits_option() {
+        // Default sample has clipboard_sharing = true and no other options.
+        // The generated conf shouldn't mention clipboardSharing at all —
+        // omission means "use Core's default behaviour" (clipboard on).
+        let mut c = sample();
+        c.options.clear();
+        c.clipboard_sharing = true;
+        let conf = c.generate_synergy_conf();
+        assert!(!conf.contains("clipboardSharing"));
+    }
+
+    #[test]
+    fn clipboard_sharing_defaults_to_true_when_missing_in_toml() {
+        // Loading a TOML written by an older Synbad must default to the
+        // pre-toggle behaviour (clipboard on) so an upgrade doesn't
+        // silently change Core behaviour.
+        let toml = r#"
+role = "server"
+server_name = "alpha"
+[[screens]]
+name = "alpha"
+"#;
+        let c: Config = toml::from_str(toml).unwrap();
+        assert!(c.clipboard_sharing);
     }
 
     #[test]

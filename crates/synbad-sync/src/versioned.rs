@@ -96,6 +96,8 @@ pub struct FieldStamps {
     #[serde(default)]
     pub options: LamportTime,
     #[serde(default)]
+    pub clipboard_sharing: LamportTime,
+    #[serde(default)]
     pub binaries: LamportTime,
 }
 
@@ -112,6 +114,7 @@ impl FieldStamps {
             screens: stamp.clone(),
             links: stamp.clone(),
             options: stamp.clone(),
+            clipboard_sharing: stamp.clone(),
             binaries: stamp,
         }
     }
@@ -126,6 +129,7 @@ impl FieldStamps {
             self.screens.counter,
             self.links.counter,
             self.options.counter,
+            self.clipboard_sharing.counter,
             self.binaries.counter,
         ]
         .into_iter()
@@ -202,10 +206,12 @@ impl VersionedConfig {
             screens: &self.config.screens,
             links: &self.config.links,
             options: &self.config.options,
+            clipboard_sharing: self.config.clipboard_sharing,
             port_stamp: &self.stamps.port,
             screens_stamp: &self.stamps.screens,
             links_stamp: &self.stamps.links,
             options_stamp: &self.stamps.options,
+            clipboard_sharing_stamp: &self.stamps.clipboard_sharing,
         };
         let bytes = match serde_json::to_vec(&shared) {
             Ok(b) => b,
@@ -255,6 +261,9 @@ impl VersionedConfig {
         }
         if self.config.options != new_config.options {
             self.stamps.options = stamp.clone();
+        }
+        if self.config.clipboard_sharing != new_config.clipboard_sharing {
+            self.stamps.clipboard_sharing = stamp.clone();
         }
         if self.config.binaries != new_config.binaries {
             self.stamps.binaries = stamp;
@@ -315,6 +324,11 @@ impl VersionedConfig {
         if other.stamps.options > self.stamps.options {
             self.config.options = other.config.options.clone();
             self.stamps.options = other.stamps.options.clone();
+            changed = true;
+        }
+        if other.stamps.clipboard_sharing > self.stamps.clipboard_sharing {
+            self.config.clipboard_sharing = other.config.clipboard_sharing;
+            self.stamps.clipboard_sharing = other.stamps.clipboard_sharing.clone();
             changed = true;
         }
 
@@ -390,10 +404,12 @@ struct SharedHashInput<'a> {
     screens: &'a [synbad_config::Screen],
     links: &'a [synbad_config::Link],
     options: &'a std::collections::BTreeMap<String, String>,
+    clipboard_sharing: bool,
     port_stamp: &'a LamportTime,
     screens_stamp: &'a LamportTime,
     links_stamp: &'a LamportTime,
     options_stamp: &'a LamportTime,
+    clipboard_sharing_stamp: &'a LamportTime,
 }
 
 #[cfg(test)]
@@ -417,6 +433,7 @@ mod tests {
             }],
             links: vec![],
             options: BTreeMap::new(),
+            clipboard_sharing: true,
             binaries: BinaryPaths::default(),
         }
     }
@@ -583,6 +600,33 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
+    }
+
+    #[test]
+    fn clipboard_sharing_is_a_shared_field_and_merges() {
+        // One peer flips off clipboard sharing; the other peer should
+        // pick that up on merge so both ends agree the Core won't relay
+        // the clipboard.
+        let mut alpha = VersionedConfig::initial(config_a(), "alpha-id");
+        let mut beta = alpha.clone();
+        beta.stamps = FieldStamps::all(LamportTime {
+            counter: 1,
+            origin: "beta-id".into(),
+        });
+
+        let mut alpha_edit = alpha.config.clone();
+        alpha_edit.clipboard_sharing = false;
+        assert!(alpha.apply_local(alpha_edit, "alpha-id"));
+        assert!(!alpha.config.clipboard_sharing);
+
+        let alpha_pre = alpha.clone();
+        assert_eq!(beta.merge(&alpha), MergeOutcome::Updated);
+        beta.merge(&alpha_pre);
+        assert!(!beta.config.clipboard_sharing);
+
+        // A second merge from the same alpha snapshot is now a no-op —
+        // both sides agree on clipboard_sharing's stamp.
+        assert_eq!(beta.merge(&alpha_pre), MergeOutcome::NoChange);
     }
 
     #[test]

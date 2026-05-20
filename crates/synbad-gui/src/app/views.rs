@@ -441,6 +441,19 @@ impl SynbadApp {
             });
             ui.end_row();
 
+            ui.label("Share clipboard");
+            let mut share = self.config.clipboard_sharing;
+            let resp = ui.checkbox(&mut share, "");
+            if resp.changed() {
+                self.config.clipboard_sharing = share;
+                self.dirty = true;
+            }
+            resp.on_hover_text(
+                "When off, the Synergy Core won't relay clipboard contents between \
+                 machines (emits `clipboardSharing = false` into synergy.conf).",
+            );
+            ui.end_row();
+
             ui.label("deskflow-core path (override)");
             let mut core_bin = self
                 .config
