@@ -97,7 +97,7 @@ Core process is restarted in place.
 | Peer doesn't appear in the discovered list | mDNS blocked on the LAN, or both machines on different VLANs / VPNs | Add the peer manually via *Add peer* in the GUI |
 | Pairing fails with "session timed out" | Firewall is blocking TCP/24850 (default service port) | Open the port, or set a different `service_port` in `~/.config/synbad/config.toml` |
 | Pairing fails with "user declined" | One side hit Decline (often: code mismatch) | Try again from a known-trusted network |
-| Core crashes immediately on Start | Missing runtime libraries (Qt6 on Linux, etc) | `journalctl --user -u synbadd -f` on Linux; `/tmp/synbadd.err.log` on macOS |
+| Core crashes immediately on Start | Linux: missing Qt6 runtime libs (see README "Runtime dependencies"). macOS: Accessibility / Input Monitoring not granted, or `Deskflow.app` is quarantined by Gatekeeper. | `journalctl --user -u synbadd -f` on Linux; `/tmp/synbadd.err.log` on macOS. On macOS also check System Settings → Privacy & Security. |
 | Configs out of sync between peers | A peer is offline or the firewall is blocking TCP/24851 (sync port) | Wait for the peer to come back; sync resumes automatically |
 | Want to forget a paired peer | Revoke trust in the GUI (or remove `~/.config/synbad/trusted-peers.json` to forget all) | After revoking, the peer must re-pair |
 | Want to rotate this machine's identity | Stop `synbadd`, delete `~/.config/synbad/identity/`, restart | Every peer must re-pair with you afterward |

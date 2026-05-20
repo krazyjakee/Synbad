@@ -81,6 +81,8 @@ and supervises it as a child process. Synbad currently pins
 because it's the last upstream release that ships a Linux build compatible
 with Ubuntu 24.04's Qt 6.4 — Deskflow 1.19+ target Qt 6.7 / 6.8.
 
+#### Linux
+
 The downloaded `deskflow-core` is the CLI binary, but it's still linked
 against (non-GUI parts of) Qt 6, plus libei and libportal. On Ubuntu 24.04 /
 Debian 12 you'll need:
@@ -91,6 +93,41 @@ sudo apt install libqt6core6t64 libqt6dbus6t64 libqt6xml6t64 libei1 libportal1
 
 (On older Debian/Ubuntu releases without the `t64` ABI transition, drop the
 `t64` suffix from the Qt packages.)
+
+#### macOS
+
+The upstream `.dmg` ships `Deskflow.app` with the Qt frameworks vendored
+inside `Contents/Frameworks/`, so **no extra Homebrew install is needed**.
+`synbadd` copies the whole bundle to
+`~/Library/Application Support/dev.synbad.synbad/bin/<tag>/Deskflow.app/`
+and runs the binary from inside it; the
+`@executable_path/../Frameworks/...` rpaths resolve to the bundled Qt.
+
+What macOS *does* require is granting permissions to `synbadd` the first
+time you click **Start**:
+
+- **System Settings → Privacy & Security → Accessibility** — needed to
+  inject keyboard/mouse events (server role) and to read modifier state
+  reliably.
+- **System Settings → Privacy & Security → Input Monitoring** — needed to
+  observe the keyboard at all on macOS 11+.
+
+If the Core fast-fails immediately on first launch, the bundle may be
+quarantined by Gatekeeper. Clear it once:
+
+```sh
+xattr -dr com.apple.quarantine \
+  "$HOME/Library/Application Support/dev.synbad.synbad/bin/"
+```
+
+#### Windows
+
+The pinned tag (v1.17.0) only ships an `.msi` installer for Windows, which
+`synbadd` can't extract in pure Rust. Until the pin is bumped to a release
+that publishes the `win-x64-portable.7z`, point `binaries.core` at a
+hand-built `deskflow-core.exe` (see below).
+
+#### Override
 
 To use a hand-built or differently-versioned `deskflow-core`, set
 `binaries.core` in `~/.config/synbad/config.toml` to its absolute path —

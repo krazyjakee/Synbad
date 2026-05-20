@@ -88,6 +88,32 @@ fn unified_bin_name() -> &'static str {
 const LEGACY_SERVER_BIN: &str = "deskflow-server";
 const LEGACY_CLIENT_BIN: &str = "deskflow-client";
 
+/// On macOS we keep the binary inside its `.app` bundle so the Qt
+/// frameworks bundled at `Contents/Frameworks/` resolve via the
+/// binary's `@executable_path/../Frameworks/...` rpath. Pulling the
+/// binary out of the bundle would orphan it from those frameworks and
+/// the process aborts on launch.
+#[cfg(target_os = "macos")]
+const MAC_APP_BUNDLE_NAME: &str = "Deskflow.app";
+
+/// Where `name` ends up in the cache for the current OS. On macOS this
+/// is `<dest_dir>/Deskflow.app/Contents/MacOS/<name>`; everywhere else
+/// the binaries live directly in `dest_dir`.
+fn installed_bin_path(dest_dir: &Path, name: &str) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        return dest_dir
+            .join(MAC_APP_BUNDLE_NAME)
+            .join("Contents")
+            .join("MacOS")
+            .join(name);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        dest_dir.join(name)
+    }
+}
+
 /// SHA-256 of release assets we know about, keyed by asset filename. Used as
 /// a fallback when the release doesn't publish a `sums.txt` (true of every
 /// Deskflow tag before v1.19).
@@ -268,7 +294,7 @@ impl Resolver {
         let dir = self.cache_root.join(tag);
         match layout_kind_for(tag) {
             LayoutKind::Unified => {
-                let path = dir.join(unified_bin_name());
+                let path = installed_bin_path(&dir, unified_bin_name());
                 if path.exists() {
                     Some(ResolvedCore {
                         layout: CoreLayout::Unified { path },
@@ -278,8 +304,8 @@ impl Resolver {
                 }
             }
             LayoutKind::SplitLegacy => {
-                let server = dir.join(LEGACY_SERVER_BIN);
-                let client = dir.join(LEGACY_CLIENT_BIN);
+                let server = installed_bin_path(&dir, LEGACY_SERVER_BIN);
+                let client = installed_bin_path(&dir, LEGACY_CLIENT_BIN);
                 if server.exists() && client.exists() {
                     Some(ResolvedCore {
                         layout: CoreLayout::SplitLegacy { server, client },
@@ -523,16 +549,16 @@ fn expected_targets(kind: LayoutKind, dest_dir: &Path) -> Vec<(String, PathBuf)>
     match kind {
         LayoutKind::Unified => vec![(
             "deskflow-core".to_string(),
-            dest_dir.join(unified_bin_name()),
+            installed_bin_path(dest_dir, unified_bin_name()),
         )],
         LayoutKind::SplitLegacy => vec![
             (
                 LEGACY_SERVER_BIN.to_string(),
-                dest_dir.join(LEGACY_SERVER_BIN),
+                installed_bin_path(dest_dir, LEGACY_SERVER_BIN),
             ),
             (
                 LEGACY_CLIENT_BIN.to_string(),
-                dest_dir.join(LEGACY_CLIENT_BIN),
+                installed_bin_path(dest_dir, LEGACY_CLIENT_BIN),
             ),
         ],
     }
@@ -669,10 +695,14 @@ fn extract_dmg_to(asset_bytes: &[u8], targets: &[(String, PathBuf)]) -> Result<(
     // various DMG variants Apple has shipped over the years. Pure-Rust DMG
     // parsing is feasible but a lot of code for one platform.
     //
-    // For SplitLegacy (v1.17.0) the DMG carries an app bundle containing
-    // both `deskflow-server` and `deskflow-client`; for Unified (v1.19+)
-    // it's just `deskflow-core`. We walk the mount once per target name
-    // and copy the first match into the cache.
+    // We copy the whole `Deskflow.app` bundle into the cache (not just the
+    // bare binaries) so that the Qt frameworks shipped in
+    // `Contents/Frameworks/` stay co-located with the binary. Deskflow's
+    // macOS binaries are linked with `@executable_path/../Frameworks/...`
+    // rpath references; pulling just the bare binary out of
+    // `Contents/MacOS/` orphans it from its Qt deps and the process aborts
+    // on launch with no useful stderr — the symptom users see is the
+    // supervisor's "core crashed within sub-second" fast-fail.
     let tmpdir = tempdir_in_state()?;
     let dmg_path = tmpdir.join("deskflow.dmg");
     std::fs::write(&dmg_path, asset_bytes)?;
@@ -695,15 +725,37 @@ fn extract_dmg_to(asset_bytes: &[u8], targets: &[(String, PathBuf)]) -> Result<(
     }
 
     let copy_result = (|| -> Result<()> {
+        let bundle_src = find_app_bundle(&mount_root, MAC_APP_BUNDLE_NAME)
+            .ok_or_else(|| anyhow!("{} not found inside .dmg", MAC_APP_BUNDLE_NAME))?;
+
+        // `installed_bin_path` lays targets out as
+        // `<dest_dir>/Deskflow.app/Contents/MacOS/<name>`, so walk up four
+        // components to recover `<dest_dir>` for the bundle copy root.
+        let dest_dir = targets
+            .first()
+            .and_then(|(_, p)| p.parent())
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .ok_or_else(|| anyhow!("empty or malformed targets for DMG extract"))?;
+        let bundle_dst = dest_dir.join(MAC_APP_BUNDLE_NAME);
+
+        if bundle_dst.exists() {
+            std::fs::remove_dir_all(&bundle_dst)
+                .with_context(|| format!("removing stale bundle at {:?}", bundle_dst))?;
+        }
+        copy_dir_preserving_symlinks(&bundle_src, &bundle_dst)
+            .with_context(|| format!("copying {} into cache", MAC_APP_BUNDLE_NAME))?;
+
         for (name, dest) in targets {
-            let src = find_named(&mount_root, name)
-                .ok_or_else(|| anyhow!("{} not found inside .dmg", name))?;
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {:?}", parent))?;
+            if !dest.exists() {
+                bail!(
+                    "{} not found at {:?} after copying {}",
+                    name,
+                    dest,
+                    MAC_APP_BUNDLE_NAME
+                );
             }
-            std::fs::copy(&src, dest)
-                .with_context(|| format!("copying {} from .dmg to {:?}", name, dest))?;
             make_executable(dest)?;
         }
         Ok(())
@@ -730,7 +782,7 @@ fn tempdir_in_state() -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn find_named(root: &Path, name: &str) -> Option<PathBuf> {
+fn find_app_bundle(root: &Path, name: &str) -> Option<PathBuf> {
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -738,15 +790,54 @@ fn find_named(root: &Path, name: &str) -> Option<PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if entry.file_name() == name {
+            let file_name = entry.file_name();
+            // `.app` is itself a directory, so this matches a real bundle.
+            if file_name == name {
                 return Some(path);
             }
-            if path.is_dir() {
+            // Skip descending into other `.app` bundles — Qt frameworks
+            // can be deep and we'd rather not walk them looking for a
+            // sibling that isn't there.
+            let is_app = file_name
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(".app");
+            if !is_app && path.is_dir() {
                 stack.push(path);
             }
         }
     }
     None
+}
+
+/// Copy `src` to `dst` recursively, preserving symlinks rather than
+/// following them. Qt frameworks rely heavily on symlinks
+/// (`Versions/Current → A`, `QtCore → Versions/Current/QtCore`, …) so
+/// flattening them would either break the framework or balloon the
+/// bundle size and break code signing.
+#[cfg(target_os = "macos")]
+fn copy_dir_preserving_symlinks(src: &Path, dst: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+    std::fs::create_dir_all(dst).with_context(|| format!("creating {:?}", dst))?;
+    for entry in std::fs::read_dir(src).with_context(|| format!("reading {:?}", src))? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if file_type.is_symlink() {
+            let target =
+                std::fs::read_link(&from).with_context(|| format!("reading symlink {:?}", from))?;
+            // `symlink` will fail if the destination already exists; the
+            // caller guarantees a clean `dst` tree, so a simple write is
+            // enough.
+            symlink(&target, &to).with_context(|| format!("symlink {:?} -> {:?}", to, target))?;
+        } else if file_type.is_dir() {
+            copy_dir_preserving_symlinks(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to).with_context(|| format!("copying {:?} to {:?}", from, to))?;
+        }
+    }
+    Ok(())
 }
 
 fn unix_now() -> u64 {
@@ -799,8 +890,8 @@ mod tests {
         let targets = expected_targets(LayoutKind::SplitLegacy, &tmp);
         extract_data_tar(&gz, "data.tar.gz", &targets).unwrap();
 
-        let s = std::fs::read(tmp.join(LEGACY_SERVER_BIN)).unwrap();
-        let c = std::fs::read(tmp.join(LEGACY_CLIENT_BIN)).unwrap();
+        let s = std::fs::read(&targets[0].1).unwrap();
+        let c = std::fs::read(&targets[1].1).unwrap();
         assert_eq!(s, b"SERVER_BODY");
         assert_eq!(c, b"CLIENT_BODY");
         // Unrelated binary must not have been written.
@@ -817,10 +908,7 @@ mod tests {
         let targets = expected_targets(LayoutKind::Unified, &tmp);
         extract_data_tar(&gz, "data.tar.gz", &targets).unwrap();
 
-        assert_eq!(
-            std::fs::read(tmp.join(unified_bin_name())).unwrap(),
-            b"CORE_BODY"
-        );
+        assert_eq!(std::fs::read(&targets[0].1).unwrap(), b"CORE_BODY");
     }
 
     #[test]
@@ -852,10 +940,7 @@ mod tests {
         let targets = expected_targets(LayoutKind::Unified, &tmp);
         extract_data_tar(&gz, "data.tar.gz", &targets).unwrap();
 
-        assert_eq!(
-            std::fs::read(tmp.join(unified_bin_name())).unwrap(),
-            b"REAL"
-        );
+        assert_eq!(std::fs::read(&targets[0].1).unwrap(), b"REAL");
     }
 
     /// Regression for the macOS "looking up sha256 for …" failure: v1.17.0

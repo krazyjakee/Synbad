@@ -943,11 +943,11 @@ impl Supervisor {
             // what happened, and we record a log line explaining why we
             // stopped retrying.
             self.desired_running = false;
+            let hint = fast_fail_hint();
             let msg = format!(
                 "[synbad] core exited within {:?} on {} consecutive attempts (exit {:?}); \
-                 giving up. Check that Deskflow's runtime deps (Qt6) are installed, \
-                 then click Start.",
-                FAST_FAIL_WINDOW, self.fast_fail_count, code
+                 giving up. {} Then click Start.",
+                FAST_FAIL_WINDOW, self.fast_fail_count, code, hint,
             );
             tracing::error!("{}", msg);
             self.record_log(msg);
@@ -1057,6 +1057,26 @@ async fn fetch_binary(
     let result = resolver.ensure_core(tx).await;
     forwarder.abort();
     result
+}
+
+/// Per-platform hint for what to check when the Core dies instantly.
+/// `synbadd` doesn't parse the child's stderr deeply enough to know the
+/// cause, so we surface the most common one for the user's OS.
+fn fast_fail_hint() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "Check that Deskflow's runtime deps (Qt6) are installed."
+    } else if cfg!(target_os = "macos") {
+        // We bundle Qt frameworks alongside the binary on macOS, so the
+        // usual culprits here are Gatekeeper quarantining the .app or
+        // missing Accessibility/Input Monitoring permissions for synbadd.
+        "On macOS, grant `synbadd` Accessibility (and Input Monitoring) \
+         under System Settings → Privacy & Security, and confirm the \
+         downloaded Deskflow.app isn't quarantined (`xattr -dr \
+         com.apple.quarantine ~/Library/Application\\ \
+         Support/dev.synbad.synbad/bin/`)."
+    } else {
+        "Check the daemon log for the Core's stderr to see why it exited."
+    }
 }
 
 /// Construct the program + argv for spawning the Deskflow Core child,
