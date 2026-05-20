@@ -10,6 +10,20 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.4] - 2026-05-20
+
+### Changed
+- Internal refactor: the supervisor and GUI app modules are now split into
+  directories.
+  [`crates/synbadd/src/supervisor.rs`](crates/synbadd/src/supervisor/)
+  (1,319 lines) became `supervisor/{mod,requests,config_edit,core_proc}.rs`
+  — one file per concern (event loop, IPC dispatch, config edits, Core
+  child lifecycle + `build_command` tests).
+  [`crates/synbad-gui/src/app.rs`](crates/synbad-gui/src/app/) (1,097
+  lines) became `app/{mod,views}.rs`, separating state + the `eframe::App`
+  frame loop from per-tab rendering. No behavior change; all 51 workspace
+  tests still pass.
+
 ## [0.1.0-alpha.3] - 2026-05-19
 
 ### Added
