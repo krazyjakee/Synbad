@@ -98,6 +98,7 @@ impl SynbadApp {
                         w: 160,
                         h: 120,
                     },
+                    monitors: vec![],
                 });
                 self.new_screen_name.clear();
                 self.dirty = true;
