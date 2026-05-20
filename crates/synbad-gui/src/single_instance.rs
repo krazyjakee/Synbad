@@ -23,9 +23,13 @@ use std::path::PathBuf;
 pub enum AcquireResult {
     /// We're the only running instance. The guard must outlive the GUI —
     /// dropping it removes the socket.
+    // Constructed only by the Unix `acquire`; the Windows stub returns
+    // `Unsupported`, so the variants look unused under `#[cfg(windows)]`.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Acquired(Guard, crossbeam_channel::Receiver<()>),
     /// Another instance is already running and we forwarded a SHOW ping
     /// to it. The caller should exit cleanly.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Forwarded,
     /// Single-instance enforcement isn't available on this platform or
     /// the lock socket couldn't be set up. Caller proceeds as if there
