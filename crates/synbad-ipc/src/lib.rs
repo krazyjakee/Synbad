@@ -37,6 +37,13 @@ pub struct DiscoveredPeer {
     /// the peer didn't advertise one — sync to that peer isn't possible.
     #[serde(default)]
     pub sync_port: u16,
+    /// Port the peer's `synbadd` listens on for the **audio bridge**
+    /// signaling protocol. Zero if the peer hasn't enabled audio or
+    /// didn't advertise one — outbound audio dial is skipped in that
+    /// case. Same kind of role as `sync_port` (per-protocol port,
+    /// lifecycle-independent from pairing).
+    #[serde(default)]
+    pub audio_port: u16,
     /// Short public-key fingerprint — what the user compares at pair time.
     pub fingerprint: String,
     /// Synbad discovery protocol version advertised by the peer.

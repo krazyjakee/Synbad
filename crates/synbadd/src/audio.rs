@@ -1,10 +1,14 @@
-//! Audio signaling transport: TCP listener that accepts authenticated
-//! `CipherStream`s from paired peers and hands each to the
-//! `synbad_audio::AudioBridge` to drive an audio session over.
+//! Audio signaling transport: TCP listener + outbound dialer.
 //!
-//! Mirrors the structure of [`crate::sync`] but stays much smaller because
-//! the bridge owns all session state — this module only does TCP plumbing
-//! and the trust-bound handshake.
+//! The listener accepts authenticated `CipherStream`s from paired peers
+//! and hands each to the `synbad_audio::AudioBridge` to drive an audio
+//! session over. The dialer mirrors that path in the opposite direction
+//! so a peer that's already trusted starts an audio session as soon as
+//! we discover it (subject to the glare rule below).
+//!
+//! Mirrors the structure of [`crate::sync`] but stays smaller because
+//! the bridge owns all session state — this module only does TCP
+//! plumbing and the trust-bound handshake.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -12,18 +16,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use synbad_audio::AudioCommand;
-use synbad_crypto::{accept as crypto_accept, HandshakeMode};
+use synbad_audio::{AudioCommand, SessionRole};
+use synbad_crypto::{accept as crypto_accept, initiate as crypto_initiate, HandshakeMode};
 use synbad_discovery::{Identity, TrustedPeerStore};
+use synbad_ipc::DiscoveredPeer;
 
 /// How long a handshake may take before we tear the connection down. The
 /// audio bridge can stay open indefinitely once the handshake has
 /// completed; this only caps the auth phase.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to wait for the outbound TCP connect itself. The session
+/// timeout above kicks in once the bytes start flowing.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct AudioListenerDeps {
     pub identity: Arc<Identity>,
@@ -60,6 +69,85 @@ pub async fn spawn_listener(
         }
     });
     Ok(handle)
+}
+
+/// Dial a paired peer's audio port and hand off the established
+/// signaling stream as the [`SessionRole::Offerer`] side.
+///
+/// Used by the supervisor on `PeerDiscovered` for trusted peers. Caller
+/// is responsible for the glare rule (only dial when our `machine_id`
+/// sorts lower than the peer's) so two peers don't both end up trying
+/// to be offerer.
+pub fn spawn_outbound(
+    peer: DiscoveredPeer,
+    deps: Arc<AudioListenerDeps>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(e) = run_outbound(peer.clone(), deps).await {
+            debug!(
+                peer = %peer.machine_id,
+                ?e,
+                "outbound audio handshake failed"
+            );
+        }
+    })
+}
+
+async fn run_outbound(peer: DiscoveredPeer, deps: Arc<AudioListenerDeps>) -> Result<()> {
+    if peer.audio_port == 0 {
+        bail!("peer {} did not advertise an audio_port", peer.machine_id);
+    }
+    let trusted = {
+        let trust = deps.trust.lock().await;
+        trust.get(&peer.machine_id).cloned()
+    };
+    let trusted = trusted.ok_or_else(|| {
+        anyhow!(
+            "peer {} is not in the trust store; refusing audio dial",
+            peer.machine_id
+        )
+    })?;
+
+    let peer_pk: [u8; 32] = hex::decode(&trusted.public_key_hex)
+        .map_err(|e| anyhow!("trust store pubkey not hex: {}", e))?
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("trust store pubkey not 32 bytes"))?;
+
+    let addr = format!("{}:{}", peer.host, peer.audio_port);
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
+        .await
+        .map_err(|_| anyhow!("audio connect to {} timed out", addr))??;
+
+    let our_machine_id = deps.identity.machine_id.to_string();
+    let signing_key = deps.identity.signing_key();
+
+    let (cipher, _peer_auth) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        crypto_initiate(
+            stream,
+            HandshakeMode::Authenticated {
+                our_signing_key: &signing_key,
+                our_machine_id: &our_machine_id,
+            },
+            Some((trusted.machine_id.as_str(), &peer_pk)),
+        ),
+    )
+    .await
+    .map_err(|_| anyhow!("audio handshake to {} timed out", trusted.machine_id))?
+    .with_context(|| format!("audio handshake with {}", trusted.machine_id))?;
+
+    info!(peer = %trusted.machine_id, %addr, "audio session dial complete");
+
+    deps.bridge_commands
+        .send(AudioCommand::IncomingSignal {
+            peer_machine_id: trusted.machine_id,
+            stream: cipher,
+            role: SessionRole::Offerer,
+        })
+        .await
+        .map_err(|_| anyhow!("audio bridge dropped its command channel"))?;
+    Ok(())
 }
 
 async fn handshake_and_handoff(
@@ -114,6 +202,7 @@ async fn handshake_and_handoff(
         .send(AudioCommand::IncomingSignal {
             peer_machine_id,
             stream: cipher,
+            role: SessionRole::Answerer,
         })
         .await
         .map_err(|_| anyhow!("audio bridge dropped its command channel"))?;

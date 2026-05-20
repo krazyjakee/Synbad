@@ -70,5 +70,5 @@
 mod cipher;
 mod handshake;
 
-pub use cipher::{CipherStream, FrameError, MAX_FRAME_BYTES};
+pub use cipher::{CipherReader, CipherStream, CipherWriter, FrameError, MAX_FRAME_BYTES};
 pub use handshake::{accept, initiate, HandshakeError, HandshakeMode, PeerAuth, TranscriptHash};

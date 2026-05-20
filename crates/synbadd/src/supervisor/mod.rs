@@ -154,6 +154,13 @@ pub struct Supervisor {
     pub(super) _audio_task: Option<tokio::task::JoinHandle<()>>,
     /// Listener accepting inbound audio signaling sessions.
     pub(super) _audio_listener: Option<tokio::task::JoinHandle<()>>,
+    /// Shared deps reused by every outbound audio dial fired from
+    /// `maybe_dial_audio`. `None` when audio is disabled — outbound dial
+    /// is skipped in that case.
+    pub(super) audio_dial_deps: Option<Arc<crate::audio::AudioListenerDeps>>,
+    /// Outbound audio handshake tasks kept alive while running. GCed
+    /// alongside `sync_tasks` / `pairing_tasks`.
+    pub(super) audio_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Supervisor {
@@ -287,8 +294,10 @@ impl Supervisor {
 
         // Audio bridge: only spawned if explicitly enabled in config.
         // Toggling `audio.enabled` requires a daemon restart in v1; the
-        // GUI surfaces this to the user.
-        let (audio_handle, audio_task, audio_listener) = if config.audio.enabled {
+        // GUI surfaces this to the user. `dial_deps` is the same struct
+        // the listener uses, kept around so `maybe_dial_audio` can fire
+        // outbound handshakes without rebuilding it each time.
+        let (audio_handle, audio_task, audio_listener, audio_dial_deps) = if config.audio.enabled {
             let bridge = synbad_audio::AudioBridge::new(
                 config.audio.clone(),
                 identity.clone(),
@@ -301,16 +310,18 @@ impl Supervisor {
                 bridge_commands: handle.commands_tx.clone(),
             });
             let listener =
-                match crate::audio::spawn_listener(config.audio.signal_port, listener_deps).await {
+                match crate::audio::spawn_listener(config.audio.signal_port, listener_deps.clone())
+                    .await
+                {
                     Ok(h) => Some(h),
                     Err(e) => {
                         tracing::warn!(?e, "audio signal listener disabled");
                         None
                     }
                 };
-            (Some(handle), Some(task), listener)
+            (Some(handle), Some(task), listener, Some(listener_deps))
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         Ok(Supervisor {
@@ -355,6 +366,8 @@ impl Supervisor {
             audio: audio_handle,
             _audio_task: audio_task,
             _audio_listener: audio_listener,
+            audio_dial_deps,
+            audio_tasks: Vec::new(),
         })
     }
 
@@ -487,7 +500,12 @@ impl Supervisor {
                     // differs from ours, open a pull-sync so we converge
                     // even if we missed their previous push (e.g. we
                     // weren't on the LAN at the time).
-                    self.maybe_pull_from(peer);
+                    self.maybe_pull_from(peer.clone());
+                    // Independently consider opening an audio session.
+                    // Driven off the same trigger (peer became visible)
+                    // so a fresh LAN connection brings audio up without
+                    // user action.
+                    self.maybe_dial_audio(peer);
                 }
             }
             DiscoveryEvent::Lost { machine_id } => {
@@ -497,6 +515,42 @@ impl Supervisor {
                 }
             }
         }
+    }
+
+    /// Open an outbound audio session to a freshly-visible peer iff:
+    /// - audio is enabled on this daemon,
+    /// - the peer advertised an `audio_port`,
+    /// - the peer is in the trust store, and
+    /// - our `machine_id` sorts lower than theirs (glare rule — only
+    ///   one side dials so we don't end up with two sessions).
+    fn maybe_dial_audio(&mut self, peer: DiscoveredPeer) {
+        let Some(dial_deps) = self.audio_dial_deps.as_ref() else {
+            return;
+        };
+        if peer.audio_port == 0 {
+            return;
+        }
+        if self.identity.machine_id.to_string() >= peer.machine_id {
+            // The other side dials. We accept on the listener.
+            return;
+        }
+        let is_trusted = match self.trust.try_lock() {
+            Ok(g) => g.contains(&peer.machine_id),
+            Err(_) => {
+                tracing::debug!("trust mutex busy; skipping audio dial");
+                return;
+            }
+        };
+        if !is_trusted {
+            return;
+        }
+        let handle = crate::audio::spawn_outbound(peer, dial_deps.clone());
+        self.audio_tasks.push(handle);
+        self.gc_audio_tasks();
+    }
+
+    pub(super) fn gc_audio_tasks(&mut self) {
+        self.audio_tasks.retain(|t| !t.is_finished());
     }
 
     /// Open an outbound sync to a freshly-visible peer iff: it's trusted,

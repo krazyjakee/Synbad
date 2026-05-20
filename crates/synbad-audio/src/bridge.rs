@@ -15,17 +15,20 @@ use tracing::{info, warn};
 
 use crate::devices;
 use crate::errors::AudioError;
-use crate::session::AudioSession;
+use crate::session::{AudioSession, SessionRole};
 
 /// Commands the supervisor sends into the bridge. Not `Debug` because
 /// some variants carry a `CipherStream` (which can't be cheaply printed
 /// and shouldn't accidentally leak handshake material into logs).
 pub enum AudioCommand {
-    /// Hand off a freshly-accepted authenticated signaling stream from a
-    /// remote peer. The bridge owns it from here on.
+    /// Hand off a freshly-handshaken authenticated signaling stream from
+    /// a remote peer. The bridge owns it from here on; `role` is set
+    /// from the TCP direction (listener accept → answerer, outbound
+    /// dial → offerer).
     IncomingSignal {
         peer_machine_id: String,
         stream: CipherStream,
+        role: SessionRole,
     },
     /// Apply a new configuration. Bridge will diff and reconfigure
     /// individual sessions as needed.
@@ -117,13 +120,30 @@ impl AudioBridge {
                 AudioCommand::IncomingSignal {
                     peer_machine_id,
                     stream,
+                    role,
                 } => {
                     if !self.config.enabled {
                         // Politely drop the stream by letting it go out of scope.
                         warn!(peer = %peer_machine_id, "incoming audio signal while disabled");
                         continue;
                     }
-                    match AudioSession::new(peer_machine_id.clone(), stream).await {
+                    // Glare resolution: if a session already exists for
+                    // this peer, the newer connection wins on the
+                    // assumption that the older one is stale. Closing
+                    // the old session aborts its tasks via Drop.
+                    if let Some(old) = self.sessions.remove(&peer_machine_id) {
+                        warn!(peer = %peer_machine_id, "replacing existing audio session");
+                        old.close(Some("superseded by new connection".into())).await;
+                    }
+                    match AudioSession::start(
+                        peer_machine_id.clone(),
+                        stream,
+                        &self.config,
+                        role,
+                        events.clone(),
+                    )
+                    .await
+                    {
                         Ok(session) => {
                             self.sessions.insert(peer_machine_id, session);
                         }

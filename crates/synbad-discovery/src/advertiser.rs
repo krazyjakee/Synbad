@@ -42,6 +42,7 @@ impl Advertiser {
         service_port: u16,
         sync_port: u16,
         core_port: u16,
+        audio_port: u16,
         config_head: &str,
     ) -> Result<Self, AdvertiseError> {
         if display_name.is_empty() || display_name.contains('.') {
@@ -56,6 +57,12 @@ impl Advertiser {
         props.insert("fp".into(), identity.fingerprint.clone());
         props.insert("core_port".into(), core_port.to_string());
         props.insert("sync_port".into(), sync_port.to_string());
+        // Only advertise the audio port when audio is actually running —
+        // a zero would be misleading and the lookup falls back to "no
+        // outbound dial" on the peer's side anyway.
+        if audio_port != 0 {
+            props.insert("audio_port".into(), audio_port.to_string());
+        }
         if !config_head.is_empty() {
             props.insert("cfg".into(), config_head.to_string());
         }

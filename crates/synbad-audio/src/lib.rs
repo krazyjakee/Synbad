@@ -35,3 +35,4 @@ pub mod session;
 pub use bridge::{AudioBridge, AudioBridgeHandle, AudioCommand, AudioEvent};
 pub use errors::AudioError;
 pub use protocol::{AudioSignal, SIGNAL_DOMAIN};
+pub use session::SessionRole;

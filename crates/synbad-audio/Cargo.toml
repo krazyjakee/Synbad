@@ -39,5 +39,11 @@ webrtc = "0.17"
 webrtc-media = "0.17"
 rtp = "0.17"
 
+# Used directly: `Bytes` for RTP payloads (matches the type webrtc's RTP
+# stack already deals in) and `rand` for the per-session RTP sequence
+# number + timestamp seeds required by RFC 3550 §5.1.
+bytes = "1"
+rand = "0.9"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

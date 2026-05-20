@@ -4794,8 +4794,10 @@ name = "synbad-audio"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "cpal",
  "hex",
+ "rand",
  "ringbuf",
  "rtp",
  "rubato",
