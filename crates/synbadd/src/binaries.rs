@@ -926,16 +926,24 @@ mod tests {
 
         // Drive the real selector via env::consts: we can only verify the
         // current host's platform. The fixture-driven assertion above is
-        // the cross-platform half. Windows is intentionally skipped — the
-        // v1.17.0 release only shipped `_win64.msi`, which `pick_asset`
-        // deliberately ignores (we can't extract MSIs in pure Rust); the
-        // portable `.7z` Windows asset only appears from v1.19+.
+        // the cross-platform half. On Windows we instead assert the
+        // intentional miss: v1.17.0 only shipped `_win64.msi`, which
+        // `pick_asset` deliberately ignores (no in-Rust MSI extraction);
+        // the portable `.7z` Windows asset only appears from v1.19+.
+        let resolved = pick_asset(&v117);
         #[cfg(not(windows))]
         {
-            let current = pick_asset(&v117).expect("v1.17.0 must resolve on the host platform");
+            let current = resolved.expect("v1.17.0 must resolve on the host platform");
             // Whatever we get back, it must be the v1.17.0 mac/linux naming
             // for a recognized platform — not the v1.19+ format.
             assert!(current.name.starts_with("deskflow-1.17.0"));
+        }
+        #[cfg(windows)]
+        {
+            assert!(
+                resolved.is_err(),
+                "v1.17.0 shouldn't resolve on Windows (only .msi shipped)",
+            );
         }
     }
 
