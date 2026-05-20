@@ -180,11 +180,8 @@ impl Supervisor {
         if let Some(tx) = self.child_kill.take() {
             let _ = tx.send(());
             // Wait for the exit event so state reflects reality before we return.
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                self.exit_rx.recv(),
-            )
-            .await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(2), self.exit_rx.recv()).await;
         }
         self.set_state(DaemonState::Stopped);
     }

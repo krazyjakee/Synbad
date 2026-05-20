@@ -91,10 +91,7 @@ pub fn acquire(
                         return AcquireResult::Forwarded;
                     }
                     Err(_) if attempt == 0 => {
-                        tracing::info!(
-                            ?socket_path,
-                            "removing stale single-instance socket"
-                        );
+                        tracing::info!(?socket_path, "removing stale single-instance socket");
                         let _ = std::fs::remove_file(&socket_path);
                         continue;
                     }

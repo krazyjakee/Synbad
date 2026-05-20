@@ -23,7 +23,7 @@
 //! would ever take effect.
 //!
 //! [`set_repaint`] wires `egui::Context::request_repaint` into the
-//! [`MenuEvent`] handler. Every tray click now nudges the egui loop, so
+//! `MenuEvent` handler. Every tray click now nudges the egui loop, so
 //! [`try_recv_menu_id`] inside `update()` actually runs and the command
 //! (Visible/Close) is dispatched.
 //!

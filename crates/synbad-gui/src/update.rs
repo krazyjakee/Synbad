@@ -11,9 +11,9 @@
 //!    can show a live status line and bar.
 //!
 //! Both stages talk through channels: the worker sends events on a sender
-//! and the UI thread polls a receiver each frame in
-//! [`SynbadApp::poll_update`]. The state machine is intentionally tiny —
-//! one optional state struct on the app, transitioned by user clicks.
+//! and the UI thread polls a receiver each frame via [`poll`]. The state
+//! machine is intentionally tiny — one optional state struct on the app,
+//! transitioned by user clicks.
 
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
@@ -269,16 +269,10 @@ pub fn draw_modal(
                     }
                     ui.add_space(8.0);
                     if res.newer {
-                        ui.label(format!(
-                            "Download size: {}",
-                            fmt_bytes(res.info.asset_size)
-                        ));
+                        ui.label(format!("Download size: {}", fmt_bytes(res.info.asset_size)));
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
-                            if ui
-                                .add(egui::Button::new("Download and install"))
-                                .clicked()
-                            {
+                            if ui.add(egui::Button::new("Download and install")).clicked() {
                                 action = Action::Install(res.info.clone());
                             }
                             if ui.button("Close").clicked() {
@@ -331,10 +325,7 @@ pub fn draw_modal(
                     ));
                 }
                 Some(UpdateState::Installed { tag, elevated }) => {
-                    ui.colored_label(
-                        egui::Color32::LIGHT_GREEN,
-                        format!("Installed {}.", tag),
-                    );
+                    ui.colored_label(egui::Color32::LIGHT_GREEN, format!("Installed {}.", tag));
                     if *elevated {
                         ui.label("Files were swapped under elevated privileges.");
                     }
