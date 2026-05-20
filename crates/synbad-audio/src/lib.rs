@@ -32,7 +32,7 @@ pub mod protocol;
 pub mod rtc;
 pub mod session;
 
-pub use bridge::{AudioBridge, AudioBridgeHandle, AudioCommand, AudioEvent};
+pub use bridge::{peer_audio_active, AudioBridge, AudioBridgeHandle, AudioCommand, AudioEvent};
 pub use errors::AudioError;
 pub use protocol::{AudioSignal, SIGNAL_DOMAIN};
 pub use session::SessionRole;

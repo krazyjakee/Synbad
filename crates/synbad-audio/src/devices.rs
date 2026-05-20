@@ -85,10 +85,16 @@ pub fn list_output_devices() -> Result<Vec<AudioDeviceInfo>, AudioError> {
 
 /// Heuristic for "this input device is actually a loopback / monitor of an
 /// output device." PipeWire/PulseAudio name them `<sink>.monitor`; some
-/// PipeWire builds also expose `Monitor of …`.
-fn looks_like_loopback(name: &str) -> bool {
+/// PipeWire builds also expose `Monitor of …`. On macOS, native loopback
+/// requires a virtual device — BlackHole, Soundflower, Loopback.app etc. —
+/// whose product names we recognise here too.
+pub(crate) fn looks_like_loopback(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.ends_with(".monitor") || lower.contains("monitor of ") || lower.contains("loopback")
+    lower.ends_with(".monitor")
+        || lower.contains("monitor of ")
+        || lower.contains("loopback")
+        || lower.contains("blackhole")
+        || lower.contains("soundflower")
 }
 
 #[cfg(test)]
@@ -102,7 +108,11 @@ mod tests {
         ));
         assert!(looks_like_loopback("Monitor of Built-in Audio"));
         assert!(looks_like_loopback("Stereo Mix (Loopback)"));
+        assert!(looks_like_loopback("BlackHole 2ch"));
+        assert!(looks_like_loopback("BlackHole 16ch"));
+        assert!(looks_like_loopback("Soundflower (2ch)"));
         assert!(!looks_like_loopback("Built-in Microphone"));
+        assert!(!looks_like_loopback("MacBook Pro Microphone"));
     }
 
     #[test]

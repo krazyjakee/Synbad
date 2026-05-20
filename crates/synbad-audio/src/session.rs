@@ -38,15 +38,18 @@
 #![allow(clippy::result_large_err)] // AudioError carries Strings; size dominates.
 
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use bytes::Bytes;
 use cpal::Stream;
 use synbad_config::AudioConfig;
 use synbad_crypto::{CipherReader, CipherStream, CipherWriter};
+use synbad_ipc::PeerAudioStatus;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
 
@@ -90,6 +93,11 @@ pub struct AudioSession {
     /// Held so the playback sink remains writable for the on_track pump
     /// installed on the PeerConnection.
     _playback_keepalive: Option<mpsc::Sender<PcmFrame>>,
+    /// Live status shared with the per-session sub-tasks. Updated by the
+    /// capture pump on first send, the inbound pump on first receive, and
+    /// the PeerConnection state-change handler. Read by the bridge in
+    /// `AudioCommand::QueryStatus`.
+    status: Arc<StdMutex<PeerAudioStatus>>,
     /// Aborted on drop.
     tasks: Vec<JoinHandle<()>>,
 }
@@ -126,6 +134,17 @@ impl AudioSession {
 
         let api = rtc::build_api()?;
         let pc = rtc::new_peer_connection(&api).await?;
+
+        let status = Arc::new(StdMutex::new(PeerAudioStatus {
+            machine_id: peer_machine_id.clone(),
+            display_name: peer_machine_id.clone(),
+            sending_to_peer: false,
+            receiving_from_peer: false,
+            rtt_ms: None,
+            last_error: None,
+        }));
+
+        install_pc_state_handler(&pc, Arc::clone(&status), events.clone());
 
         // Outbound: cpal mic/loopback → L16 packets → outbound track.
         let outbound_track = rtc::build_outbound_track();
@@ -192,7 +211,7 @@ impl AudioSession {
 
         // Hook on_track to spawn an inbound-RTP pump per remote track.
         if let Some(tx) = playback_tx.clone() {
-            install_on_track(&pc, tx, &session_id);
+            install_on_track(&pc, tx, &session_id, Arc::clone(&status), events.clone());
         }
 
         // Spawn the writer task. It owns the CipherWriter and quits when
@@ -209,6 +228,8 @@ impl AudioSession {
                 rx,
                 outbound_track.clone(),
                 peer_machine_id.clone(),
+                Arc::clone(&status),
+                events.clone(),
             ))
         });
 
@@ -235,8 +256,15 @@ impl AudioSession {
             _capture_stream: capture_stream,
             _playback_stream: playback_stream,
             _playback_keepalive: playback_tx,
+            status,
             tasks,
         })
+    }
+
+    /// Snapshot of this session's current peer status. Cheap (one lock +
+    /// clone) so it's safe to call per-`QueryStatus`.
+    pub fn status(&self) -> PeerAudioStatus {
+        self.status.lock().expect("peer status poisoned").clone()
     }
 
     /// Tear down the PeerConnection and stop both audio streams.
@@ -303,11 +331,15 @@ fn install_on_track(
     pc: &Arc<RTCPeerConnection>,
     playback_tx: mpsc::Sender<PcmFrame>,
     session_id: &str,
+    status: Arc<StdMutex<PeerAudioStatus>>,
+    events: mpsc::Sender<crate::bridge::AudioEvent>,
 ) {
     let session_id = session_id.to_string();
     pc.on_track(Box::new(move |track, _receiver, _transceiver| {
         let playback_tx = playback_tx.clone();
         let session_id = session_id.clone();
+        let status = Arc::clone(&status);
+        let events = events.clone();
         Box::pin(async move {
             if track.payload_type() != L16_PAYLOAD_TYPE {
                 warn!(
@@ -317,7 +349,7 @@ fn install_on_track(
                 );
                 return;
             }
-            inbound_pump(track, playback_tx, session_id).await;
+            inbound_pump(track, playback_tx, session_id, status, events).await;
         })
     }));
 }
@@ -326,14 +358,21 @@ async fn inbound_pump(
     track: Arc<webrtc::track::track_remote::TrackRemote>,
     playback_tx: mpsc::Sender<PcmFrame>,
     session_id: String,
+    status: Arc<StdMutex<PeerAudioStatus>>,
+    events: mpsc::Sender<crate::bridge::AudioEvent>,
 ) {
     debug!(session = %session_id, "inbound RTP pump started");
+    let mut first_packet = true;
     loop {
         match track.read_rtp().await {
             Ok((pkt, _attrs)) => {
                 let frame = depayload_l16(&pkt.payload);
                 if frame.is_empty() {
                     continue;
+                }
+                if first_packet {
+                    first_packet = false;
+                    update_status(&status, &events, |s| s.receiving_from_peer = true);
                 }
                 if playback_tx.send(frame).await.is_err() {
                     break;
@@ -344,6 +383,66 @@ async fn inbound_pump(
                 break;
             }
         }
+    }
+    update_status(&status, &events, |s| s.receiving_from_peer = false);
+}
+
+/// Installs the PeerConnection state-change handler that mirrors transport
+/// failures into the shared status. `Connected` clears any sticky error;
+/// `Failed`/`Disconnected` set one. `Closed` zeroes the send/receive flags
+/// so the GUI can show "idle" rather than the last `true` it saw.
+fn install_pc_state_handler(
+    pc: &Arc<RTCPeerConnection>,
+    status: Arc<StdMutex<PeerAudioStatus>>,
+    events: mpsc::Sender<crate::bridge::AudioEvent>,
+) {
+    pc.on_peer_connection_state_change(Box::new(move |state| {
+        let status = Arc::clone(&status);
+        let events = events.clone();
+        Box::pin(async move {
+            debug!(?state, "audio peer connection state change");
+            update_status(&status, &events, |s| match state {
+                RTCPeerConnectionState::Connected => {
+                    s.last_error = None;
+                }
+                RTCPeerConnectionState::Failed => {
+                    s.last_error = Some("connection failed".to_string());
+                }
+                RTCPeerConnectionState::Disconnected => {
+                    s.last_error = Some("connection disconnected".to_string());
+                }
+                RTCPeerConnectionState::Closed => {
+                    s.sending_to_peer = false;
+                    s.receiving_from_peer = false;
+                }
+                // New / Connecting / Unspecified: no user-visible change.
+                _ => {}
+            });
+        })
+    }));
+}
+
+/// Mutate the shared status and, if the mutation actually changed
+/// something, push a `PeerStatus` event onto the bridge's event channel.
+/// `try_send` so a clogged channel can't stall a callback task.
+fn update_status<F>(
+    status: &Arc<StdMutex<PeerAudioStatus>>,
+    events: &mpsc::Sender<crate::bridge::AudioEvent>,
+    update: F,
+) where
+    F: FnOnce(&mut PeerAudioStatus),
+{
+    let snapshot;
+    let changed;
+    {
+        let mut guard = status.lock().expect("peer status poisoned");
+        let before = guard.clone();
+        update(&mut guard);
+        changed = *guard != before;
+        snapshot = guard.clone();
+    }
+    if changed {
+        let _ = events.try_send(crate::bridge::AudioEvent::PeerStatus(snapshot));
     }
 }
 
@@ -383,12 +482,15 @@ async fn capture_pump_task(
     mut rx: mpsc::Receiver<PcmFrame>,
     track: Arc<webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP>,
     peer_machine_id: String,
+    status: Arc<StdMutex<PeerAudioStatus>>,
+    events: mpsc::Sender<crate::bridge::AudioEvent>,
 ) {
     // RTP sequence + timestamp need to start at random values per RFC
     // 3550; the synchronization source (SSRC) is set by the binding
     // when the track is bound to the PeerConnection so we leave it 0.
     let mut sequence_number: u16 = rand::random();
     let mut timestamp: u32 = rand::random();
+    let mut first_packet = true;
 
     debug!(peer = %peer_machine_id, "capture pump started");
     while let Some(frame) = rx.recv().await {
@@ -422,12 +524,21 @@ async fn capture_pump_task(
         // first few frames on the offerer side, so swallow rather than
         // warn. We pass an empty extension list because L16 doesn't
         // carry any header extensions.
-        if let Err(e) = track.write_rtp_with_extensions(&pkt, &[]).await {
-            debug!(?e, peer = %peer_machine_id, "RTP write failed");
+        match track.write_rtp_with_extensions(&pkt, &[]).await {
+            Ok(_) => {
+                if first_packet {
+                    first_packet = false;
+                    update_status(&status, &events, |s| s.sending_to_peer = true);
+                }
+            }
+            Err(e) => {
+                debug!(?e, peer = %peer_machine_id, "RTP write failed");
+            }
         }
         sequence_number = sequence_number.wrapping_add(1);
         timestamp = timestamp.wrapping_add(SAMPLES_PER_PACKET);
     }
+    update_status(&status, &events, |s| s.sending_to_peer = false);
     debug!(peer = %peer_machine_id, "capture pump exiting");
 }
 
@@ -629,6 +740,42 @@ async fn wait_for_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fresh_status() -> Arc<StdMutex<PeerAudioStatus>> {
+        Arc::new(StdMutex::new(PeerAudioStatus {
+            machine_id: "peer-A".into(),
+            display_name: "peer-A".into(),
+            sending_to_peer: false,
+            receiving_from_peer: false,
+            rtt_ms: None,
+            last_error: None,
+        }))
+    }
+
+    #[test]
+    fn update_status_emits_event_on_change() {
+        let status = fresh_status();
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+
+        update_status(&status, &events_tx, |s| s.sending_to_peer = true);
+
+        let ev = events_rx.try_recv().expect("event should be emitted");
+        match ev {
+            crate::bridge::AudioEvent::PeerStatus(s) => assert!(s.sending_to_peer),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_status_skips_event_when_unchanged() {
+        let status = fresh_status();
+        status.lock().unwrap().sending_to_peer = true;
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+
+        // Same value → no event.
+        update_status(&status, &events_tx, |s| s.sending_to_peer = true);
+        assert!(events_rx.try_recv().is_err());
+    }
 
     #[test]
     fn payload_l16_round_trips() {

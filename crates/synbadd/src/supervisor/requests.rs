@@ -5,7 +5,7 @@
 //! a `Response` — anything non-trivial (config edits, core lifecycle) is
 //! a thin call into a sibling module, so this stays a routing table.
 
-use synbad_audio::{bridge::DeviceListReply, AudioBridge, AudioCommand};
+use synbad_audio::{bridge::DeviceListReply, peer_audio_active, AudioBridge, AudioCommand};
 use synbad_ipc::server::IncomingRequest;
 use synbad_ipc::{Event, Request, Response};
 use tokio::sync::oneshot;
@@ -102,9 +102,21 @@ impl Supervisor {
                 let mut trust = self.trust.lock().await;
                 match trust.remove(&machine_id) {
                     Ok(true) => {
+                        drop(trust);
                         let _ = self.events.send(Event::TrustRevoked {
                             machine_id: machine_id.clone(),
                         });
+                        // Tear down any active audio session — a revoked
+                        // peer must not keep streaming. Best-effort: if
+                        // the bridge is disabled or has died we skip it.
+                        if let Some(handle) = &self.audio {
+                            let _ = handle
+                                .commands_tx
+                                .send(AudioCommand::ClosePeer {
+                                    peer_machine_id: machine_id.clone(),
+                                })
+                                .await;
+                        }
                         Response::Ok
                     }
                     Ok(false) => Response::Error {
@@ -167,12 +179,12 @@ impl Supervisor {
         &mut self,
         audio: synbad_config::AudioConfig,
     ) -> anyhow::Result<()> {
-        let was_enabled = self.config.audio.enabled;
+        let old_audio = self.config.audio.clone();
         let mut new_config = self.config.clone();
         new_config.audio = audio.clone();
-        if was_enabled != audio.enabled {
+        if old_audio.enabled != audio.enabled {
             tracing::warn!(
-                from = was_enabled,
+                from = old_audio.enabled,
                 to = audio.enabled,
                 "audio.enabled toggled — a daemon restart is required for the change to take effect"
             );
@@ -183,8 +195,26 @@ impl Supervisor {
         if let Some(handle) = &self.audio {
             let _ = handle
                 .commands_tx
-                .send(AudioCommand::Reconfigure(audio))
+                .send(AudioCommand::Reconfigure(audio.clone()))
                 .await;
+        }
+        // Pick up "newly enabled" peers (master toggle was already on and
+        // a per_peer entry just turned on, or globals turned on). Bridge
+        // doesn't dial outbound itself; the supervisor owns
+        // `maybe_dial_audio`. Glare rule dedupes any redundant dial.
+        if old_audio.enabled && audio.enabled {
+            let newly_enabled: Vec<synbad_ipc::DiscoveredPeer> = self
+                .peers
+                .values()
+                .filter(|p| {
+                    !peer_audio_active(&old_audio, &p.machine_id)
+                        && peer_audio_active(&audio, &p.machine_id)
+                })
+                .cloned()
+                .collect();
+            for peer in newly_enabled {
+                self.maybe_dial_audio(peer);
+            }
         }
         self.set_config(new_config).await
     }

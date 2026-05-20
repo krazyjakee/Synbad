@@ -408,6 +408,15 @@ impl SynbadApp {
         if let Some(err) = self.audio_last_error.clone() {
             ui.horizontal(|ui| {
                 ui.colored_label(egui::Color32::LIGHT_RED, format!("⚠ {err}"));
+                // The capture-side LoopbackUnavailable error has no
+                // actionable fix without a virtual audio device — drop
+                // a link to BlackHole right next to the message so the
+                // user knows what to install rather than guessing.
+                if err.contains("loopback capture not available")
+                    || err.contains("virtual audio device")
+                {
+                    ui.hyperlink_to("Install BlackHole", "https://existential.audio/blackhole/");
+                }
                 if ui.small_button("Dismiss").clicked() {
                     self.audio_last_error = None;
                 }

@@ -519,15 +519,28 @@ impl Supervisor {
 
     /// Open an outbound audio session to a freshly-visible peer iff:
     /// - audio is enabled on this daemon,
+    /// - the peer's routing for us would actually do work (skipping this
+    ///   check would leave dead empty sessions for peers the user has
+    ///   explicitly disabled),
     /// - the peer advertised an `audio_port`,
     /// - the peer is in the trust store, and
     /// - our `machine_id` sorts lower than theirs (glare rule — only
     ///   one side dials so we don't end up with two sessions).
+    ///
+    /// Reconnect path: after a network blip long enough for mDNS records
+    /// to expire (~120 s default TTL), the peer fires `DiscoveryEvent::Lost`
+    /// then `Found` when it reappears. `was_present` flips false, which
+    /// re-enters this function. Short blips below the mDNS TTL keep the
+    /// peer "visible" and currently don't auto-redial — the bridge's
+    /// glare rule still picks up cleanly if the peer dials us first.
     fn maybe_dial_audio(&mut self, peer: DiscoveredPeer) {
         let Some(dial_deps) = self.audio_dial_deps.as_ref() else {
             return;
         };
         if peer.audio_port == 0 {
+            return;
+        }
+        if !synbad_audio::peer_audio_active(&self.config.audio, &peer.machine_id) {
             return;
         }
         if self.identity.machine_id.to_string() >= peer.machine_id {

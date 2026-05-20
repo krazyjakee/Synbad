@@ -41,6 +41,10 @@ pub enum AudioCommand {
     QueryStatus {
         reply: tokio::sync::oneshot::Sender<Vec<PeerAudioStatus>>,
     },
+    /// Tear down an active audio session for a specific peer. Used when
+    /// a peer's trust is revoked or when a hot config reload disables
+    /// the peer's routing.
+    ClosePeer { peer_machine_id: String },
     /// Graceful shutdown: close all sessions and exit the run loop.
     Shutdown,
 }
@@ -158,9 +162,35 @@ impl AudioBridge {
                     }
                 }
                 AudioCommand::Reconfigure(new_cfg) => {
-                    self.config = new_cfg;
-                    // V1: no diffing yet; future commits will tear down and
-                    // rebuild sessions affected by the change.
+                    let old_cfg = std::mem::replace(&mut self.config, new_cfg);
+                    let new_cfg = &self.config;
+                    // A device swap invalidates every cpal stream we hold,
+                    // so every session needs a clean restart. Per-peer
+                    // routing flipping off is the other "active state
+                    // changed" case — a peer that was flowing audio and is
+                    // now disabled should stop immediately rather than
+                    // wait for natural reconnect.
+                    let device_changed = old_cfg.input_device != new_cfg.input_device
+                        || old_cfg.output_device != new_cfg.output_device;
+                    let peers_to_close: Vec<String> = self
+                        .sessions
+                        .keys()
+                        .filter(|peer| {
+                            device_changed
+                                || (peer_audio_active(&old_cfg, peer)
+                                    && !peer_audio_active(new_cfg, peer))
+                        })
+                        .cloned()
+                        .collect();
+                    for peer in peers_to_close {
+                        if let Some(session) = self.sessions.remove(&peer) {
+                            info!(peer = %peer, "closing session on reconfigure");
+                            session.close(Some("reconfigure".into())).await;
+                        }
+                    }
+                    // Flip-on doesn't auto-dial: the supervisor walks
+                    // visible peers and calls `maybe_dial_audio` for any
+                    // newly-enabled ones (see `update_audio_config`).
                 }
                 AudioCommand::ListDevices { reply } => {
                     let input = devices::list_input_devices().unwrap_or_default();
@@ -168,19 +198,15 @@ impl AudioBridge {
                     let _ = reply.send(DeviceListReply { input, output });
                 }
                 AudioCommand::QueryStatus { reply } => {
-                    let statuses: Vec<PeerAudioStatus> = self
-                        .sessions
-                        .keys()
-                        .map(|peer| PeerAudioStatus {
-                            machine_id: peer.clone(),
-                            display_name: peer.clone(),
-                            sending_to_peer: false,
-                            receiving_from_peer: false,
-                            rtt_ms: None,
-                            last_error: None,
-                        })
-                        .collect();
+                    let statuses: Vec<PeerAudioStatus> =
+                        self.sessions.values().map(|s| s.status()).collect();
                     let _ = reply.send(statuses);
+                }
+                AudioCommand::ClosePeer { peer_machine_id } => {
+                    if let Some(session) = self.sessions.remove(&peer_machine_id) {
+                        info!(peer = %peer_machine_id, "closing session on request");
+                        session.close(Some("closed by supervisor".into())).await;
+                    }
                 }
                 AudioCommand::Shutdown => {
                     info!("audio bridge shutdown requested");
@@ -203,5 +229,71 @@ impl AudioBridge {
             input: devices::list_input_devices()?,
             output: devices::list_output_devices()?,
         })
+    }
+}
+
+/// Whether this peer should have an active audio session under the given
+/// config. A peer is "active" iff the master toggle is on and either
+/// send-to-peer or receive-from-peer would do real work. The supervisor
+/// and the bridge both consult this — the bridge to decide what to close
+/// on reconfigure, the supervisor to decide what to dial.
+pub fn peer_audio_active(cfg: &AudioConfig, peer: &str) -> bool {
+    if !cfg.enabled {
+        return false;
+    }
+    match cfg.per_peer.get(peer) {
+        Some(routing) => routing.enabled && (routing.send_to_peer || routing.receive_from_peer),
+        None => cfg.send_mic_to_peers || cfg.receive_peer_audio,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use synbad_config::PeerAudioRouting;
+
+    fn cfg_default() -> AudioConfig {
+        AudioConfig::default()
+    }
+
+    #[test]
+    fn peer_audio_active_off_when_master_disabled() {
+        let mut cfg = cfg_default();
+        cfg.enabled = false;
+        cfg.send_mic_to_peers = true;
+        assert!(!peer_audio_active(&cfg, "peer-X"));
+    }
+
+    #[test]
+    fn peer_audio_active_uses_globals_without_override() {
+        let mut cfg = cfg_default();
+        cfg.enabled = true;
+        cfg.send_mic_to_peers = true;
+        assert!(peer_audio_active(&cfg, "peer-X"));
+
+        cfg.send_mic_to_peers = false;
+        cfg.receive_peer_audio = false;
+        assert!(!peer_audio_active(&cfg, "peer-X"));
+    }
+
+    #[test]
+    fn peer_audio_active_respects_per_peer_override() {
+        let mut cfg = cfg_default();
+        cfg.enabled = true;
+        // Globals would say off, but per_peer flips on.
+        cfg.per_peer.insert(
+            "peer-X".into(),
+            PeerAudioRouting {
+                enabled: true,
+                send_to_peer: true,
+                receive_from_peer: false,
+            },
+        );
+        assert!(peer_audio_active(&cfg, "peer-X"));
+
+        // Disabled override beats global-on.
+        cfg.send_mic_to_peers = true;
+        cfg.per_peer.get_mut("peer-X").unwrap().enabled = false;
+        assert!(!peer_audio_active(&cfg, "peer-X"));
     }
 }
