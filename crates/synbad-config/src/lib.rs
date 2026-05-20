@@ -82,6 +82,28 @@ pub struct Screen {
     /// Grid placement for the GUI layout editor. Logical pixels.
     #[serde(default)]
     pub position: GridPosition,
+    /// Physical monitors attached to this machine, in the machine's own
+    /// coordinate system (logical pixels reported by the OS). Populated by
+    /// `synbad-gui` at startup using the local desktop session. Empty when
+    /// the machine has never run the GUI — the layout editor falls back to
+    /// the legacy `position.w/h` box in that case.
+    #[serde(default)]
+    pub monitors: Vec<MonitorInfo>,
+}
+
+/// One physical display attached to a `Screen`. Coordinates are in the
+/// owning machine's own desktop space, so the bounding box across all
+/// `monitors` represents that machine's total virtual desktop. The GUI
+/// scales this into the layout canvas.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MonitorInfo {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    #[serde(default)]
+    pub primary: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -97,6 +119,28 @@ pub struct GridPosition {
 
 fn default_screen_size() -> u32 {
     160
+}
+
+impl Screen {
+    /// Logical bounding box across `monitors`, in this machine's own
+    /// desktop coordinates. Returns `None` when no monitors are reported
+    /// (so callers can fall back to `position.w/h`).
+    pub fn monitor_bbox(&self) -> Option<(u32, u32)> {
+        if self.monitors.is_empty() {
+            return None;
+        }
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        for m in &self.monitors {
+            min_x = min_x.min(m.x);
+            min_y = min_y.min(m.y);
+            max_x = max_x.max(m.x + m.w as i32);
+            max_y = max_y.max(m.y + m.h as i32);
+        }
+        Some(((max_x - min_x) as u32, (max_y - min_y) as u32))
+    }
 }
 
 /// A directional adjacency: when the cursor leaves `from` on `side`, it
@@ -169,6 +213,7 @@ impl Default for Config {
                     w: 160,
                     h: 120,
                 },
+                monitors: vec![],
             }],
             links: vec![],
             options: BTreeMap::new(),
@@ -435,6 +480,13 @@ mod tests {
                         w: 160,
                         h: 120,
                     },
+                    monitors: vec![MonitorInfo {
+                        x: 0,
+                        y: 0,
+                        w: 1920,
+                        h: 1080,
+                        primary: true,
+                    }],
                 },
                 Screen {
                     name: "beta".into(),
@@ -445,6 +497,7 @@ mod tests {
                         w: 160,
                         h: 120,
                     },
+                    monitors: vec![],
                 },
             ],
             links: vec![Link {

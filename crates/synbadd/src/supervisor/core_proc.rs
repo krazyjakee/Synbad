@@ -445,6 +445,7 @@ mod tests {
                 name: "alpha".into(),
                 aliases: vec![],
                 position: Default::default(),
+                monitors: vec![],
             }],
             port: 24800,
             server_address: matches!(role, NodeRole::Client).then(|| "peer.local".into()),

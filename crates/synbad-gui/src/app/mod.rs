@@ -18,13 +18,21 @@ use std::time::Instant;
 
 use eframe::CreationContext;
 
-use synbad_config::{paths, Config, NodeRole};
+use synbad_config::{paths, Config, MonitorInfo, NodeRole, Screen};
 use synbad_ipc::{DaemonState, DiscoveredPeer, SyncDirection, TrustedPeer};
 
 use crate::ipc_thread::{self, Cmd, IpcHandle, Update};
 use crate::layout_editor::LayoutEditor;
+use crate::monitors;
 use crate::tray;
 use crate::update::{self, UpdateState};
+
+/// How often the GUI re-checks for monitor changes and unmapped trusted
+/// peers. Cheap to run — display-info is a couple of syscalls and the
+/// peer pass is O(trusted_peers). Picked to be responsive to a user
+/// plugging/unplugging a monitor without flooding the daemon with
+/// SetConfig calls.
+const RECONCILE_INTERVAL_SECS: u64 = 5;
 
 pub(super) const LOG_CAP: usize = 1000;
 
@@ -116,6 +124,14 @@ pub struct SynbadApp {
     /// State machine for the in-progress update flow (check or install).
     /// `None` means we haven't opened the dialog yet this session.
     pub(super) update_state: Option<UpdateState>,
+
+    /// Snapshot of locally-attached monitors, refreshed periodically.
+    /// Mirrored into `config.screens[server_name].monitors` whenever a
+    /// difference is detected so the layout reflects real hardware.
+    pub(super) local_monitors: Vec<MonitorInfo>,
+    /// Wall-clock of the most recent monitor / auto-populate pass. Drives
+    /// the [`RECONCILE_INTERVAL_SECS`] tick from inside `update`.
+    pub(super) last_reconcile: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +181,8 @@ impl SynbadApp {
             last_sync_status: None,
             show_update_dialog: false,
             update_state: None,
+            local_monitors: monitors::enumerate(),
+            last_reconcile: None,
         }
     }
 
@@ -342,6 +360,10 @@ impl SynbadApp {
                     self.pending_pairings
                         .retain(|p| p.peer_machine_id != peer.machine_id);
                     self.trusted_peers.insert(peer.machine_id.clone(), peer);
+                    // Force the next `update` frame to reconcile instead
+                    // of waiting out the interval — the user expects the
+                    // peer to slot into their layout immediately.
+                    self.last_reconcile = None;
                 }
                 Update::PairingFailed { session_id, reason } => {
                     self.pending_pairings.retain(|p| p.session_id != session_id);
@@ -430,6 +452,103 @@ impl SynbadApp {
         machine_id.to_string()
     }
 
+    /// Periodic reconciliation pass. Two jobs:
+    ///   * Refresh `local_monitors` and mirror them into our own `Screen`
+    ///     entry so plugging/unplugging a display is reflected in the layout.
+    ///   * Append any trusted peer that isn't already represented as a
+    ///     screen, so paired-but-unseen machines auto-appear after the
+    ///     interval even when `PairingCompleted` wasn't observed (e.g. the
+    ///     user paired through another session and we connected later).
+    ///
+    /// Both rules only mutate the local edit buffer — they never call
+    /// `SetConfig` unless the user already had unsaved edits *or* the
+    /// change is a pure structural fix-up that should propagate. To avoid
+    /// fighting the user mid-drag, we skip the layout-touching half while
+    /// `self.layout` reports a drag in progress and while a "remote update
+    /// arrived" banner is pending.
+    fn reconcile(&mut self) {
+        if !self.connected {
+            return;
+        }
+        if self.pending_remote_config.is_some() {
+            // Don't fight a banner we haven't resolved yet.
+            return;
+        }
+        if self.layout.is_dragging() {
+            return;
+        }
+
+        let mut changed = false;
+
+        // Refresh local monitors. Re-enumeration is cheap; the diff lets
+        // us avoid pointless SetConfig round-trips.
+        let fresh = monitors::enumerate();
+        if fresh != self.local_monitors {
+            self.local_monitors = fresh;
+        }
+
+        if let Some(screen) = self
+            .config
+            .screens
+            .iter_mut()
+            .find(|s| s.name == self.config.server_name)
+        {
+            if screen.monitors != self.local_monitors {
+                screen.monitors = self.local_monitors.clone();
+                changed = true;
+            }
+        }
+
+        // Auto-populate paired peers as screens. Server-driven: we only
+        // append peers we've already paired with. The peer's own GUI is
+        // responsible for filling in *its* monitors on its own pass — sync
+        // delivers that update to us, and the per-field LWW resolves any
+        // race.
+        let known: BTreeSet<&str> = self
+            .config
+            .screens
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let mut to_add: Vec<String> = Vec::new();
+        for peer in self.trusted_peers.values() {
+            if peer.display_name == self.config.server_name {
+                // The peer happens to share our name — skip rather than
+                // collide. The user can rename either side.
+                continue;
+            }
+            if !known.contains(peer.display_name.as_str()) {
+                to_add.push(peer.display_name.clone());
+            }
+        }
+        if !to_add.is_empty() {
+            for name in to_add {
+                let idx = self.config.screens.len() as i32;
+                self.config.screens.push(Screen {
+                    name,
+                    aliases: vec![],
+                    position: synbad_config::GridPosition {
+                        x: (idx % 3) * 200,
+                        y: (idx / 3) * 160,
+                        w: 160,
+                        h: 120,
+                    },
+                    monitors: vec![],
+                });
+            }
+            changed = true;
+        }
+
+        if changed {
+            // Push immediately rather than waiting for the user to hit
+            // Apply: monitor info and auto-added peers are infra-level,
+            // not creative edits, and persisting them is what makes the
+            // sync visible on the other side.
+            self.send(Cmd::SetConfig(self.config.clone()));
+            self.dirty = false;
+        }
+    }
+
     fn push_log(&mut self, line: String) {
         if self.log.len() >= LOG_CAP {
             self.log.pop_front();
@@ -449,6 +568,21 @@ impl eframe::App for SynbadApp {
         self.drain_show_requests(ctx);
         self.handle_close(ctx);
         update::poll(&mut self.update_state);
+
+        // Periodic reconcile pass — monitor enumeration + paired-peer
+        // backfill. Cheap, so the cadence is short.
+        let should_reconcile = match self.last_reconcile {
+            None => true,
+            Some(t) => t.elapsed().as_secs() >= RECONCILE_INTERVAL_SECS,
+        };
+        if should_reconcile {
+            self.last_reconcile = Some(Instant::now());
+            self.reconcile();
+        }
+        // Keep ticking even when the user isn't interacting so monitor
+        // changes (plug/unplug) and newly-paired peers show up without
+        // requiring a click.
+        ctx.request_repaint_after(std::time::Duration::from_secs(RECONCILE_INTERVAL_SECS));
         // While a worker is running, ask egui to repaint at ~30 Hz so the
         // progress bar moves on its own without depending on user input.
         if update::in_flight(&self.update_state) {

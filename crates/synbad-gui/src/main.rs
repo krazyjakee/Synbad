@@ -7,6 +7,7 @@ use tracing_subscriber::EnvFilter;
 mod app;
 mod ipc_thread;
 mod layout_editor;
+mod monitors;
 mod single_instance;
 mod tray;
 mod update;

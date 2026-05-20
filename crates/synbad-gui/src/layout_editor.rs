@@ -8,10 +8,15 @@
 
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
-use synbad_config::{Config, Link, Side};
+use synbad_config::{Config, Link, Screen, Side};
 
 const SNAP_PX: f32 = 14.0;
 const GRID: f32 = 20.0;
+/// Real-monitor logical pixels per layout-canvas pixel. A 1920×1080 panel
+/// renders as 160×90 in the canvas, matching the legacy default screen
+/// size of 160×120 closely enough that mixed monitor / monitorless layouts
+/// look uniform.
+const MONITOR_SCALE: f32 = 12.0;
 
 pub struct LayoutEditor {
     pan: Vec2,
@@ -41,6 +46,13 @@ impl LayoutEditor {
         self.pan = Vec2::ZERO;
     }
 
+    /// True while the user is actively dragging a screen. The reconcile
+    /// pass uses this to avoid mutating `config.screens` mid-drag — that
+    /// would yank the rect out from under the cursor.
+    pub fn is_dragging(&self) -> bool {
+        self.dragging.is_some()
+    }
+
     /// Returns `true` if the config changed (drag, delete).
     pub fn show(&mut self, ui: &mut egui::Ui, config: &mut Config) -> bool {
         let mut dirty = false;
@@ -61,9 +73,10 @@ impl LayoutEditor {
         // Build screen rects in screen space and pick the hovered screen.
         let mut rects: Vec<Rect> = Vec::with_capacity(config.screens.len());
         for s in &config.screens {
+            let size = display_size(s);
             let r = Rect::from_min_size(
                 origin + Vec2::new(s.position.x as f32, s.position.y as f32),
-                Vec2::new(s.position.w as f32, s.position.h as f32),
+                size,
             );
             rects.push(r);
         }
@@ -103,7 +116,7 @@ impl LayoutEditor {
             for (r, s) in rects.iter_mut().zip(config.screens.iter()) {
                 *r = Rect::from_min_size(
                     origin + Vec2::new(s.position.x as f32, s.position.y as f32),
-                    Vec2::new(s.position.w as f32, s.position.h as f32),
+                    display_size(s),
                 );
             }
             dirty = true;
@@ -148,7 +161,8 @@ impl LayoutEditor {
 
         // Draw screens.
         for (i, r) in rects.iter().enumerate() {
-            let is_server = config.screens[i].name == config.server_name;
+            let screen = &config.screens[i];
+            let is_server = screen.name == config.server_name;
             let fill = if is_server {
                 Color32::from_rgb(46, 92, 60)
             } else {
@@ -160,10 +174,19 @@ impl LayoutEditor {
                 Color32::from_gray(180)
             };
             painter.rect(*r, 4.0, fill, Stroke::new(1.5, stroke_color));
+
+            // Per-monitor sub-rects. Only worth drawing for multi-monitor
+            // setups — a single-monitor screen is already represented by
+            // the outer rect, and drawing a single inner box on top adds
+            // noise without information.
+            if screen.monitors.len() > 1 {
+                draw_monitors(&painter, *r, screen);
+            }
+
             painter.text(
                 r.center(),
                 egui::Align2::CENTER_CENTER,
-                &config.screens[i].name,
+                &screen.name,
                 egui::FontId::proportional(14.0),
                 Color32::WHITE,
             );
@@ -193,6 +216,52 @@ impl LayoutEditor {
 
 fn snap(v: f32, step: f32) -> f32 {
     (v / step).round() * step
+}
+
+/// Size of a screen rect in canvas pixels. Prefers the real monitor
+/// bounding box (scaled), falling back to `position.w/h` when the screen
+/// hasn't reported any monitors yet — typically a peer we just auto-added
+/// whose own GUI hasn't pushed its monitor list through sync.
+fn display_size(s: &Screen) -> Vec2 {
+    if let Some((w, h)) = s.monitor_bbox() {
+        Vec2::new(w as f32 / MONITOR_SCALE, h as f32 / MONITOR_SCALE)
+    } else {
+        Vec2::new(s.position.w as f32, s.position.h as f32)
+    }
+}
+
+/// Draw per-monitor sub-rects inside `outer`, normalising each monitor's
+/// machine-space coordinates so they fit `outer` precisely. Used only for
+/// multi-monitor screens — see the caller.
+fn draw_monitors(painter: &egui::Painter, outer: Rect, screen: &Screen) {
+    // Recompute the bbox to derive the offset; `monitor_bbox` only gives
+    // the size.
+    let mut min_x = i32::MAX;
+    let mut min_y = i32::MAX;
+    for m in &screen.monitors {
+        min_x = min_x.min(m.x);
+        min_y = min_y.min(m.y);
+    }
+    let stroke = Stroke::new(1.0, Color32::from_gray(140));
+    for m in &screen.monitors {
+        let top_left = outer.min
+            + Vec2::new(
+                (m.x - min_x) as f32 / MONITOR_SCALE,
+                (m.y - min_y) as f32 / MONITOR_SCALE,
+            );
+        let size = Vec2::new(m.w as f32 / MONITOR_SCALE, m.h as f32 / MONITOR_SCALE);
+        let r = Rect::from_min_size(top_left, size);
+        painter.rect_stroke(r, 2.0, stroke);
+        if m.primary {
+            painter.text(
+                r.right_bottom() - Vec2::new(4.0, 4.0),
+                egui::Align2::RIGHT_BOTTOM,
+                "★",
+                egui::FontId::proportional(9.0),
+                Color32::from_gray(200),
+            );
+        }
+    }
 }
 
 fn draw_grid(painter: &egui::Painter, rect: Rect, origin: Pos2) {

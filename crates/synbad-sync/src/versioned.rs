@@ -414,6 +414,7 @@ mod tests {
                 name: "alpha".into(),
                 aliases: vec![],
                 position: GridPosition::default(),
+                monitors: vec![],
             }],
             links: vec![],
             options: BTreeMap::new(),
@@ -427,6 +428,7 @@ mod tests {
             name: "beta".into(),
             aliases: vec![],
             position: GridPosition::default(),
+            monitors: vec![],
         });
         c.links.push(Link {
             from: "alpha".into(),
