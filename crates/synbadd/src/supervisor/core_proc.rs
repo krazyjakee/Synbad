@@ -207,7 +207,14 @@ impl Supervisor {
             return;
         }
 
-        if self.fast_fail_count >= MAX_FAST_FAILS {
+        // For client role, a fast exit is almost always "server unreachable"
+        // (DNS miss, server down, network drop) — exactly the case where the
+        // user wants us to keep trying. Stay in the retry loop with capped
+        // backoff instead of triggering the fast-fail give-up that exists
+        // for server-role startup problems (port in use, missing libs).
+        let is_client = matches!(self.config.role, NodeRole::Client);
+
+        if !is_client && self.fast_fail_count >= MAX_FAST_FAILS {
             // Give up. The exit code stays on the chip so the GUI surfaces
             // what happened, and we record a log line explaining why we
             // stopped retrying.
@@ -227,6 +234,14 @@ impl Supervisor {
         self.set_state(DaemonState::Crashed { exit_code: code });
         let delay = self.backoff;
         self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+        if is_client {
+            // Surface reconnect attempts in the user-visible log so the chip
+            // doesn't just look stuck at "Crashed" while we back off.
+            self.record_log(format!(
+                "[synbad] disconnected from server (exit {:?}); reconnecting in {:?}",
+                code, delay
+            ));
+        }
         tracing::warn!(
             ?delay,
             attempt = self.fast_fail_count,
