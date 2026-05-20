@@ -11,6 +11,7 @@ use synbad_config::{paths, Config};
 use synbad_ipc::server::Listener;
 use synbad_ipc::Event;
 
+mod audio;
 mod binaries;
 mod pairing;
 mod supervisor;

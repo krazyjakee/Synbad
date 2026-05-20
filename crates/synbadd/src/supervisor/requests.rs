@@ -5,8 +5,10 @@
 //! a `Response` — anything non-trivial (config edits, core lifecycle) is
 //! a thin call into a sibling module, so this stays a routing table.
 
+use synbad_audio::{bridge::DeviceListReply, AudioBridge, AudioCommand};
 use synbad_ipc::server::IncomingRequest;
 use synbad_ipc::{Event, Request, Response};
+use tokio::sync::oneshot;
 
 use crate::pairing;
 
@@ -113,8 +115,102 @@ impl Supervisor {
                     },
                 }
             }
+            Request::ListAudioDevices => self.list_audio_devices().await,
+            Request::SetAudioConfig { config } => match self.update_audio_config(config).await {
+                Ok(()) => Response::Ok,
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
+            },
+            Request::GetAudioStatus => self.audio_status_snapshot().await,
         };
         let _ = reply.send(response);
+    }
+
+    /// Enumerate audio devices. Works whether or not the audio bridge is
+    /// running: when the bridge is enabled we ask it (so a single source
+    /// of truth handles cpal threading), otherwise we probe cpal directly
+    /// so the GUI can populate dropdowns before the user opts in.
+    async fn list_audio_devices(&self) -> Response {
+        let reply: Result<DeviceListReply, String> = match &self.audio {
+            Some(handle) => {
+                let (tx, rx) = oneshot::channel();
+                if handle
+                    .commands_tx
+                    .send(AudioCommand::ListDevices { reply: tx })
+                    .await
+                    .is_err()
+                {
+                    return Response::Error {
+                        message: "audio bridge is not responding".into(),
+                    };
+                }
+                rx.await
+                    .map_err(|_| "audio bridge dropped reply channel".to_string())
+            }
+            None => AudioBridge::list_devices_blocking().map_err(|e| e.to_string()),
+        };
+        match reply {
+            Ok(list) => Response::AudioDevices {
+                input: list.input,
+                output: list.output,
+            },
+            Err(e) => Response::Error { message: e },
+        }
+    }
+
+    /// Update the audio sub-section of the config. Toggling
+    /// `audio.enabled` live is *not* supported in v1 — the listener and
+    /// bridge are only built at startup. We log a warning when the flag
+    /// flips so the user knows a restart is needed.
+    async fn update_audio_config(
+        &mut self,
+        audio: synbad_config::AudioConfig,
+    ) -> anyhow::Result<()> {
+        let was_enabled = self.config.audio.enabled;
+        let mut new_config = self.config.clone();
+        new_config.audio = audio.clone();
+        if was_enabled != audio.enabled {
+            tracing::warn!(
+                from = was_enabled,
+                to = audio.enabled,
+                "audio.enabled toggled — a daemon restart is required for the change to take effect"
+            );
+        }
+        // Push the live bridge a Reconfigure so device picks / per-peer
+        // toggles take effect immediately. enabled changes still need a
+        // restart, but everything else is hot-reloadable.
+        if let Some(handle) = &self.audio {
+            let _ = handle
+                .commands_tx
+                .send(AudioCommand::Reconfigure(audio))
+                .await;
+        }
+        self.set_config(new_config).await
+    }
+
+    /// Snapshot per-peer audio status from the bridge.
+    async fn audio_status_snapshot(&self) -> Response {
+        let Some(handle) = &self.audio else {
+            return Response::AudioStatus { peers: Vec::new() };
+        };
+        let (tx, rx) = oneshot::channel();
+        if handle
+            .commands_tx
+            .send(AudioCommand::QueryStatus { reply: tx })
+            .await
+            .is_err()
+        {
+            return Response::Error {
+                message: "audio bridge is not responding".into(),
+            };
+        }
+        match rx.await {
+            Ok(peers) => Response::AudioStatus { peers },
+            Err(_) => Response::Error {
+                message: "audio bridge dropped reply channel".into(),
+            },
+        }
     }
 
     fn start_pairing(&mut self, machine_id: &str) -> anyhow::Result<()> {

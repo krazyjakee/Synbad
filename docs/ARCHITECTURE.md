@@ -59,6 +59,17 @@ Consequences:
 A future phase *may* add a native-Rust protocol implementation to drop the
 Core-binary dependency entirely; that is out of scope for the initial release.
 
+## Audio bridge (optional sidecar)
+
+`synbad-audio` is a self-contained subsystem that runs alongside the Core
+wrapper. It uses [`webrtc-rs`](https://github.com/webrtc-rs/webrtc) for
+RTP/DTLS/SRTP and [`cpal`](https://github.com/RustAudio/cpal) for device
+I/O. The signaling channel reuses the same authenticated, encrypted
+transport (`synbad-crypto`) and trust store (`synbad-discovery`) that
+already back pairing and config-sync, with its own listener port and
+protocol domain (`b"synbad-audio-v1"`). `ice_servers` is empty —
+host-candidates only on the LAN. See [AUDIO.md](AUDIO.md).
+
 ## Process model
 
 - **`synbad`** — GUI application (user session). Talks to `synbadd` over a

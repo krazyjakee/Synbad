@@ -1,0 +1,43 @@
+[package]
+name = "synbad-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "LAN audio bridge for Synbad: cpal capture/playback + webrtc-rs RTP transport."
+
+[dependencies]
+synbad-config = { path = "../synbad-config" }
+synbad-crypto = { path = "../synbad-crypto" }
+synbad-discovery = { path = "../synbad-discovery" }
+synbad-ipc = { path = "../synbad-ipc" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }
+
+# Audio I/O — cpal abstracts ALSA / CoreAudio / WASAPI behind one API.
+cpal = "0.17"
+
+# Pure-Rust resampler used when a device's native sample rate isn't 48 kHz.
+rubato = "2"
+
+# Lock-free SPSC ring buffer for moving PCM frames between the cpal callback
+# thread (real-time, must not block) and the tokio task that feeds RTP.
+ringbuf = "0.4"
+
+# WebRTC stack: PeerConnection, ICE, DTLS, SRTP, RTP framing. v0.17 is the
+# last Tokio-coupled stable release; v0.20+ is moving to sans-I/O.
+# We hand-roll L16 payloading on top of the rtp/rtcp crates because the
+# high-level `webrtc` MediaEngine only ships Opus/G722 presets.
+webrtc = "0.17"
+webrtc-media = "0.17"
+rtp = "0.17"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

@@ -20,10 +20,12 @@ use std::os::unix::process::CommandExt;
 
 use crossbeam_channel::{Receiver, Sender};
 
+use synbad_config::AudioConfig;
 use synbad_config::{paths, Config};
 use synbad_ipc::client::Connection;
 use synbad_ipc::{
-    DaemonState, DiscoveredPeer, Event, Message, Request, Response, SyncDirection, TrustedPeer,
+    AudioDeviceInfo, DaemonState, DiscoveredPeer, Event, Message, PeerAudioStatus, Request,
+    Response, SyncDirection, TrustedPeer,
 };
 
 #[derive(Debug, Clone)]
@@ -48,6 +50,13 @@ pub enum Cmd {
     RevokeTrust {
         machine_id: String,
     },
+    /// Refresh the audio device dropdowns.
+    ListAudioDevices,
+    /// Push a new audio config — the daemon persists it and broadcasts a
+    /// ConfigChanged event back so other tabs stay in sync.
+    SetAudioConfig(AudioConfig),
+    /// Pull current per-peer audio session state.
+    GetAudioStatus,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +124,23 @@ pub enum Update {
         direction: SyncDirection,
         reason: String,
     },
+    /// Reply to `Cmd::ListAudioDevices`. Includes both input and output
+    /// devices the local cpal host can see.
+    AudioDevices {
+        input: Vec<AudioDeviceInfo>,
+        output: Vec<AudioDeviceInfo>,
+    },
+    /// Daemon notified us the device set changed (plug/unplug).
+    AudioDevicesChanged,
+    /// Per-peer audio session status update.
+    AudioPeerStatus(PeerAudioStatus),
+    /// Audio subsystem error. `peer` is `None` for global failures.
+    AudioError {
+        peer: Option<String>,
+        message: String,
+    },
+    /// Reply to `Cmd::GetAudioStatus` — full snapshot.
+    AudioStatusSnapshot(Vec<PeerAudioStatus>),
 }
 
 pub struct IpcHandle {
@@ -266,6 +292,13 @@ fn event_loop(
                                     direction,
                                     reason,
                                 },
+                                Event::AudioDevicesChanged => Update::AudioDevicesChanged,
+                                Event::AudioPeerStatus { status } => {
+                                    Update::AudioPeerStatus(status)
+                                }
+                                Event::AudioError { peer, message } => {
+                                    Update::AudioError { peer, message }
+                                }
                             };
                             let _ = update_tx.send(upd);
                             repaint();
@@ -385,6 +418,9 @@ fn command_loop(
                         Request::ConfirmPairing { session_id, accept }
                     }
                     Cmd::RevokeTrust { machine_id } => Request::RevokeTrust { machine_id },
+                    Cmd::ListAudioDevices => Request::ListAudioDevices,
+                    Cmd::SetAudioConfig(config) => Request::SetAudioConfig { config },
+                    Cmd::GetAudioStatus => Request::GetAudioStatus,
                 };
                 match conn.request(req) {
                     Ok(Response::Status { state, recent_log }) => {
@@ -407,6 +443,12 @@ fn command_loop(
                     }
                     Ok(Response::TrustedPeers { peers }) => {
                         let _ = update_tx.send(Update::TrustedSnapshot(peers));
+                    }
+                    Ok(Response::AudioDevices { input, output }) => {
+                        let _ = update_tx.send(Update::AudioDevices { input, output });
+                    }
+                    Ok(Response::AudioStatus { peers }) => {
+                        let _ = update_tx.send(Update::AudioStatusSnapshot(peers));
                     }
                     Ok(_) => {}
                     Err(e) => {

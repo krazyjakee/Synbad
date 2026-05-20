@@ -31,5 +31,10 @@
        a helper so the dock/window-server doesn't try to make it foreground. -->
   <key>LSUIElement</key>
   <false/>
+  <!-- macOS 10.14+ requires this string to be present before any process in
+       the bundle can open an audio input device. Shown to the user in the
+       TCC prompt the first time the audio bridge is enabled. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Synbad bridges audio between paired peers on your LAN.</string>
 </dict>
 </plist>

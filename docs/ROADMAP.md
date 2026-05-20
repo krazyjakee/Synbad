@@ -43,6 +43,23 @@ Delivery is phased so each phase is independently usable.
        (see `dist/` — systemd user unit, launchd plist, scheduled task)
 - [x] Docs: user guide, security model (USER-GUIDE.md, SECURITY.md)
 
+## Phase 6 — Audio bridge
+- [x] `synbad-audio` crate: cpal device I/O + webrtc-rs PeerConnection
+       (see [AUDIO.md](AUDIO.md))
+- [x] Signaling reuses `synbad-crypto` authenticated channel on its own
+       TCP port (default 24852)
+- [x] GUI Audio tab: master enable, device dropdowns, per-peer status
+- [x] Linux + Windows loopback (PipeWire monitor / WASAPI loopback) work
+       through cpal without extra deps
+- [ ] macOS loopback: document BlackHole prereq + show actionable error
+       when no loopback device is selected
+- [ ] Opus codec swap (optional; ~30× bandwidth reduction)
+       — currently shipping raw L16
+- [ ] Auto follow-the-focused-screen routing — uses Core's active-screen
+       event to switch which peer is receiving audio
+- [ ] Echo cancellation / noise suppression — webrtc-rs doesn't ship AEC;
+       evaluate OS-level options
+
 ## Possible future
 - [ ] Native-Rust protocol implementation to drop the Core-binary dependency
 

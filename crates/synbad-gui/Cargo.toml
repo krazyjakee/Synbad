@@ -58,7 +58,7 @@ daemon at login.\
 """
 section = "net"
 priority = "optional"
-depends = "$auto, libgtk-3-0, libayatana-appindicator3-1"
+depends = "$auto, libgtk-3-0, libayatana-appindicator3-1, libasound2"
 assets = [
     ["target/release/synbad-gui", "usr/bin/synbad-gui", "755"],
     ["target/release/synbadd", "usr/bin/synbadd", "755"],

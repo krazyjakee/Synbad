@@ -145,6 +145,15 @@ pub struct Supervisor {
     /// Outbound sync sessions kept alive while running. We GC finished
     /// handles like we do with pairing tasks.
     pub(super) sync_tasks: Vec<tokio::task::JoinHandle<()>>,
+
+    /// Audio bridge handle (commands + events). `None` if audio is
+    /// disabled in config at startup. Toggling `audio.enabled` requires a
+    /// daemon restart in v1.
+    pub(super) audio: Option<synbad_audio::AudioBridgeHandle>,
+    /// Run-loop task driving the bridge. Held so the bridge isn't dropped.
+    pub(super) _audio_task: Option<tokio::task::JoinHandle<()>>,
+    /// Listener accepting inbound audio signaling sessions.
+    pub(super) _audio_listener: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Supervisor {
@@ -276,6 +285,34 @@ impl Supervisor {
             }
         };
 
+        // Audio bridge: only spawned if explicitly enabled in config.
+        // Toggling `audio.enabled` requires a daemon restart in v1; the
+        // GUI surfaces this to the user.
+        let (audio_handle, audio_task, audio_listener) = if config.audio.enabled {
+            let bridge = synbad_audio::AudioBridge::new(
+                config.audio.clone(),
+                identity.clone(),
+                trust.clone(),
+            );
+            let (handle, task) = bridge.spawn();
+            let listener_deps = Arc::new(crate::audio::AudioListenerDeps {
+                identity: identity.clone(),
+                trust: trust.clone(),
+                bridge_commands: handle.commands_tx.clone(),
+            });
+            let listener =
+                match crate::audio::spawn_listener(config.audio.signal_port, listener_deps).await {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        tracing::warn!(?e, "audio signal listener disabled");
+                        None
+                    }
+                };
+            (Some(handle), Some(task), listener)
+        } else {
+            (None, None, None)
+        };
+
         Ok(Supervisor {
             config_path,
             config,
@@ -315,6 +352,9 @@ impl Supervisor {
             _sync_listener: sync_listener,
             sync_ops: sync_ops_rx,
             sync_tasks: Vec::new(),
+            audio: audio_handle,
+            _audio_task: audio_task,
+            _audio_listener: audio_listener,
         })
     }
 
@@ -334,6 +374,12 @@ impl Supervisor {
                 match self.incoming_pairings.as_mut() {
                     Some(rx) => rx.recv().await,
                     None => std::future::pending::<Option<IncomingSession>>().await,
+                }
+            };
+            let audio_event = async {
+                match self.audio.as_mut() {
+                    Some(h) => h.events_rx.recv().await,
+                    None => std::future::pending::<Option<synbad_audio::AudioEvent>>().await,
                 }
             };
 
@@ -371,6 +417,9 @@ impl Supervisor {
                 Some(op) = self.sync_ops.recv() => {
                     self.handle_sync_op(op).await;
                 }
+                Some(ev) = audio_event => {
+                    self.handle_audio_event(ev);
+                }
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("ctrl-c, shutting down");
                     self.stop_core().await;
@@ -386,6 +435,18 @@ impl Supervisor {
             .insert(session.session_id.clone(), session.confirm_tx);
         self.pairing_tasks.push(session._task);
         self.gc_pairing_tasks();
+    }
+
+    /// Forward an event from the audio bridge onto the supervisor's event
+    /// bus so the GUI sees it.
+    fn handle_audio_event(&self, ev: synbad_audio::AudioEvent) {
+        use synbad_audio::AudioEvent as A;
+        let ipc_event = match ev {
+            A::PeerStatus(status) => Event::AudioPeerStatus { status },
+            A::Error { peer, message } => Event::AudioError { peer, message },
+            A::DevicesChanged => Event::AudioDevicesChanged,
+        };
+        let _ = self.events.send(ipc_event);
     }
 
     pub(super) fn gc_pairing_tasks(&mut self) {

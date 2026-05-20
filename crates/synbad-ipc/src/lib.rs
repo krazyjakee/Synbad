@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use synbad_config::Config;
+use synbad_config::{AudioConfig, Config};
 
 /// A peer discovered on the local network via mDNS. The fields are
 /// populated from the peer's `_synbad._tcp.local.` TXT record. The peer
@@ -101,6 +101,17 @@ pub enum Request {
     ListTrustedPeers,
     /// Forget a previously-paired peer.
     RevokeTrust { machine_id: String },
+    /// Enumerate available audio input and output devices on the local
+    /// machine. The GUI uses the result to populate device-picker
+    /// dropdowns in the Audio tab.
+    ListAudioDevices,
+    /// Replace the audio sub-section of the config without touching the
+    /// rest of it. Cheaper than `SetConfig` when the user is just
+    /// toggling audio on/off, since it won't restart the Core.
+    SetAudioConfig { config: AudioConfig },
+    /// Return a snapshot of per-peer audio session status (sending /
+    /// receiving / RTT / last error).
+    GetAudioStatus,
     /// Stop the Core process and terminate the daemon. The daemon replies
     /// `Response::Ok`, then exits. Sent by the GUI when the user quits so a
     /// GUI-spawned `synbadd` doesn't outlive the window.
@@ -127,6 +138,13 @@ pub enum Response {
     },
     TrustedPeers {
         peers: Vec<TrustedPeer>,
+    },
+    AudioDevices {
+        input: Vec<AudioDeviceInfo>,
+        output: Vec<AudioDeviceInfo>,
+    },
+    AudioStatus {
+        peers: Vec<PeerAudioStatus>,
     },
     Error {
         message: String,
@@ -226,6 +244,19 @@ pub enum Event {
         direction: SyncDirection,
         reason: String,
     },
+    /// Local audio device set changed (plug/unplug). The GUI should
+    /// re-issue `Request::ListAudioDevices` to refresh dropdowns.
+    AudioDevicesChanged,
+    /// Per-peer audio session status update — push from the bridge as
+    /// connections come and go.
+    AudioPeerStatus { status: PeerAudioStatus },
+    /// Audio subsystem error. `peer` is `None` for global errors
+    /// (e.g. cpal initialization failed), `Some(machine_id)` for a
+    /// peer-scoped failure.
+    AudioError {
+        peer: Option<String>,
+        message: String,
+    },
 }
 
 /// Whether a sync session was initiated by us or accepted from a peer.
@@ -234,6 +265,36 @@ pub enum Event {
 pub enum SyncDirection {
     Inbound,
     Outbound,
+}
+
+/// One audio input or output device as the GUI sees it. Mirrors the
+/// fields cpal exposes, with `is_loopback` flagged for inputs that
+/// actually capture system audio (PipeWire `.monitor`, WASAPI loopback).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AudioDeviceInfo {
+    pub name: String,
+    pub is_default: bool,
+    pub native_sample_rate: u32,
+    pub channels: u16,
+    /// True iff this is a monitor / loopback input — relevant for the
+    /// "client speakers → server" direction. Always `false` for outputs.
+    #[serde(default)]
+    pub is_loopback: bool,
+}
+
+/// Snapshot of one peer's audio session state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerAudioStatus {
+    pub machine_id: String,
+    pub display_name: String,
+    pub sending_to_peer: bool,
+    pub receiving_from_peer: bool,
+    /// Most recent round-trip estimate from RTCP receiver reports.
+    #[serde(default)]
+    pub rtt_ms: Option<u32>,
+    /// Sticky error string, cleared once a session re-establishes.
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
