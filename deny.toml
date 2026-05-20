@@ -7,7 +7,22 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # Transitive via eframe → winit → gtk-rs GTK3 stack. The GUI sticks with
+    # GTK3 until eframe ships a maintained replacement; revisit on the next
+    # eframe bump.
+    "RUSTSEC-2024-0412", # gdk
+    "RUSTSEC-2024-0413", # gtk
+    "RUSTSEC-2024-0415", # atk
+    "RUSTSEC-2024-0416", # gdk-sys
+    "RUSTSEC-2024-0418", # gtk-sys
+    "RUSTSEC-2024-0419", # atk-sys
+    "RUSTSEC-2024-0420", # gdkwayland-sys / gdkx11-sys
+    # Transitive via winit dialog stack; replaced upstream by proc-macro-error2.
+    "RUSTSEC-2024-0370",
+    # Transitive via webrtc crates; no migration path until upstream moves off.
+    "RUSTSEC-2025-0057", # fxhash
+]
 
 [licenses]
 version = 2
@@ -19,6 +34,8 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "0BSD",
+    "BSL-1.0",
     "ISC",
     "Zlib",
     "Unicode-DFS-2016",
@@ -26,6 +43,13 @@ allow = [
     "CC0-1.0",
     "MPL-2.0",
     "OpenSSL",
+    # webpki-roots ships Mozilla's CA bundle under CDLA-Permissive-2.0 (data, not code).
+    "CDLA-Permissive-2.0",
+    # libbz2-rs-sys re-licenses the bzip2 reference under its original permissive terms.
+    "bzip2-1.0.6",
+    # epaint bundles Ubuntu/Noto fonts: OFL-1.1 + UFL-1.0 cover font files only.
+    "OFL-1.1",
+    "LicenseRef-UFL-1.0",
 ]
 confidence-threshold = 0.92
 exceptions = []
@@ -33,6 +57,9 @@ exceptions = []
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Intra-workspace path dependencies don't carry a version requirement — that's
+# expected, not a wildcard from crates.io. Only flag external wildcards.
+allow-wildcard-paths = true
 highlight = "all"
 deny = []
 skip = []
