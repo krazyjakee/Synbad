@@ -257,6 +257,13 @@ pub enum Event {
     /// Per-peer audio session status update — push from the bridge as
     /// connections come and go.
     AudioPeerStatus { status: PeerAudioStatus },
+    /// A peer's audio session was torn down. The GUI should drop the
+    /// matching row from its per-peer status table — without this it
+    /// would hold the last `AudioPeerStatus` forever and the user would
+    /// see a stale "connected" entry for a peer that's no longer
+    /// streaming. The supervisor's reconcile loop will redial if the
+    /// peer is still visible and the closure was transient.
+    AudioPeerRemoved { machine_id: String },
     /// Audio subsystem error. `peer` is `None` for global errors
     /// (e.g. cpal initialization failed), `Some(machine_id)` for a
     /// peer-scoped failure.

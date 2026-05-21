@@ -255,17 +255,24 @@ impl AudioBridge {
 }
 
 /// Whether this peer should have an active audio session under the given
-/// config. A peer is "active" iff the master toggle is on and either
-/// send-to-peer or receive-from-peer would do real work. The supervisor
-/// and the bridge both consult this — the bridge to decide what to close
-/// on reconfigure, the supervisor to decide what to dial.
+/// config. With the simplified routing model, an enabled bridge means
+/// "bidirectional audio with every peer" — the per-peer map is the only
+/// way to opt out of a specific link or direction.
+///
+/// The supervisor and the bridge both consult this — the bridge to
+/// decide what to close on reconfigure, the supervisor to decide what
+/// to dial.
 pub fn peer_audio_active(cfg: &AudioConfig, peer: &str) -> bool {
     if !cfg.enabled {
         return false;
     }
     match cfg.per_peer.get(peer) {
+        // An explicit override with both directions muted is the user
+        // asking us not to bring this peer up at all. Anything else
+        // (send-only, receive-only, or both) is worth a session.
         Some(routing) => routing.enabled && (routing.send_to_peer || routing.receive_from_peer),
-        None => cfg.send_mic_to_peers || cfg.receive_peer_audio,
+        // No override means default-on, in both directions.
+        None => true,
     }
 }
 
@@ -282,27 +289,50 @@ mod tests {
     fn peer_audio_active_off_when_master_disabled() {
         let mut cfg = cfg_default();
         cfg.enabled = false;
-        cfg.send_mic_to_peers = true;
         assert!(!peer_audio_active(&cfg, "peer-X"));
     }
 
     #[test]
-    fn peer_audio_active_uses_globals_without_override() {
+    fn peer_audio_active_defaults_on_when_enabled() {
         let mut cfg = cfg_default();
         cfg.enabled = true;
-        cfg.send_mic_to_peers = true;
         assert!(peer_audio_active(&cfg, "peer-X"));
+    }
 
-        cfg.send_mic_to_peers = false;
-        cfg.receive_peer_audio = false;
+    #[test]
+    fn peer_audio_active_per_peer_disable_beats_global_on() {
+        let mut cfg = cfg_default();
+        cfg.enabled = true;
+        cfg.per_peer.insert(
+            "peer-X".into(),
+            PeerAudioRouting {
+                enabled: false,
+                send_to_peer: true,
+                receive_from_peer: true,
+            },
+        );
         assert!(!peer_audio_active(&cfg, "peer-X"));
     }
 
     #[test]
-    fn peer_audio_active_respects_per_peer_override() {
+    fn peer_audio_active_per_peer_both_directions_muted_is_off() {
         let mut cfg = cfg_default();
         cfg.enabled = true;
-        // Globals would say off, but per_peer flips on.
+        cfg.per_peer.insert(
+            "peer-X".into(),
+            PeerAudioRouting {
+                enabled: true,
+                send_to_peer: false,
+                receive_from_peer: false,
+            },
+        );
+        assert!(!peer_audio_active(&cfg, "peer-X"));
+    }
+
+    #[test]
+    fn peer_audio_active_per_peer_send_only_is_on() {
+        let mut cfg = cfg_default();
+        cfg.enabled = true;
         cfg.per_peer.insert(
             "peer-X".into(),
             PeerAudioRouting {
@@ -312,10 +342,5 @@ mod tests {
             },
         );
         assert!(peer_audio_active(&cfg, "peer-X"));
-
-        // Disabled override beats global-on.
-        cfg.send_mic_to_peers = true;
-        cfg.per_peer.get_mut("peer-X").unwrap().enabled = false;
-        assert!(!peer_audio_active(&cfg, "peer-X"));
     }
 }

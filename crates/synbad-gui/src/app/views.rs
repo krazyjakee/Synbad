@@ -680,8 +680,8 @@ impl SynbadApp {
             });
         });
         ui.label(
-            "Streams microphone audio between paired peers over WebRTC. \
-             Toggling the master switch requires a daemon restart.",
+            "Streams microphone audio bidirectionally between paired peers \
+             over WebRTC. Flip Enabled on both ends to start streaming.",
         );
 
         if let Some(err) = self.audio_last_error.clone() {
@@ -713,41 +713,20 @@ impl SynbadApp {
                 ui.label("Enabled");
                 if ui
                     .checkbox(&mut audio.enabled, "")
-                    .on_hover_text("Master switch. Requires a daemon restart to take effect.")
+                    .on_hover_text(
+                        "Master switch. When on, every paired peer gets a \
+                         bidirectional audio session. Per-peer overrides \
+                         can mute one direction or a specific link.",
+                    )
                     .changed()
                 {
                     audio_changed = true;
                 }
                 ui.end_row();
 
-                // Routing toggles + device pickers are no-ops with the
-                // master switch off; gray them out so the disabled state
-                // matches the runtime behavior.
+                // Device pickers are no-ops with the master switch off;
+                // gray them out so the disabled state matches the runtime.
                 let active = audio.enabled;
-
-                ui.label("Send local mic to peers");
-                if ui
-                    .add_enabled(
-                        active,
-                        egui::Checkbox::new(&mut audio.send_mic_to_peers, ""),
-                    )
-                    .changed()
-                {
-                    audio_changed = true;
-                }
-                ui.end_row();
-
-                ui.label("Play peer audio locally");
-                if ui
-                    .add_enabled(
-                        active,
-                        egui::Checkbox::new(&mut audio.receive_peer_audio, ""),
-                    )
-                    .changed()
-                {
-                    audio_changed = true;
-                }
-                ui.end_row();
 
                 ui.label("Input device");
                 ui.add_enabled_ui(active, |ui| {
@@ -803,25 +782,33 @@ impl SynbadApp {
         } else {
             // RTT is plumbed through the IPC type but the bridge doesn't
             // surface RTCP receiver-report numbers yet, so it's omitted
-            // here to avoid a column that's always "—".
+            // here to avoid a column that's always blank. Glyphs are
+            // plain ASCII so they render without depending on whatever
+            // unicode coverage the system font ships with.
             egui::Grid::new("audio-peer-status")
                 .num_columns(4)
                 .striped(true)
                 .show(ui, |ui| {
-                    ui.label("Peer");
-                    ui.label("→ peer");
-                    ui.label("← peer");
-                    ui.label("Error");
+                    ui.label(egui::RichText::new("Peer").strong());
+                    ui.label(egui::RichText::new("Send").strong());
+                    ui.label(egui::RichText::new("Receive").strong());
+                    ui.label(egui::RichText::new("State").strong());
                     ui.end_row();
                     for status in self.audio_peer_status.values() {
                         ui.label(&status.display_name);
-                        ui.label(if status.sending_to_peer { "✓" } else { "—" });
-                        ui.label(if status.receiving_from_peer {
-                            "✓"
-                        } else {
-                            "—"
-                        });
-                        ui.label(status.last_error.clone().unwrap_or_default());
+                        direction_cell(ui, status.sending_to_peer);
+                        direction_cell(ui, status.receiving_from_peer);
+                        match &status.last_error {
+                            Some(err) => {
+                                ui.colored_label(egui::Color32::LIGHT_RED, err);
+                            }
+                            None if status.sending_to_peer || status.receiving_from_peer => {
+                                ui.colored_label(egui::Color32::LIGHT_GREEN, "connected");
+                            }
+                            None => {
+                                ui.label("negotiating…");
+                            }
+                        }
                         ui.end_row();
                     }
                 });
@@ -1083,6 +1070,16 @@ fn device_combo(
             }
         });
     changed
+}
+
+/// Render an "on / off" cell for the per-peer audio direction columns.
+/// Plain ASCII so the result is identical regardless of the system font.
+fn direction_cell(ui: &mut egui::Ui, on: bool) {
+    if on {
+        ui.colored_label(egui::Color32::LIGHT_GREEN, "on");
+    } else {
+        ui.colored_label(egui::Color32::GRAY, "off");
+    }
 }
 
 pub(super) fn state_chip(s: &DaemonState, connected: bool) -> (egui::Color32, String) {

@@ -481,6 +481,9 @@ impl SynbadApp {
                     self.audio_peer_status
                         .insert(status.machine_id.clone(), status);
                 }
+                Update::AudioPeerRemoved(machine_id) => {
+                    self.audio_peer_status.remove(&machine_id);
+                }
                 Update::AudioStatusSnapshot(peers) => {
                     self.audio_peer_status.clear();
                     for p in peers {
