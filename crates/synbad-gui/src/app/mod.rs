@@ -147,6 +147,13 @@ pub struct SynbadApp {
     /// True once we've fetched the device list at least once. Lets the
     /// tab show "loading…" until the daemon replies.
     pub(super) audio_devices_loaded: bool,
+
+    /// Reveal the technical knobs (role, ports, server address, core path,
+    /// generated `.conf` previews, raw log) in the Settings + Status tabs.
+    /// Off by default — the visible UI is dashboard-style, advanced is a
+    /// reveal for power users. Session-scoped (no persistence) so we don't
+    /// silently dump advanced UI on someone who toggled it once.
+    pub(super) show_advanced: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +210,7 @@ impl SynbadApp {
             audio_peer_status: BTreeMap::new(),
             audio_last_error: None,
             audio_devices_loaded: false,
+            show_advanced: false,
         }
     }
 
@@ -283,7 +291,9 @@ impl SynbadApp {
 
     /// Tell the daemon to exit, at most once per process. Blocking but
     /// bounded (see [`ipc_thread::shutdown_daemon`]); only ever called on
-    /// the way out.
+    /// the way out. Always runs — `synbadd` is GUI-only, so when the GUI
+    /// closes the daemon should go with it regardless of the autostart
+    /// setting (which controls *startup*, not shutdown).
     fn shutdown_daemon_once(&mut self) {
         if self.daemon_shutdown_sent {
             return;
@@ -640,7 +650,7 @@ impl eframe::App for SynbadApp {
             ui.horizontal(|ui| {
                 ui.heading("Synbad");
                 ui.separator();
-                ui.selectable_value(&mut self.tab, Tab::Status, "Status");
+                ui.selectable_value(&mut self.tab, Tab::Status, "Dashboard");
                 ui.selectable_value(&mut self.tab, Tab::Layout, "Layout");
                 let peers_label = if self.discovered_peers.is_empty() {
                     "Peers".to_string()
@@ -663,10 +673,16 @@ impl eframe::App for SynbadApp {
                 let online = self.connected;
                 let offline_tip = "Waiting for the synbadd daemon. Actions will be available \
                                    once it's reachable.";
-                let start = ui
-                    .add_enabled(online, egui::Button::new("Start"))
-                    .on_disabled_hover_text(offline_tip);
-                if start.clicked() {
+                // Start is always enabled — clicking it both spawns the
+                // daemon (if autostart was off and it isn't running yet)
+                // *and* tells it to bring up the Core. The command
+                // dispatcher waits a few seconds for the daemon's socket,
+                // so the user gets one-click "start sharing" instead of
+                // having to wait for `connected` to flip before retrying.
+                if ui.button("Start").clicked() {
+                    self.ipc
+                        .daemon_wanted
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     self.send(Cmd::Start);
                 }
                 let stop = ui

@@ -11,6 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -146,6 +147,13 @@ pub enum Update {
 pub struct IpcHandle {
     pub cmd_tx: Sender<Cmd>,
     pub update_rx: Receiver<Update>,
+    /// Session-scoped "user wants the daemon up right now" flag. Initialized
+    /// from the on-disk `autostart` config at GUI startup; flipped to `true`
+    /// when the user clicks Start so a disconnect mid-session triggers a
+    /// re-spawn even if `autostart` is off. The event loop reads this on
+    /// every reconnect attempt to decide whether to launch a fresh
+    /// `synbadd`.
+    pub daemon_wanted: Arc<AtomicBool>,
 }
 
 /// Best-effort synchronous daemon shutdown, used when the user quits the
@@ -171,14 +179,16 @@ pub fn shutdown_daemon(socket_path: PathBuf) {
 pub fn spawn(socket_path: PathBuf, repaint: Arc<dyn Fn() + Send + Sync>) -> IpcHandle {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<Cmd>();
     let (update_tx, update_rx) = crossbeam_channel::unbounded::<Update>();
+    let daemon_wanted = Arc::new(AtomicBool::new(autostart_at_startup()));
 
     {
         let socket_path = socket_path.clone();
         let update_tx = update_tx.clone();
         let repaint = repaint.clone();
+        let daemon_wanted = daemon_wanted.clone();
         thread::Builder::new()
             .name("synbad-ipc-events".into())
-            .spawn(move || event_loop(socket_path, update_tx, repaint))
+            .spawn(move || event_loop(socket_path, update_tx, repaint, daemon_wanted))
             .expect("spawn event thread");
     }
     {
@@ -191,13 +201,18 @@ pub fn spawn(socket_path: PathBuf, repaint: Arc<dyn Fn() + Send + Sync>) -> IpcH
             .expect("spawn cmd thread");
     }
 
-    IpcHandle { cmd_tx, update_rx }
+    IpcHandle {
+        cmd_tx,
+        update_rx,
+        daemon_wanted,
+    }
 }
 
 fn event_loop(
     socket_path: PathBuf,
     update_tx: Sender<Update>,
     repaint: Arc<dyn Fn() + Send + Sync>,
+    daemon_wanted: Arc<AtomicBool>,
 ) {
     let mut backoff = Duration::from_millis(500);
     let mut last_spawn: Option<Instant> = None;
@@ -319,12 +334,21 @@ fn event_loop(
                 )));
                 repaint();
 
-                // Auto-launch the daemon if nothing is listening. Throttled
-                // so a daemon that crashes on startup doesn't get re-spawned
-                // every backoff tick (which would also accumulate zombies).
-                let should_spawn = last_spawn
-                    .map(|t| t.elapsed() >= Duration::from_secs(3))
-                    .unwrap_or(true);
+                // Auto-launch the daemon if nothing is listening, but only
+                // when the user wants one running. `daemon_wanted` starts
+                // life from the on-disk `autostart` flag and is flipped
+                // on by the Start button — so an autostart=off user who
+                // has *also* never clicked Start gets a quiet GUI, while
+                // a daemon that crashes mid-session is respawned for both
+                // autostart modes (the user clearly wanted it up).
+                //
+                // Throttled so a daemon that crashes on startup doesn't
+                // get re-spawned every backoff tick (which would also
+                // accumulate zombies).
+                let should_spawn = daemon_wanted.load(Ordering::Relaxed)
+                    && last_spawn
+                        .map(|t| t.elapsed() >= Duration::from_secs(3))
+                        .unwrap_or(true);
                 if should_spawn {
                     last_spawn = Some(Instant::now());
                     match spawn_daemon() {
@@ -340,6 +364,23 @@ fn event_loop(
 
         thread::sleep(backoff);
         backoff = (backoff * 2).min(Duration::from_secs(10));
+    }
+}
+
+/// Read `autostart` straight off the on-disk config to seed the
+/// session-scoped `daemon_wanted` flag at GUI startup. We can't ask the
+/// daemon yet (there isn't one), so the on-disk value is the only source
+/// of truth this early. Defaults to `true` when the file is missing or
+/// malformed — first-run users (and anyone whose config got corrupted)
+/// should still get the turnkey "GUI launches the daemon" experience.
+fn autostart_at_startup() -> bool {
+    match synbad_config::Config::load(&paths::config_file()) {
+        Ok(Some(cfg)) => cfg.autostart,
+        Ok(None) => true,
+        Err(e) => {
+            tracing::warn!(?e, "could not read autostart from config; defaulting to on");
+            true
+        }
     }
 }
 
@@ -403,8 +444,24 @@ fn command_loop(
     update_tx: Sender<Update>,
     repaint: Arc<dyn Fn() + Send + Sync>,
 ) {
+    // How long a single command will wait for the daemon to come up
+    // before we give up. Covers the typical Start-button-while-daemon-is-
+    // booting race: the event loop spawns `synbadd`, the daemon boots and
+    // binds its socket in ~hundreds of ms, and we want the Cmd::Start the
+    // user just clicked to land instead of getting dropped on the floor.
+    const COMMAND_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+    const COMMAND_CONNECT_RETRY: Duration = Duration::from_millis(150);
+
     while let Ok(cmd) = cmd_rx.recv() {
-        match Connection::connect(&socket_path) {
+        let started = Instant::now();
+        let conn_result = loop {
+            match Connection::connect(&socket_path) {
+                Ok(c) => break Ok(c),
+                Err(e) if started.elapsed() >= COMMAND_CONNECT_TIMEOUT => break Err(e),
+                Err(_) => thread::sleep(COMMAND_CONNECT_RETRY),
+            }
+        };
+        match conn_result {
             Ok(mut conn) => {
                 let req = match cmd {
                     Cmd::Start => Request::Start,

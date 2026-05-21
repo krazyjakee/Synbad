@@ -435,6 +435,7 @@ mod tests {
             links: vec![],
             options: BTreeMap::new(),
             clipboard_sharing: true,
+            autostart: true,
             binaries: BinaryPaths::default(),
             audio: AudioConfig::default(),
         }

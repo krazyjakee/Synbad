@@ -54,6 +54,15 @@ pub struct Config {
     /// suppresses clipboard relay in both directions.
     #[serde(default = "default_clipboard_sharing")]
     pub clipboard_sharing: bool,
+    /// Should the GUI spawn `synbadd` on startup (and stop it on exit)?
+    /// On by default — most users want a turnkey app where the daemon's
+    /// lifecycle is tied to the window. Turning it off lets a separately-
+    /// managed daemon (systemd user unit, launchd agent) own its own
+    /// lifecycle while the GUI attaches as a thin client.
+    ///
+    /// Read by the GUI only; the daemon doesn't act on it.
+    #[serde(default = "default_autostart")]
+    pub autostart: bool,
     /// Where to find the Synergy Core executables.
     #[serde(default)]
     pub binaries: BinaryPaths,
@@ -75,6 +84,10 @@ fn default_sync_port() -> u16 {
 }
 
 fn default_clipboard_sharing() -> bool {
+    true
+}
+
+fn default_autostart() -> bool {
     true
 }
 
@@ -291,6 +304,7 @@ impl Default for Config {
             links: vec![],
             options: BTreeMap::new(),
             clipboard_sharing: default_clipboard_sharing(),
+            autostart: default_autostart(),
             binaries: BinaryPaths::default(),
             audio: AudioConfig::default(),
         }
@@ -401,6 +415,9 @@ impl Config {
             c.service_port = 0;
             c.sync_port = 0;
             c.audio = AudioConfig::default();
+            // `autostart` is a GUI-lifecycle toggle, not a Core input —
+            // toggling it must not bounce active input sharing.
+            c.autostart = true;
             c
         };
         core_view(self) != core_view(other)
@@ -586,6 +603,7 @@ mod tests {
             }],
             options: BTreeMap::from([("heartbeat".to_string(), "5000".to_string())]),
             clipboard_sharing: true,
+            autostart: true,
             binaries: BinaryPaths::default(),
             audio: AudioConfig::default(),
         }
@@ -650,6 +668,35 @@ mod tests {
         c.role = NodeRole::Client;
         c.server_address = Some("peer.local:24800".into());
         assert!(a.core_inputs_differ(&c), "role change is a Core input");
+    }
+
+    #[test]
+    fn core_inputs_differ_ignores_autostart() {
+        // `autostart` is a GUI-only preference — toggling it must not
+        // bounce the running Core, since the Core has no idea what it
+        // means.
+        let a = sample();
+        let mut b = a.clone();
+        b.autostart = !a.autostart;
+        assert!(
+            !a.core_inputs_differ(&b),
+            "autostart edits must not count as Core input changes"
+        );
+    }
+
+    #[test]
+    fn autostart_defaults_to_true_when_missing_in_toml() {
+        // Loading a TOML written by an older Synbad must default to the
+        // pre-toggle behaviour (autostart on) so an upgrade doesn't
+        // silently disable the auto-spawn that users relied on.
+        let toml = r#"
+role = "server"
+server_name = "alpha"
+[[screens]]
+name = "alpha"
+"#;
+        let c: Config = toml::from_str(toml).unwrap();
+        assert!(c.autostart);
     }
 
     #[test]
