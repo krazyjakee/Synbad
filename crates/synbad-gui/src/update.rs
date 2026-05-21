@@ -15,6 +15,7 @@
 //! machine is intentionally tiny — one optional state struct on the app,
 //! transitioned by user clicks.
 
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 
@@ -40,8 +41,14 @@ pub enum UpdateState {
         downloaded: u64,
         total: u64,
     },
-    /// Install finished successfully — user just needs to restart.
-    Installed { tag: String, elevated: bool },
+    /// Install finished successfully. `exe` is the on-disk path the new
+    /// binary now lives at (the canonicalised current_exe before the swap),
+    /// which the caller spawns when the user opts to relaunch.
+    Installed {
+        tag: String,
+        elevated: bool,
+        exe: PathBuf,
+    },
     /// Install failed mid-stream. Carries the error message; user can retry
     /// (which falls back to a fresh check).
     InstallFailed(String),
@@ -62,10 +69,12 @@ pub enum InstallMsg {
 }
 
 /// Carries enough about the successful install for the UI to show the right
-/// follow-up copy (the elevated bit changes the wording).
+/// follow-up copy (the elevated bit changes the wording) and to relaunch
+/// the freshly-installed GUI binary.
 pub struct DoneInfo {
     pub tag: String,
     pub elevated: bool,
+    pub exe: PathBuf,
 }
 
 /// Spawn the GitHub release lookup on a worker. Cheap call — one HTTPS
@@ -105,6 +114,7 @@ pub fn spawn_install(ctx: &egui::Context, info: UpdateInfo) -> UpdateState {
             Ok(applied) => InstallMsg::Done(Ok(DoneInfo {
                 tag: applied.tag,
                 elevated: applied.elevated,
+                exe: applied.replaced_self,
             })),
             Err(e) => InstallMsg::Done(Err(format!("{e:#}"))),
         };
@@ -178,6 +188,7 @@ pub fn poll(state: &mut Option<UpdateState>) {
                 Ok(d) => UpdateState::Installed {
                     tag: d.tag,
                     elevated: d.elevated,
+                    exe: d.exe,
                 },
                 Err(e) => UpdateState::InstallFailed(e),
             })
@@ -200,6 +211,12 @@ pub enum Action {
     Check,
     /// User clicked Install — kick the download/apply worker with this info.
     Install(UpdateInfo),
+    /// User clicked Relaunch on the post-install screen. The caller is
+    /// expected to bounce the daemon supervisor, spawn `exe`, and exit so
+    /// the new copy can take over the tray / single-instance socket.
+    Relaunch {
+        exe: PathBuf,
+    },
 }
 
 /// Pretty-format a byte count for the progress label. Stays in MB up to a
@@ -324,19 +341,36 @@ pub fn draw_modal(
                         fmt_bytes(*total)
                     ));
                 }
-                Some(UpdateState::Installed { tag, elevated }) => {
+                Some(UpdateState::Installed { tag, elevated, exe }) => {
                     ui.colored_label(egui::Color32::LIGHT_GREEN, format!("Installed {}.", tag));
                     if *elevated {
                         ui.label("Files were swapped under elevated privileges.");
                     }
                     ui.label(
-                        "Restart Synbad (and the synbadd daemon) for the new \
-                         version to take effect.",
+                        "Synbad needs to relaunch so the new binaries take \
+                         over from the running ones. The daemon will be \
+                         bounced through your session supervisor.",
                     );
                     ui.add_space(8.0);
-                    if ui.button("Close").clicked() {
-                        action = Action::Close;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(egui::Button::new("Relaunch now"))
+                            .on_hover_text("Restart synbadd and reopen this window.")
+                            .clicked()
+                        {
+                            action = Action::Relaunch { exe: exe.clone() };
+                        }
+                        if ui
+                            .button("Later")
+                            .on_hover_text(
+                                "Close this dialog. The new version takes effect the next \
+                                 time you quit and reopen Synbad and bounce the daemon.",
+                            )
+                            .clicked()
+                        {
+                            action = Action::Close;
+                        }
+                    });
                 }
                 Some(UpdateState::InstallFailed(e)) => {
                     ui.colored_label(egui::Color32::LIGHT_RED, "Install failed:");
