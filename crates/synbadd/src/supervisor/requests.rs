@@ -172,10 +172,12 @@ impl Supervisor {
     }
 
     /// Update the audio sub-section of the config. Toggling
-    /// `audio.enabled` live is *not* supported in v1 — the listener and
-    /// bridge are only built at startup. We surface this to the GUI as an
-    /// AudioError so the user gets immediate feedback rather than a
-    /// silently-stored toggle that does nothing until restart.
+    /// `audio.enabled` is now hot-reloadable: the supervisor brings the
+    /// bridge + listener up (or tears them down) live via
+    /// [`Supervisor::ensure_audio_subsystem`] /
+    /// [`Supervisor::teardown_audio_subsystem`]. If the live bring-up
+    /// fails (e.g. the signal port is in use) we surface the old
+    /// "restart required" error so the user has actionable feedback.
     async fn update_audio_config(
         &mut self,
         audio: synbad_config::AudioConfig,
@@ -183,47 +185,62 @@ impl Supervisor {
         let old_audio = self.config.audio.clone();
         let mut new_config = self.config.clone();
         new_config.audio = audio.clone();
+
+        // Persist the new config first so `ensure_audio_subsystem` /
+        // teardown see the up-to-date master switch.
+        self.set_config(new_config).await?;
+
         if old_audio.enabled != audio.enabled {
-            tracing::warn!(
-                from = old_audio.enabled,
-                to = audio.enabled,
-                "audio.enabled toggled — a daemon restart is required for the change to take effect"
-            );
-            let _ = self.events.send(Event::AudioError {
-                peer: None,
-                message: "Audio enabled was changed — restart the Synbad daemon for the new \
-                          setting to take effect."
-                    .into(),
-            });
+            if audio.enabled {
+                match self.ensure_audio_subsystem().await {
+                    Ok(()) => {
+                        tracing::info!("audio subsystem brought up live");
+                    }
+                    Err(e) => {
+                        tracing::warn!(?e, "failed to bring audio subsystem up live");
+                        let _ = self.events.send(Event::AudioError {
+                            peer: None,
+                            message: format!(
+                                "Audio could not start: {e}. Restart the Synbad daemon to retry."
+                            ),
+                        });
+                    }
+                }
+            } else {
+                self.teardown_audio_subsystem().await;
+            }
         }
         // Push the live bridge a Reconfigure so device picks / per-peer
-        // toggles take effect immediately. enabled changes still need a
-        // restart, but everything else is hot-reloadable.
+        // toggles take effect immediately.
         if let Some(handle) = &self.audio {
             let _ = handle
                 .commands_tx
                 .send(AudioCommand::Reconfigure(audio.clone()))
                 .await;
         }
-        // Pick up "newly enabled" peers (master toggle was already on and
-        // a per_peer entry just turned on, or globals turned on). Bridge
-        // doesn't dial outbound itself; the supervisor owns
-        // `maybe_dial_audio`. Glare rule dedupes any redundant dial.
+        // Pick up "newly enabled" peers (master toggle was already on
+        // and a per_peer entry just turned on, or globals turned on).
+        // The reconcile loop is the single dial entry-point; it'll skip
+        // peers that became inactive and pick up the newly-active ones.
         if old_audio.enabled && audio.enabled {
-            let newly_enabled: Vec<synbad_ipc::DiscoveredPeer> = self
+            let demoted: Vec<String> = self
                 .peers
-                .values()
-                .filter(|p| {
-                    !peer_audio_active(&old_audio, &p.machine_id)
-                        && peer_audio_active(&audio, &p.machine_id)
+                .keys()
+                .filter(|id| {
+                    peer_audio_active(&old_audio, id) && !peer_audio_active(&audio, id)
                 })
                 .cloned()
                 .collect();
-            for peer in newly_enabled {
-                self.maybe_dial_audio(peer);
+            // Demoted peers must be evicted from `audio_live` so the
+            // reconcile loop doesn't think they're still up if the user
+            // later re-enables them.
+            for id in &demoted {
+                self.audio_live.remove(id);
+                self.audio_backoff.remove(id);
             }
         }
-        self.set_config(new_config).await
+        self.reconcile_audio_sessions();
+        Ok(())
     }
 
     /// Snapshot per-peer audio status from the bridge.
