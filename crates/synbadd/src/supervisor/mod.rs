@@ -158,7 +158,9 @@ pub struct Supervisor {
     pub(super) identity: Arc<Identity>,
     /// mDNS service advertisement. Dropped on shutdown to send a goodbye.
     /// `None` if discovery failed to start — daemon keeps running.
-    pub(super) _advertiser: Option<Advertiser>,
+    /// Live-updated by `ensure_audio_subsystem` / `teardown_audio_subsystem`
+    /// so peers see our `audio_port` flip without a daemon restart.
+    pub(super) advertiser: Option<Advertiser>,
     /// mDNS browser; lives alongside the advertiser.
     pub(super) _browser: Option<Browser>,
     /// Incoming Found/Lost events from the browser thread.
@@ -402,7 +404,7 @@ impl Supervisor {
             started_at: None,
             fast_fail_count: 0,
             identity,
-            _advertiser: advertiser,
+            advertiser,
             _browser: browser,
             discovery_rx,
             peers: HashMap::new(),
@@ -595,7 +597,10 @@ impl Supervisor {
                 // up multiple times in quick succession. Skip the
                 // re-broadcast if nothing the user cares about changed —
                 // only the `host` flips between resolutions and any one
-                // value is fine to keep.
+                // value is fine to keep. `audio_port` is in the check so
+                // a peer flipping audio on (re-registers their TXT with
+                // a fresh audio_port) kicks our reconcile loop right
+                // away instead of waiting up to 5 s for the next tick.
                 let unchanged = self
                     .peers
                     .get(&peer.machine_id)
@@ -603,6 +608,7 @@ impl Supervisor {
                         p.machine_id == peer.machine_id
                             && p.fingerprint == peer.fingerprint
                             && p.config_head == peer.config_head
+                            && p.audio_port == peer.audio_port
                     })
                     .unwrap_or(false);
                 let was_present = self.peers.contains_key(&peer.machine_id);
@@ -681,10 +687,23 @@ impl Supervisor {
                     None
                 }
             };
+        let listener_up = listener.is_some();
         self.audio = Some(handle);
         self._audio_task = Some(task);
         self._audio_listener = listener;
         self.audio_dial_deps = Some(dial_deps);
+        // Refresh the mDNS TXT so peers learn our audio_port without a
+        // daemon restart. Only advertise it when the listener actually
+        // bound — peers seeing the key try to dial it. Failure here is
+        // non-fatal: outbound dial still works, peers just won't redial
+        // us until the next time something kicks the advertisement.
+        if listener_up {
+            if let Some(adv) = self.advertiser.as_mut() {
+                if let Err(e) = adv.set_audio_port(self.config.audio.signal_port) {
+                    tracing::warn!(?e, "failed to refresh mDNS TXT with audio_port");
+                }
+            }
+        }
         tracing::info!("audio subsystem online");
         // Kick the reconcile loop right away so visible+trusted peers
         // get a session without waiting for the periodic tick.
@@ -712,6 +731,14 @@ impl Supervisor {
         self.audio_live.clear();
         self.audio_inflight.clear();
         self.audio_backoff.clear();
+        // Drop the audio_port TXT key so peers stop dialing us. Goodbye
+        // is best-effort — a peer that misses the unregister will hit a
+        // refused connection on its next reconcile tick and back off.
+        if let Some(adv) = self.advertiser.as_mut() {
+            if let Err(e) = adv.set_audio_port(0) {
+                tracing::warn!(?e, "failed to drop audio_port from mDNS TXT");
+            }
+        }
         tracing::info!("audio subsystem offline");
     }
 
@@ -738,6 +765,16 @@ impl Supervisor {
             return;
         };
         if peer.audio_port == 0 {
+            // Common after a hot toggle: our bridge is up but the peer's
+            // mDNS advertisement is still the startup snapshot without
+            // an `audio_port` key. `trace!` because this fires once per
+            // visible peer per reconcile tick — too noisy for `debug!`,
+            // but you need _some_ breadcrumb when "audio is on but
+            // nothing's dialing" is the symptom.
+            tracing::trace!(
+                peer = %peer.machine_id,
+                "skipping audio dial: peer's mDNS TXT has no audio_port"
+            );
             return;
         }
         if !synbad_audio::peer_audio_active(&self.config.audio, &peer.machine_id) {
