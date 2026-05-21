@@ -16,6 +16,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # audiopus_sys 0.2.2 bundles libopus, whose CMakeLists.txt declares
+  # cmake_minimum_required(VERSION < 3.5) — CMake 4.x rejects that outright.
+  # The bundled build is only hit on cross-arch macOS (x86_64-apple-darwin
+  # built on the arm64 runner, where pkg-config can't use Homebrew's arm64
+  # opus). Setting this env var (CMake 4.0.3+) tells CMake to configure
+  # legacy projects anyway. Harmless on platforms that don't invoke CMake.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   build:
