@@ -76,7 +76,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/Library/Caches/Homebrew/downloads
-          key: brew-downloads-${{ matrix.target }}-librsvg-v1
+          key: brew-downloads-${{ matrix.target }}-librsvg-opus-v1
 
       - name: Install macOS deps
         if: runner.os == 'macOS'
@@ -84,7 +84,10 @@ jobs:
           # rsvg-convert powers assets/scripts/generate-icons.sh; iconutil
           # ships with Xcode CLT (already on the runner). The cache step above
           # keeps the bottle so brew just extracts on warm runs.
-          brew install --quiet librsvg
+          # opus + pkg-config let audiopus_sys link the system libopus
+          # instead of building its bundled copy via cmake, which fails on
+          # aarch64-apple-darwin.
+          brew install --quiet librsvg opus pkg-config
 
       # rust-cache must run *after* RUSTFLAGS is in scope (set at job-env above)
       # so the cache key reflects the flags we'll actually compile with.

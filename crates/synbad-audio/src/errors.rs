@@ -22,6 +22,9 @@ pub enum AudioError {
     #[error("webrtc error: {0}")]
     WebRtc(String),
 
+    #[error("codec error: {0}")]
+    Codec(String),
+
     #[error("signaling protocol error: {0}")]
     Signal(String),
 

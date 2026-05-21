@@ -83,6 +83,20 @@ impl CipherStream {
         self.transcript
     }
 
+    /// Underlying TCP local address. Used by the audio bridge to
+    /// figure out which interface IP to advertise as the host
+    /// candidate for the WebRTC media socket — the same NIC that
+    /// successfully terminated our signaling TCP is the natural one
+    /// to use for the UDP media path.
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.stream.local_addr()
+    }
+
+    /// Underlying TCP peer address.
+    pub fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.stream.peer_addr()
+    }
+
     /// Encrypt and frame `payload`. Each call emits exactly one frame.
     /// Returns an error if the payload exceeds [`MAX_FRAME_BYTES`] or
     /// if the per-direction counter would overflow.

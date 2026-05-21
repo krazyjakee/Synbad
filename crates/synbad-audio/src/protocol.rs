@@ -9,15 +9,25 @@
 //!
 //! The session is conceptually long-lived: an [`Offer`](AudioSignal::Offer)
 //! starts negotiation, the matching [`Answer`](AudioSignal::Answer)
-//! completes it, and zero-or-more [`IceCandidate`](AudioSignal::IceCandidate)
-//! messages trickle in afterwards as ICE gathering completes. A
-//! [`Close`](AudioSignal::Close) tears down the WebRTC PeerConnection
-//! without dropping the signaling channel — useful for renegotiation.
+//! completes it, and a [`Close`](AudioSignal::Close) tears down the
+//! session.
+//!
+//! ## ICE trickling
+//!
+//! Earlier revisions of this protocol carried `IceCandidate` and
+//! `IceComplete` variants for trickle ICE — but the str0m WebRTC
+//! stack we use bundles every host candidate into the SDP itself
+//! (driven by `add_local_candidate` before `sdp_api().apply()`), so
+//! we have no separate candidates to forward. Keeping the protocol
+//! small reduces the moving parts and avoids a class of
+//! "candidate arrived before remote-description" races.
 
 use serde::{Deserialize, Serialize};
 
 /// One signaling message. The variants line up with WebRTC's standard
-/// JSEP exchange.
+/// JSEP exchange — `Offer` / `Answer` carry full SDPs (with ICE
+/// candidates already embedded), `Close` lets either side tear the
+/// session down without dropping the underlying signaling stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AudioSignal {
@@ -25,15 +35,6 @@ pub enum AudioSignal {
     Offer { session_id: String, sdp: String },
     /// SDP answer from the responder.
     Answer { session_id: String, sdp: String },
-    /// Trickled ICE candidate.
-    IceCandidate {
-        session_id: String,
-        candidate: String,
-        sdp_mid: Option<String>,
-        sdp_mline_index: Option<u16>,
-    },
-    /// End-of-candidates marker (null candidate per RFC 8838).
-    IceComplete { session_id: String },
     /// Tear down this session. The signaling stream stays open.
     Close {
         session_id: String,
@@ -48,8 +49,6 @@ impl AudioSignal {
         match self {
             AudioSignal::Offer { session_id, .. }
             | AudioSignal::Answer { session_id, .. }
-            | AudioSignal::IceCandidate { session_id, .. }
-            | AudioSignal::IceComplete { session_id }
             | AudioSignal::Close { session_id, .. } => session_id,
         }
     }
@@ -68,22 +67,6 @@ mod tests {
         let bytes = serde_json::to_vec(&signal).unwrap();
         let back: AudioSignal = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.session_id(), "abc-123");
-    }
-
-    #[test]
-    fn round_trip_ice() {
-        let signal = AudioSignal::IceCandidate {
-            session_id: "s".into(),
-            candidate: "candidate:1 1 UDP 2113937151 192.168.1.5 54321 typ host".into(),
-            sdp_mid: Some("0".into()),
-            sdp_mline_index: Some(0),
-        };
-        let bytes = serde_json::to_vec(&signal).unwrap();
-        let back: AudioSignal = serde_json::from_slice(&bytes).unwrap();
-        match back {
-            AudioSignal::IceCandidate { candidate, .. } => assert!(candidate.contains("host")),
-            _ => panic!("variant changed in round-trip"),
-        }
     }
 
     #[test]

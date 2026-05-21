@@ -44,6 +44,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libasound2-dev
+      - name: Install macOS audio deps
+        # audiopus_sys's bundled libopus cmake build fails on
+        # aarch64-apple-darwin. Installing opus via brew lets pkg-config
+        # find it, skipping the bundled build entirely.
+        if: runner.os == 'macOS'
+        run: brew install --quiet opus pkg-config
       - name: clippy (workspace, default features)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: clippy (GUI with tray)
@@ -66,6 +72,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libasound2-dev
+      - name: Install macOS audio deps
+        if: runner.os == 'macOS'
+        run: brew install --quiet opus pkg-config
       - name: cargo test
         run: cargo test --workspace --all-targets --no-fail-fast
       - name: cargo build (synbadd, 7z feature on Windows)
