@@ -64,6 +64,11 @@ pub enum Cmd {
 pub enum Update {
     Connected,
     Disconnected(String),
+    /// The event loop has fired off a `synbadd` spawn and is waiting for
+    /// its socket to come up. Rendered as a neutral status (not an error)
+    /// so the user sees "starting" instead of a misleading "could not
+    /// connect" during the boot window.
+    Launching(String),
     Status {
         state: DaemonState,
         recent_log: Vec<String>,
@@ -208,6 +213,44 @@ pub fn spawn(socket_path: PathBuf, repaint: Arc<dyn Fn() + Send + Sync>) -> IpcH
     }
 }
 
+/// How long after we initiate a `synbadd` spawn we keep showing a soft
+/// "starting" status instead of a "could not connect" error. The daemon
+/// typically binds its socket in well under a second; 5s gives plenty of
+/// headroom for cold-cache disk reads and Windows AV scans without
+/// letting a truly-broken binary hide behind the friendly message.
+const LAUNCH_GRACE: Duration = Duration::from_secs(5);
+/// Minimum gap between consecutive spawn attempts. Stops a daemon that
+/// crashes on startup from getting respawned every backoff tick (which
+/// would also accumulate zombie processes on Unix).
+const SPAWN_THROTTLE: Duration = Duration::from_secs(3);
+
+/// True iff a spawn attempt at `last_spawn_at` is still within the soft
+/// "starting" grace window relative to `now`. Used to decide whether a
+/// connect failure should surface as a friendly `Launching` status or a
+/// real `Disconnected` error.
+fn in_launch_grace(last_spawn_at: Option<Instant>, now: Instant, grace: Duration) -> bool {
+    last_spawn_at
+        .map(|t| now.saturating_duration_since(t) < grace)
+        .unwrap_or(false)
+}
+
+/// True iff we should kick off a fresh `synbadd` spawn this iteration:
+/// the user wants a daemon running AND we haven't tried recently (so a
+/// crashing daemon doesn't get re-spawned on every backoff tick).
+fn should_spawn(daemon_wanted: bool, last_spawn_at: Option<Instant>, now: Instant) -> bool {
+    daemon_wanted
+        && last_spawn_at
+            .map(|t| now.saturating_duration_since(t) >= SPAWN_THROTTLE)
+            .unwrap_or(true)
+}
+
+/// Render the "couldn't even launch the binary" failure into a
+/// user-facing string. Kept as a free function so the message format is
+/// trivially testable without touching the surrounding IPC machinery.
+fn launch_failure_msg(path: &Path, err: &std::io::Error) -> String {
+    format!("could not launch synbadd at {}: {}", path.display(), err)
+}
+
 fn event_loop(
     socket_path: PathBuf,
     update_tx: Sender<Update>,
@@ -216,9 +259,29 @@ fn event_loop(
 ) {
     let mut backoff = Duration::from_millis(500);
     let mut last_spawn: Option<Instant> = None;
+    // Sticky message from the most recent failed spawn. Outranks the
+    // generic "could not connect" — a missing binary is the user-actionable
+    // root cause and the connect failure is just downstream noise. Cleared
+    // when a spawn succeeds or a connect succeeds.
+    let mut last_spawn_error: Option<String> = None;
+
+    // Kick off the daemon BEFORE the first connect attempt when the user
+    // wants one running. Without this we'd flash "could not connect to
+    // synbadd" on every cold start with autostart on — the connect
+    // races ahead of the spawn we were about to do anyway.
+    if daemon_wanted.load(Ordering::Relaxed) {
+        last_spawn_error = try_spawn(&update_tx, &repaint).err();
+        last_spawn = Some(Instant::now());
+        if last_spawn_error.is_none() {
+            let _ = update_tx.send(Update::Launching("starting synbadd…".into()));
+            repaint();
+        }
+    }
+
     loop {
         match Connection::connect(&socket_path) {
             Ok(mut conn) => {
+                last_spawn_error = None;
                 backoff = Duration::from_millis(500);
                 let _ = update_tx.send(Update::Connected);
                 repaint();
@@ -328,10 +391,27 @@ fn event_loop(
                 }
             }
             Err(e) => {
-                let _ = update_tx.send(Update::Disconnected(format!(
-                    "could not connect to synbadd at {:?}: {}",
-                    socket_path, e
-                )));
+                // Pick the most informative status for the user:
+                //   1. If our most recent spawn failed outright (e.g. the
+                //      binary doesn't exist), that's the root cause —
+                //      surface it instead of the generic connect error.
+                //   2. If we recently fired off a spawn that succeeded, the
+                //      socket just isn't bound yet — show "starting…", not
+                //      a scary error.
+                //   3. Otherwise this is a genuine connect failure: no
+                //      daemon, no recent spawn we initiated, daemon_wanted
+                //      may be off. Show the real error.
+                let now = Instant::now();
+                if let Some(msg) = last_spawn_error.clone() {
+                    let _ = update_tx.send(Update::Disconnected(msg));
+                } else if in_launch_grace(last_spawn, now, LAUNCH_GRACE) {
+                    let _ = update_tx.send(Update::Launching("starting synbadd…".into()));
+                } else {
+                    let _ = update_tx.send(Update::Disconnected(format!(
+                        "could not connect to synbadd at {:?}: {}",
+                        socket_path, e
+                    )));
+                }
                 repaint();
 
                 // Auto-launch the daemon if nothing is listening, but only
@@ -341,23 +421,9 @@ fn event_loop(
                 // has *also* never clicked Start gets a quiet GUI, while
                 // a daemon that crashes mid-session is respawned for both
                 // autostart modes (the user clearly wanted it up).
-                //
-                // Throttled so a daemon that crashes on startup doesn't
-                // get re-spawned every backoff tick (which would also
-                // accumulate zombies).
-                let should_spawn = daemon_wanted.load(Ordering::Relaxed)
-                    && last_spawn
-                        .map(|t| t.elapsed() >= Duration::from_secs(3))
-                        .unwrap_or(true);
-                if should_spawn {
+                if should_spawn(daemon_wanted.load(Ordering::Relaxed), last_spawn, now) {
+                    last_spawn_error = try_spawn(&update_tx, &repaint).err();
                     last_spawn = Some(Instant::now());
-                    match spawn_daemon() {
-                        Ok(child) => tracing::info!(
-                            pid = child.id(),
-                            "no daemon reachable — spawned synbadd"
-                        ),
-                        Err(e) => tracing::warn!(?e, "failed to spawn synbadd"),
-                    }
                 }
             }
         }
@@ -412,7 +478,10 @@ fn synbadd_binary() -> PathBuf {
 /// We deliberately do not retain the `Child` handle: `Child` has no Drop
 /// behaviour, so letting it fall out of scope simply detaches us from the
 /// process — the daemon outlives the GUI on its own.
-fn spawn_daemon() -> std::io::Result<std::process::Child> {
+///
+/// Returns the path we attempted to launch alongside the spawn result so
+/// callers can show "could not launch synbadd at <path>" without re-resolving.
+fn spawn_daemon() -> (PathBuf, std::io::Result<std::process::Child>) {
     let binary = synbadd_binary();
     let log_path = paths::state_dir().join("synbadd.log");
     if let Some(parent) = log_path.parent() {
@@ -426,7 +495,32 @@ fn spawn_daemon() -> std::io::Result<std::process::Child> {
     {
         cmd.process_group(0);
     }
-    cmd.spawn()
+    (binary, cmd.spawn())
+}
+
+/// One-shot wrapper around `spawn_daemon` that also surfaces failures to
+/// the UI. On success returns `Ok(())` — the caller is responsible for
+/// emitting `Update::Launching` if it wants the boot-status banner. On
+/// failure, returns the user-facing message we already pushed onto the
+/// update channel so the caller can keep it as `last_spawn_error`.
+fn try_spawn(
+    update_tx: &Sender<Update>,
+    repaint: &Arc<dyn Fn() + Send + Sync>,
+) -> Result<(), String> {
+    let (binary, result) = spawn_daemon();
+    match result {
+        Ok(child) => {
+            tracing::info!(pid = child.id(), path = %binary.display(), "spawned synbadd");
+            Ok(())
+        }
+        Err(e) => {
+            let msg = launch_failure_msg(&binary, &e);
+            tracing::warn!(?e, path = %binary.display(), "failed to spawn synbadd");
+            let _ = update_tx.send(Update::Disconnected(msg.clone()));
+            repaint();
+            Err(msg)
+        }
+    }
 }
 
 fn log_stdio(path: &Path) -> Stdio {
@@ -565,5 +659,109 @@ fn refetch_config(socket_path: &Path) -> Option<Config> {
         Some(config)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synbadd_binary_uses_platform_name() {
+        // synbadd_binary resolves to either an adjacent candidate or a
+        // bare PathBuf — but the file name should always match the
+        // platform-appropriate executable name.
+        let expected = if cfg!(windows) { "synbadd.exe" } else { "synbadd" };
+        let path = synbadd_binary();
+        assert_eq!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some(expected),
+            "synbadd_binary should resolve to a path whose file name is {expected:?}, got {path:?}",
+        );
+    }
+
+    #[test]
+    fn in_launch_grace_no_attempt_is_false() {
+        // Before any spawn has been kicked off there is no grace window
+        // — a connect failure here means "no daemon, nothing in flight"
+        // and the user should see a real error.
+        let now = Instant::now();
+        assert!(!in_launch_grace(None, now, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn in_launch_grace_recent_attempt_is_true() {
+        // A spawn we kicked off well within the grace window suppresses
+        // the connect-failure error in favour of the soft "starting…"
+        // status.
+        let now = Instant::now();
+        let recent = now - Duration::from_millis(500);
+        assert!(in_launch_grace(Some(recent), now, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn in_launch_grace_stale_attempt_is_false() {
+        // Once the grace window expires we should fall through to the
+        // real "could not connect" error so a daemon that never bound
+        // its socket doesn't hide behind the friendly status forever.
+        let now = Instant::now();
+        let stale = now - Duration::from_secs(30);
+        assert!(!in_launch_grace(Some(stale), now, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn should_spawn_skips_when_daemon_not_wanted() {
+        // The user has autostart off and hasn't clicked Start — a connect
+        // failure is normal and we shouldn't be poking at the binary.
+        let now = Instant::now();
+        assert!(!should_spawn(false, None, now));
+        assert!(!should_spawn(
+            false,
+            Some(now - Duration::from_secs(60)),
+            now
+        ));
+    }
+
+    #[test]
+    fn should_spawn_fires_on_first_attempt() {
+        // First iteration with daemon_wanted=true and no recent spawn —
+        // this is the path that fixes the original "could not connect
+        // before launch" race.
+        let now = Instant::now();
+        assert!(should_spawn(true, None, now));
+    }
+
+    #[test]
+    fn should_spawn_is_throttled() {
+        // A daemon that crashes on startup shouldn't get respawned
+        // every backoff tick — the throttle window protects us from
+        // zombie accumulation on Unix.
+        let now = Instant::now();
+        let very_recent = now - Duration::from_millis(100);
+        assert!(!should_spawn(true, Some(very_recent), now));
+
+        let just_after_throttle = now - (SPAWN_THROTTLE + Duration::from_millis(100));
+        assert!(should_spawn(true, Some(just_after_throttle), now));
+    }
+
+    #[test]
+    fn launch_failure_msg_includes_path_and_io_error() {
+        // The user needs to know which binary we tried to launch (so they
+        // can verify it exists at that path), and which OS error came
+        // back. No dev-time build hints — keep the message factual.
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let msg = launch_failure_msg(Path::new("/usr/bin/synbadd"), &err);
+        assert!(
+            msg.contains("/usr/bin/synbadd"),
+            "expected attempted path in message, got {msg:?}",
+        );
+        assert!(
+            msg.contains("No such file or directory"),
+            "expected underlying io error in message, got {msg:?}",
+        );
+        assert!(
+            msg.starts_with("could not launch synbadd"),
+            "expected user-facing prefix in message, got {msg:?}",
+        );
     }
 }
