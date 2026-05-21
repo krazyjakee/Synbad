@@ -30,21 +30,31 @@ jobs:
             archive: tar.gz
             gui_features: tray
             daemon_features: ""
+            # mold is ~3x faster than ld on our final binary link; the flag is
+            # gcc-style and only applies to Linux. Putting it on the matrix row
+            # (vs. job-level env) keeps RUSTFLAGS empty on the other runners
+            # so we don't churn their rust-cache keys.
+            rustflags: "-C link-arg=-fuse-ld=mold"
           - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
             gui_features: ""
             daemon_features: ""
+            rustflags: ""
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
             gui_features: ""
             daemon_features: ""
+            rustflags: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
             gui_features: ""
             daemon_features: sevenz
+            rustflags: ""
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,42 +64,56 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: release-${{ matrix.target }}
-
       - name: Install Linux deps
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev \
-                                  libasound2-dev \
-                                  librsvg2-bin file desktop-file-utils
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libasound2-dev librsvg2-bin file desktop-file-utils mold
+          version: release-v1
+
+      - name: Cache Homebrew downloads
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew/downloads
+          key: brew-downloads-${{ matrix.target }}-librsvg-v1
 
       - name: Install macOS deps
         if: runner.os == 'macOS'
         run: |
           # rsvg-convert powers assets/scripts/generate-icons.sh; iconutil
-          # ships with Xcode CLT (already on the runner).
-          brew install librsvg
+          # ships with Xcode CLT (already on the runner). The cache step above
+          # keeps the bottle so brew just extracts on warm runs.
+          brew install --quiet librsvg
 
-      - name: Build synbadd
+      # rust-cache must run *after* RUSTFLAGS is in scope (set at job-env above)
+      # so the cache key reflects the flags we'll actually compile with.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+          save-if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build synbadd + synbad-gui
         shell: bash
         run: |
+          set -euo pipefail
+          # One cargo invocation builds both binaries: shared deps (tokio,
+          # serde, etc.) only get walked once. Multi-package selection requires
+          # pkg-qualified feature syntax ("synbadd/sevenz" rather than just
+          # "sevenz"), which is fine under the workspace's resolver = "2".
+          feats=""
           if [ -n "${{ matrix.daemon_features }}" ]; then
-            cargo build --release --target ${{ matrix.target }} -p synbadd --features "${{ matrix.daemon_features }}"
-          else
-            cargo build --release --target ${{ matrix.target }} -p synbadd
+            feats="synbadd/${{ matrix.daemon_features }}"
           fi
-
-      - name: Build synbad-gui
-        shell: bash
-        run: |
           if [ -n "${{ matrix.gui_features }}" ]; then
-            cargo build --release --target ${{ matrix.target }} -p synbad-gui --features "${{ matrix.gui_features }}"
-          else
-            cargo build --release --target ${{ matrix.target }} -p synbad-gui
+            [ -n "$feats" ] && feats="$feats,"
+            feats="${feats}synbad-gui/${{ matrix.gui_features }}"
           fi
+          args=(build --release --target "${{ matrix.target }}" -p synbadd -p synbad-gui)
+          if [ -n "$feats" ]; then
+            args+=(--features "$feats")
+          fi
+          cargo "${args[@]}"
 
       - name: Stage artifacts
         id: stage
