@@ -389,18 +389,18 @@ impl Config {
     /// Core actually consumes?
     ///
     /// The Core only ever sees what flows into `generate_synergy_conf` /
-    /// `generate_deskflow_settings` plus which binary we launch. The
-    /// daemon-only ports — `service_port` (pairing) and `sync_port`
-    /// (config sync) — drive mDNS/pairing/sync and never reach the Core,
-    /// so an edit that touches only those should apply silently instead
-    /// of bouncing active input sharing. Everything else (role,
-    /// server_name, server_address, port, screens, links, options,
-    /// binary override) is a Core input.
+    /// `generate_deskflow_settings` plus which binary we launch. Fields
+    /// that don't reach the Core — daemon-only ports (`service_port` for
+    /// pairing, `sync_port` for config sync) and the `audio` bridge
+    /// section — should apply silently instead of bouncing active input
+    /// sharing. Everything else (role, server_name, server_address,
+    /// port, screens, links, options, binary override) is a Core input.
     pub fn core_inputs_differ(&self, other: &Config) -> bool {
         let core_view = |c: &Config| {
             let mut c = c.clone();
             c.service_port = 0;
             c.sync_port = 0;
+            c.audio = AudioConfig::default();
             c
         };
         core_view(self) != core_view(other)
@@ -650,6 +650,22 @@ mod tests {
         c.role = NodeRole::Client;
         c.server_address = Some("peer.local:24800".into());
         assert!(a.core_inputs_differ(&c), "role change is a Core input");
+    }
+
+    #[test]
+    fn core_inputs_differ_ignores_audio_section() {
+        // Audio settings drive the LAN audio bridge, not the Deskflow
+        // Core — flipping them must not bounce active input sharing.
+        let a = sample();
+        let mut b = a.clone();
+        b.audio.enabled = !a.audio.enabled;
+        b.audio.send_mic_to_peers = true;
+        b.audio.input_device = Some("Built-in Microphone".into());
+        b.audio.signal_port = a.audio.signal_port + 1;
+        assert!(
+            !a.core_inputs_differ(&b),
+            "audio bridge edits must not count as Core input changes"
+        );
     }
 
     #[test]
