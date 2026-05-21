@@ -10,6 +10,8 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-05-21
+
 ### Fixed
 - Auto-update on Linux/macOS appeared to update only the daemon. The
   on-disk swap was actually doing both binaries, but the running GUI
@@ -23,6 +25,36 @@ All notable changes to Synbad land here. Format follows
   single-instance socket, spawns a fresh `synbad-gui`, and exits — so
   both halves of the install actually take effect without the user
   having to chase down systemd / launchctl by hand.
+- GUI flashed a misleading "could not connect to synbadd" error on cold
+  start with autostart on, because the IPC loop tried to connect before
+  spawning the daemon. The loop now pre-spawns the daemon at the top of
+  the boot dance, holds a 5 s soft "Launching…" grace window for connect
+  failures during that period, and surfaces real spawn failures with the
+  attempted binary path (e.g. `could not launch synbadd at
+  /usr/bin/synbadd: No such file or directory`) instead of looping the
+  generic connect error.
+- Client Core could stall on a silent "NOTE: disconnected from server"
+  log line — modern `deskflow-core` keeps the process alive after the
+  link drops without retrying, so the supervisor's exit-driven
+  reconnect never fired. The supervisor now watches the log stream for
+  that line (client role only), force-kills the child, and lets the
+  existing `MAX_CLIENT_RECONNECTS = 3` path take over.
+- Audio bridge is now level-triggered with retry instead of edge-only.
+  A 5 s reconcile loop in the supervisor walks every visible peer and
+  redials any that should have a session but don't; failed dials arm
+  per-peer exponential backoff (1 s → 60 s cap), and `SessionClosed` /
+  `PeerStatus` events evict liveness so a dropped session recovers
+  within a tick or two. Toggling `audio.enabled` is hot-reloadable —
+  the bridge and listener are built (or torn down) live instead of
+  requiring a daemon restart.
+
+### Changed
+- Release workflow is faster: a single `cargo build -p synbadd -p
+  synbad-gui` invocation replaces the two sequential builds, `mold` is
+  used as the linker on Linux, and apt + Homebrew downloads are cached
+  between runs. `rust-cache` is now scoped to tag pushes only so PR/CI
+  activity can't evict release-target entries from the per-repo cache
+  budget.
 
 ## [0.1.2] - 2026-05-21
 
