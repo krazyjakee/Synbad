@@ -10,6 +10,36 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-05-21
+
+### Changed
+- Audio bridge ported from `webrtc-rs` 0.17 to `str0m` 0.19. On-wire
+  codec switched from a hand-rolled L16 carrier to Opus at 48 kHz mono,
+  64 kbps. Bandwidth drops by an order of magnitude and the LAN session
+  bring-up settles in ~140 ms on loopback.
+
+### Fixed
+- Two-machine audio between v0.1.4 hosts was broken because every
+  inbound RTP packet failed AEAD/HMAC authentication immediately after
+  DTLS-SRTP handshake completed — a key-derivation bug in `webrtc-rs`
+  0.17 that survived several attempted workarounds (AES-CM-HMAC profile
+  preference, deferred `add_track`, bundled-ICE SDP, mDNS off, loopback
+  candidates on). Validated against `str0m` with a side-by-side
+  bidirectional smoke test, then swapped the whole stack. The
+  un-`#[ignore]`'d loopback integration test (`tests/loopback.rs`) is
+  the regression net.
+- macOS CI/release builds no longer fail on `audiopus_sys`'s bundled
+  libopus cmake build (which doesn't compile on aarch64-apple-darwin).
+  The workflows now `brew install opus pkg-config` so the crate picks
+  up the system library and skips the bundled build.
+
+### Notes
+- **Wire-incompatible audio** with v0.1.4 and earlier — the codec
+  changed. Pairing, sync, and input sharing remain wire-compatible, so
+  mixed clusters keep working for everything except audio.
+- New runtime dependency on `libopus`. Linux distros already ship it;
+  the macOS release bundle pulls it via brew during build.
+
 ## [0.1.4] - 2026-05-21
 
 ### Changed
