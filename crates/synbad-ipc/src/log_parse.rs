@@ -20,6 +20,21 @@
 
 use crate::Event;
 
+/// Detect the Core's "disconnected from server" notice (client role).
+/// Some Core versions log this when the TCP link to the server drops but
+/// then sit idle without retrying — the supervisor uses this signal to
+/// force a process-level restart so the existing client-reconnect cap
+/// engages instead of leaving the child stuck.
+///
+/// `strip_log_prefix` also peels off a leading `[bracketed]` token, so the
+/// supervisor's own `[synbad] disconnected from server …` retry-loop log
+/// line also matches here. Callers must filter that out themselves before
+/// acting on this signal; otherwise a kill triggers a log line that
+/// triggers another kill.
+pub fn is_client_server_disconnect(line: &str) -> bool {
+    strip_log_prefix(line).starts_with("disconnected from server")
+}
+
 /// Try to extract a structured event from a single line of Core stderr.
 /// Returns `None` for lines that don't carry a recognized signal — those
 /// still flow through as raw `Event::Log`.
@@ -151,6 +166,21 @@ mod tests {
             Event::PeerDisconnected { name } => assert_eq!(name, "phone"),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn detects_client_disconnect_with_and_without_prefixes() {
+        assert!(is_client_server_disconnect(
+            "NOTE: disconnected from server"
+        ));
+        assert!(is_client_server_disconnect(
+            "2026-05-19T12:34:56 NOTE: disconnected from server"
+        ));
+        assert!(is_client_server_disconnect(
+            "[2026-05-19T12:34:56] NOTE: disconnected from server"
+        ));
+        assert!(!is_client_server_disconnect("NOTE: started server"));
+        assert!(!is_client_server_disconnect(""));
     }
 
     #[test]
