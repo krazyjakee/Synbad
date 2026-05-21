@@ -227,11 +227,17 @@ pub struct BinaryPaths {
 
 /// LAN audio bridge configuration. Disabled by default; opting in surfaces
 /// device dropdowns in the GUI and starts the audio signaling listener.
+///
+/// Routing is intentionally simple: when `enabled` is true the bridge
+/// brings up a bidirectional session with every trusted peer. The
+/// per-peer map is the only knob for muting one direction (or the whole
+/// link) on a specific peer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AudioConfig {
     /// Master switch. When `false`, the audio subsystem doesn't bind its
-    /// signaling listener and won't accept incoming sessions.
+    /// signaling listener and won't accept incoming sessions. When
+    /// `true`, every paired peer gets a bidirectional session unless
+    /// a `per_peer` entry overrides it.
     #[serde(default)]
     pub enabled: bool,
     /// User-chosen input device name. `None` means "OS default."
@@ -240,13 +246,8 @@ pub struct AudioConfig {
     /// User-chosen output device name. `None` means "OS default."
     #[serde(default)]
     pub output_device: Option<String>,
-    /// Globally allow capturing the local mic and sending to peers.
-    #[serde(default)]
-    pub send_mic_to_peers: bool,
-    /// Globally allow receiving peer audio and playing it locally.
-    #[serde(default)]
-    pub receive_peer_audio: bool,
-    /// Per-peer overrides keyed by `machine_id`. Absent = use globals.
+    /// Per-peer overrides keyed by `machine_id`. Absent = bidirectional
+    /// when `enabled` is true.
     #[serde(default)]
     pub per_peer: BTreeMap<String, PeerAudioRouting>,
     /// TCP port the audio signaling listener binds. Defaults to
@@ -261,15 +262,15 @@ impl Default for AudioConfig {
             enabled: false,
             input_device: None,
             output_device: None,
-            send_mic_to_peers: false,
-            receive_peer_audio: false,
             per_peer: BTreeMap::new(),
             signal_port: default_audio_signal_port(),
         }
     }
 }
 
-/// Per-peer override for the global audio routing toggles.
+/// Per-peer override for the bidirectional default. With no entry, an
+/// enabled bridge sends and receives on this link; the entry below can
+/// disable the whole link (`enabled = false`) or mute one direction.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PeerAudioRouting {
@@ -706,7 +707,6 @@ name = "alpha"
         let a = sample();
         let mut b = a.clone();
         b.audio.enabled = !a.audio.enabled;
-        b.audio.send_mic_to_peers = true;
         b.audio.input_device = Some("Built-in Microphone".into());
         b.audio.signal_port = a.audio.signal_port + 1;
         assert!(
@@ -778,7 +778,6 @@ name = "alpha"
     fn audio_defaults_round_trip_through_toml() {
         let mut c = sample();
         c.audio.enabled = true;
-        c.audio.send_mic_to_peers = true;
         c.audio.input_device = Some("Built-in Microphone".into());
         c.audio.per_peer.insert(
             "peer-uuid-123".into(),
@@ -819,5 +818,38 @@ name = "alpha"
         let c: Config = toml::from_str(pre_audio).expect("legacy config still parses");
         assert!(!c.audio.enabled);
         assert_eq!(c.audio.signal_port, default_audio_signal_port());
+    }
+
+    #[test]
+    fn audio_section_with_legacy_direction_toggles_still_loads() {
+        // v0.1.x persisted `send_mic_to_peers` / `receive_peer_audio`.
+        // The fields are gone in the simplified routing model — make sure
+        // an upgrade doesn't trip on them.
+        let legacy = r#"
+            role = "server"
+            server_name = "host"
+            port = 24800
+            service_port = 24850
+            sync_port = 24851
+
+            [[screens]]
+            name = "host"
+            aliases = []
+
+            [screens.position]
+            x = 0
+            y = 0
+            w = 160
+            h = 120
+
+            [binaries]
+
+            [audio]
+            enabled = true
+            send_mic_to_peers = true
+            receive_peer_audio = false
+        "#;
+        let c: Config = toml::from_str(legacy).expect("legacy audio config still parses");
+        assert!(c.audio.enabled);
     }
 }

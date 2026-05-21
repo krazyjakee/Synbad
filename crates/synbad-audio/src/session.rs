@@ -282,17 +282,20 @@ impl AudioSession {
 }
 
 fn peer_wants_send(cfg: &AudioConfig, peer: &str) -> bool {
+    // No per-peer override = bidirectional default whenever the bridge
+    // is enabled. The bridge would never have started this session if
+    // `enabled` were false, so we don't double-check it here.
     cfg.per_peer
         .get(peer)
         .map(|p| p.enabled && p.send_to_peer)
-        .unwrap_or(cfg.send_mic_to_peers)
+        .unwrap_or(true)
 }
 
 fn peer_wants_recv(cfg: &AudioConfig, peer: &str) -> bool {
     cfg.per_peer
         .get(peer)
         .map(|p| p.enabled && p.receive_from_peer)
-        .unwrap_or(cfg.receive_peer_audio)
+        .unwrap_or(true)
 }
 
 fn install_ice_handler(

@@ -105,18 +105,20 @@ The `[audio]` section in `synbad.toml`:
 enabled = true
 input_device = "Built-in Microphone"   # or omit for OS default
 output_device = "Built-in Speakers"    # or omit for OS default
-send_mic_to_peers = true
-receive_peer_audio = true
 signal_port = 24852
 
+# Optional per-peer override. Absent = bidirectional default whenever
+# `enabled = true`. Useful for muting one direction (or the whole link)
+# for a specific peer without changing the master switch.
 [audio.per_peer."peer-uuid-abc"]
 enabled = true
 send_to_peer = true
 receive_from_peer = false
 ```
 
-Toggling `enabled` requires a daemon restart — the listener and bridge are
-only built at startup. Device picks and the per-peer maps reload live.
+`enabled` is hot-reloadable — flipping it from the GUI brings the
+listener and bridge up (or tears them down) live, no restart needed.
+Device picks and the per-peer map also reload live.
 
 ## Platform notes
 
@@ -161,7 +163,7 @@ The audio path inherits the existing pairing/trust model:
   seconds (the next signaling read on the now-broken trust returns an
   error and the bridge tears the session down).
 - No microphone audio is sent before the user has explicitly enabled
-  `send_mic_to_peers` and confirmed the pairing.
+  the audio bridge (`[audio] enabled = true`) and confirmed the pairing.
 
 ## Implementation map
 

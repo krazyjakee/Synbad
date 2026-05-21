@@ -568,10 +568,17 @@ impl Supervisor {
             A::SessionClosed { peer } => {
                 self.audio_live.remove(&peer);
                 tracing::debug!(peer = %peer, "audio session closed; reconcile will retry");
-                // Don't surface as an IPC event — the GUI already sees
-                // the session disappear from the next `AudioStatus`
-                // snapshot, and a transient close that immediately
-                // reconnects shouldn't generate a flash of error noise.
+                // Tell the GUI to drop the row. The GUI's per-peer
+                // status table is push-driven (the lazy `GetAudioStatus`
+                // only fires on tab open), so without this signal a
+                // stale "connected" entry would stick around until the
+                // user restarts the app. The reconcile loop will redial
+                // shortly if the peer is still trusted and visible —
+                // when that session comes up a fresh `PeerStatus` will
+                // repopulate the row.
+                let _ = self
+                    .events
+                    .send(Event::AudioPeerRemoved { machine_id: peer });
             }
         }
     }

@@ -140,6 +140,9 @@ pub enum Update {
     AudioDevicesChanged,
     /// Per-peer audio session status update.
     AudioPeerStatus(PeerAudioStatus),
+    /// Peer's audio session ended — the GUI should drop its row from
+    /// the per-peer status table.
+    AudioPeerRemoved(String),
     /// Audio subsystem error. `peer` is `None` for global failures.
     AudioError {
         peer: Option<String>,
@@ -373,6 +376,9 @@ fn event_loop(
                                 Event::AudioDevicesChanged => Update::AudioDevicesChanged,
                                 Event::AudioPeerStatus { status } => {
                                     Update::AudioPeerStatus(status)
+                                }
+                                Event::AudioPeerRemoved { machine_id } => {
+                                    Update::AudioPeerRemoved(machine_id)
                                 }
                                 Event::AudioError { peer, message } => {
                                     Update::AudioError { peer, message }
