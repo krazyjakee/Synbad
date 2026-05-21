@@ -187,10 +187,7 @@ impl SynbadApp {
                 .iter()
                 .filter(|(id, _)| !self.trusted_peers.contains_key(*id))
                 .count();
-            ui.label(format!(
-                "{} paired ({} online)",
-                paired, online,
-            ));
+            ui.label(format!("{} paired ({} online)", paired, online,));
             if unverified > 0 {
                 ui.label(
                     egui::RichText::new(format!(
@@ -201,8 +198,7 @@ impl SynbadApp {
                 );
             } else if paired == 0 {
                 ui.label(
-                    egui::RichText::new("No peers yet. Start synbad on another machine.")
-                        .weak(),
+                    egui::RichText::new("No peers yet. Start synbad on another machine.").weak(),
                 );
             }
         });
@@ -253,7 +249,11 @@ impl SynbadApp {
                     egui::RichText::new(format!(
                         "Syncing with {} peer{}…",
                         self.active_syncs.len(),
-                        if self.active_syncs.len() == 1 { "" } else { "s" }
+                        if self.active_syncs.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
                     ))
                     .color(egui::Color32::LIGHT_BLUE),
                 );
@@ -265,10 +265,7 @@ impl SynbadApp {
                 };
                 ui.label(egui::RichText::new(&s.message).color(colour));
             } else if self.trusted_peers.is_empty() {
-                ui.label(
-                    egui::RichText::new("Pair a peer to start syncing layout edits.")
-                        .weak(),
-                );
+                ui.label(egui::RichText::new("Pair a peer to start syncing layout edits.").weak());
             } else {
                 ui.label(egui::RichText::new("Idle — layout is in sync.").weak());
             }
@@ -1073,4 +1070,3 @@ pub(super) fn state_chip(s: &DaemonState, connected: bool) -> (egui::Color32, St
         ),
     }
 }
-
