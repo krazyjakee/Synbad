@@ -14,8 +14,7 @@
 //!
 //! Signaling (SDP offer/answer + ICE) runs over an authenticated
 //! [`synbad_crypto::CipherStream`] on its own TCP port — the same pattern
-//! `synbad-sync` uses for config replication, with its own protocol domain
-//! (`b"synbad-audio-v1"`).
+//! `synbad-sync` uses for config replication.
 //!
 //! ## Public entry point
 //!
@@ -34,5 +33,5 @@ pub mod session;
 
 pub use bridge::{peer_audio_active, AudioBridge, AudioBridgeHandle, AudioCommand, AudioEvent};
 pub use errors::AudioError;
-pub use protocol::{AudioSignal, SIGNAL_DOMAIN};
+pub use protocol::AudioSignal;
 pub use session::SessionRole;

@@ -16,11 +16,6 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Domain string mixed into the signing transcript and used as the
-/// CipherStream's protocol identifier. Distinct from `synbad-sync-v1`
-/// so the two protocols cannot be confused on a misconnected port.
-pub const SIGNAL_DOMAIN: &[u8] = b"synbad-audio-v1";
-
 /// One signaling message. The variants line up with WebRTC's standard
 /// JSEP exchange.
 #[derive(Debug, Clone, Serialize, Deserialize)]

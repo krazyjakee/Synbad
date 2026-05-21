@@ -173,8 +173,9 @@ impl Supervisor {
 
     /// Update the audio sub-section of the config. Toggling
     /// `audio.enabled` live is *not* supported in v1 — the listener and
-    /// bridge are only built at startup. We log a warning when the flag
-    /// flips so the user knows a restart is needed.
+    /// bridge are only built at startup. We surface this to the GUI as an
+    /// AudioError so the user gets immediate feedback rather than a
+    /// silently-stored toggle that does nothing until restart.
     async fn update_audio_config(
         &mut self,
         audio: synbad_config::AudioConfig,
@@ -188,6 +189,12 @@ impl Supervisor {
                 to = audio.enabled,
                 "audio.enabled toggled — a daemon restart is required for the change to take effect"
             );
+            let _ = self.events.send(Event::AudioError {
+                peer: None,
+                message: "Audio enabled was changed — restart the Synbad daemon for the new \
+                          setting to take effect."
+                    .into(),
+            });
         }
         // Push the live bridge a Reconfigure so device picks / per-peer
         // toggles take effect immediately. enabled changes still need a

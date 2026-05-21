@@ -441,38 +441,59 @@ impl SynbadApp {
                 }
                 ui.end_row();
 
+                // Routing toggles + device pickers are no-ops with the
+                // master switch off; gray them out so the disabled state
+                // matches the runtime behavior.
+                let active = audio.enabled;
+
                 ui.label("Send local mic to peers");
-                if ui.checkbox(&mut audio.send_mic_to_peers, "").changed() {
+                if ui
+                    .add_enabled(
+                        active,
+                        egui::Checkbox::new(&mut audio.send_mic_to_peers, ""),
+                    )
+                    .changed()
+                {
                     audio_changed = true;
                 }
                 ui.end_row();
 
                 ui.label("Play peer audio locally");
-                if ui.checkbox(&mut audio.receive_peer_audio, "").changed() {
+                if ui
+                    .add_enabled(
+                        active,
+                        egui::Checkbox::new(&mut audio.receive_peer_audio, ""),
+                    )
+                    .changed()
+                {
                     audio_changed = true;
                 }
                 ui.end_row();
 
                 ui.label("Input device");
-                if device_combo(
-                    ui,
-                    "audio-input",
-                    &self.audio_input_devices,
-                    &mut audio.input_device,
-                ) {
-                    audio_changed = true;
-                }
+                ui.add_enabled_ui(active, |ui| {
+                    if device_combo(
+                        ui,
+                        "audio-input",
+                        &self.audio_input_devices,
+                        &mut audio.input_device,
+                    ) {
+                        audio_changed = true;
+                    }
+                });
                 ui.end_row();
 
                 ui.label("Output device");
-                if device_combo(
-                    ui,
-                    "audio-output",
-                    &self.audio_output_devices,
-                    &mut audio.output_device,
-                ) {
-                    audio_changed = true;
-                }
+                ui.add_enabled_ui(active, |ui| {
+                    if device_combo(
+                        ui,
+                        "audio-output",
+                        &self.audio_output_devices,
+                        &mut audio.output_device,
+                    ) {
+                        audio_changed = true;
+                    }
+                });
                 ui.end_row();
 
                 ui.label("Signaling port");
@@ -500,14 +521,16 @@ impl SynbadApp {
         if self.audio_peer_status.is_empty() {
             ui.label("No active audio sessions.");
         } else {
+            // RTT is plumbed through the IPC type but the bridge doesn't
+            // surface RTCP receiver-report numbers yet, so it's omitted
+            // here to avoid a column that's always "—".
             egui::Grid::new("audio-peer-status")
-                .num_columns(5)
+                .num_columns(4)
                 .striped(true)
                 .show(ui, |ui| {
                     ui.label("Peer");
                     ui.label("→ peer");
                     ui.label("← peer");
-                    ui.label("RTT");
                     ui.label("Error");
                     ui.end_row();
                     for status in self.audio_peer_status.values() {
@@ -518,12 +541,6 @@ impl SynbadApp {
                         } else {
                             "—"
                         });
-                        ui.label(
-                            status
-                                .rtt_ms
-                                .map(|r| format!("{r} ms"))
-                                .unwrap_or_else(|| "—".into()),
-                        );
                         ui.label(status.last_error.clone().unwrap_or_default());
                         ui.end_row();
                     }
