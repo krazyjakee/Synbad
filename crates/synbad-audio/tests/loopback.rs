@@ -45,15 +45,13 @@ const RX_DEADLINE: Duration = Duration::from_secs(15);
 /// outbound RTP timestamps look identical to a live capture.
 const FRAME_INTERVAL: Duration = Duration::from_millis(20);
 
-// Currently FAILS — reproduces a webrtc-rs 0.17 SRTP key derivation
-// bug that we haven't been able to work around from the outside (see
-// the longer commentary at the top of this file and in
-// `session::start_inner`). Marked `#[ignore]` so `cargo test` stays
-// green; run explicitly with
-// `cargo test -p synbad-audio --test loopback -- --ignored --nocapture`
-// when iterating on a fix.
+// End-to-end regression test for the audio bridge. Previously
+// failed against webrtc-rs 0.17 because of a DTLS-SRTP key
+// derivation bug; the Phase 2 port to str0m fixed that root cause,
+// so this test now PASSES and stays in the default `cargo test`
+// run. If it starts failing again, the bridge is broken at the
+// `AudioSession` layer, not at the codec or transport.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "reproduces an unresolved webrtc-rs 0.17 SRTP bug; run explicitly with --ignored"]
 async fn loopback_audio_flows_bidirectionally() {
     // Subscriber so a failure prints the webrtc-rs logs (including the
     // suspected SRTP `aead::Error`). Quiet by default; turn up with

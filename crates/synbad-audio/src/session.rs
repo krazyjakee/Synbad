@@ -1,68 +1,87 @@
 //! Per-peer audio session state machine.
 //!
 //! One session per paired peer with audio enabled. The session owns:
-//! - the WebRTC [`RTCPeerConnection`]
-//! - the local capture stream (mic or loopback) feeding into the
-//!   outbound RTP track
-//! - the local playback stream draining the inbound RTP track
+//! - a [`str0m::Rtc`] driving WebRTC (DTLS-SRTP, ICE, RTP framing)
+//! - a [`tokio::net::UdpSocket`] for the media path
+//! - the local capture stream (cpal mic or loopback) feeding into the
+//!   outbound Opus encoder
+//! - the local playback stream draining inbound Opus frames
 //! - the [`synbad_crypto::CipherStream`] (split into read + write halves)
-//!   carrying signaling messages
+//!   carrying SDP offer/answer signaling
 //!
 //! ## Roles
 //!
 //! Exactly one peer in a pair drives the SDP offer/answer. We pick by
 //! TCP direction: the side that dials is the [`SessionRole::Offerer`]
 //! and the side that accepts is the [`SessionRole::Answerer`]. The
-//! supervisor enforces a glare rule (only dial when our `machine_id` is
-//! lexicographically smaller than the peer's) so two peers never both
-//! end up as offerer.
+//! supervisor enforces a glare rule (only dial when our `machine_id`
+//! is lexicographically smaller than the peer's) so two peers never
+//! both end up as offerer.
 //!
-//! ## Concurrency
+//! ## Driver loop
 //!
-//! The session task spawns three sub-tasks:
+//! str0m is sans-I/O — it never touches the network or a clock on its
+//! own, just transforms `Input` events into `Output` events. The
+//! driver task is the I/O wrapper:
 //!
-//! 1. **Signaling writer** — owns the [`synbad_crypto::CipherWriter`]
-//!    half and drains an internal `mpsc<AudioSignal>` queue. The PC's
-//!    `on_ice_candidate` callback pushes into the queue directly.
-//! 2. **Capture pump** — drains the mpsc from `capture::start_capture`
-//!    and writes one RTP packet per 20 ms PCM frame to the outbound
-//!    track (with L16 byte-swap from host-LE to wire-BE).
-//! 3. **Inbound pump** (per remote track) — spawned from
-//!    `pc.on_track`, reads RTP packets, byte-swaps BE → host-LE, and
-//!    pushes mono `i16` frames into the playback sender.
+//! 1. Initial handshake: do the SDP offer/answer over the cipher
+//!    stream. str0m bakes ICE candidates into the SDP itself
+//!    (`add_local_candidate` before `sdp_api().apply()`), so no
+//!    separate trickle is needed.
+//! 2. Main loop: `tokio::select!` over UDP recv, capture frame
+//!    arrival, scheduled timeout, signal-stream read, and the close
+//!    signal. After each input, drain `Rtc::poll_output` until it
+//!    returns `Timeout`, dispatching `Transmit` to the UDP socket and
+//!    `Event::MediaData` to the Opus decoder.
 //!
-//! The main session task drives negotiation: offer/answer over the
-//! [`synbad_crypto::CipherReader`] half, then loops handling inbound
-//! signals (ICE candidates, IceComplete, Close).
+//! ## Why str0m
+//!
+//! v0.1.4 used webrtc-rs 0.17, which we found derives mismatched
+//! DTLS-SRTP keys in our two-PC scenario — every inbound packet
+//! failed AEAD/HMAC authentication. The Phase 1 validation test
+//! (`tests/str0m_validation.rs`) proved str0m completes the same
+//! bidirectional bring-up cleanly. Phase 2 (this file plus
+//! `rtc.rs` / `protocol.rs`) is the full port.
 
 #![allow(clippy::result_large_err)] // AudioError carries Strings; size dominates.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use cpal::Stream;
+use str0m::change::{SdpAnswer, SdpOffer};
+use str0m::format::{Codec, PayloadParams};
+use str0m::media::{Direction, MediaKind, Mid, Pt};
+use str0m::net::{Protocol, Receive};
+use str0m::{Candidate, Event, Input, Output, Rtc};
 use synbad_config::AudioConfig;
 use synbad_crypto::{CipherReader, CipherStream, CipherWriter};
 use synbad_ipc::PeerAudioStatus;
-use tokio::sync::mpsc;
+use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::RTCPeerConnection;
 
-use crate::capture::{self, PcmFrame, FRAME_SAMPLES};
+use crate::capture::{self, PcmFrame};
 use crate::errors::AudioError;
-use crate::playback;
+use crate::playback as playback_mod;
 use crate::protocol::AudioSignal;
-use crate::rtc::{self, L16_PAYLOAD_TYPE, SAMPLES_PER_PACKET};
+use crate::rtc::{
+    build_opus_decoder, build_opus_encoder, build_rtc, FRAME_SAMPLES, OPUS_MAX_DECODE_SAMPLES,
+};
 
-/// Outbound queue depth for signals heading to the peer. Trickled ICE
-/// candidates appear in bursts of a few; 32 is comfortably above the
-/// realistic peak.
-const SIGNAL_QUEUE_DEPTH: usize = 32;
+/// Maximum Opus encoded packet we'll ever produce. 4000 bytes is well
+/// above libopus's hard limit (~1275 at 510 kbps for 20 ms frames);
+/// we allocate this once and reuse it across encode calls.
+const OPUS_ENCODE_BUF: usize = 4000;
+
+/// MTU-ish allocation for the UDP recv buffer. WebRTC media packets
+/// rarely exceed 1200 bytes once DTLS overhead is included, but we
+/// pad for jumbo frames on LANs that allow them.
+const UDP_RECV_BUF: usize = 2000;
 
 /// Which side of a session this is. Determines who creates the SDP
 /// offer vs. who replies with the answer.
@@ -76,65 +95,64 @@ pub enum SessionRole {
 
 /// A single negotiated audio link with one peer.
 ///
-/// Dropping the [`AudioSession`] aborts every owned task and drops the
-/// owned cpal streams, which tears down the PeerConnection's interceptor
-/// pipeline and stops audio I/O. The struct deliberately holds the
-/// `Stream` handles rather than passing them to other tasks because cpal
-/// streams aren't `Send` on every platform.
+/// Dropping the [`AudioSession`] aborts every owned task and drops
+/// the cpal streams, which tears down the cpal callbacks and stops
+/// audio I/O. The struct deliberately holds the `Stream` handles
+/// rather than passing them to other tasks because cpal streams
+/// aren't `Send` on every platform.
 pub struct AudioSession {
     pub session_id: String,
     pub peer_machine_id: String,
-    peer_connection: Arc<RTCPeerConnection>,
+    /// Sender used to ask the driver to tear down gracefully. The
+    /// driver also exits if `close_tx` is dropped (channel closes),
+    /// so we don't have to call this — `Drop` is sufficient.
+    close_tx: Option<oneshot::Sender<()>>,
     /// Held to keep the cpal capture callback running. `Stream` isn't
     /// `Send` on all hosts so it stays on the supervisor's task.
     _capture_stream: Option<Stream>,
     /// Held to keep the cpal playback callback running.
     _playback_stream: Option<Stream>,
-    /// Held so the playback sink remains writable for the on_track pump
-    /// installed on the PeerConnection.
+    /// Held so the playback sink remains writable for the driver task.
     _playback_keepalive: Option<mpsc::Sender<PcmFrame>>,
-    /// Live status shared with the per-session sub-tasks. Updated by the
-    /// capture pump on first send, the inbound pump on first receive, and
-    /// the PeerConnection state-change handler. Read by the bridge in
-    /// `AudioCommand::QueryStatus`.
+    /// Live status shared with the driver task. Updated as media flows
+    /// in either direction and when the underlying ICE/DTLS state
+    /// changes. Read by the bridge in `AudioCommand::QueryStatus`.
     status: Arc<StdMutex<PeerAudioStatus>>,
-    /// Aborted on drop.
+    /// Driver task handle; aborted on drop.
     tasks: Vec<JoinHandle<()>>,
 }
 
 impl Drop for AudioSession {
     fn drop(&mut self) {
+        // Sending on close_tx is best-effort — if the driver has
+        // already exited the receive side is gone, which is fine.
+        if let Some(tx) = self.close_tx.take() {
+            let _ = tx.send(());
+        }
         for t in self.tasks.drain(..) {
             t.abort();
         }
     }
 }
 
-/// Internal bundle of "where do PCM frames come from / where do they go"
-/// passed into [`AudioSession::start_inner`]. Production builds this from
-/// cpal in [`AudioSession::start`]; integration tests build it from in-memory
-/// `mpsc` channels via [`AudioSession::start_for_test`].
+/// Internal bundle of "where do PCM frames come from / where do they
+/// go" passed into [`AudioSession::start_inner`]. Production builds
+/// this from cpal in [`AudioSession::start`]; integration tests build
+/// it from in-memory `mpsc` channels via
+/// [`AudioSession::start_for_test`].
 struct SessionIo {
-    /// `None` means "this side has no microphone to send" — the capture
-    /// pump task isn't spawned and no outbound RTP packets are written.
     capture_rx: Option<mpsc::Receiver<PcmFrame>>,
-    /// `None` means "drop any audio the peer sends us" — `on_track` is
-    /// still installed implicitly via the absence path below, but the
-    /// inbound pump isn't wired to a sink.
     playback_tx: Option<mpsc::Sender<PcmFrame>>,
-    /// cpal `Stream` handle kept alive for the session's lifetime. cpal
-    /// stops capturing the moment this drops. `None` in tests.
     capture_stream: Option<Stream>,
-    /// As above, for the playback side.
     playback_stream: Option<Stream>,
 }
 
 impl AudioSession {
     /// Start a fully-driven session.
     ///
-    /// Builds the PeerConnection, attaches the outbound L16 track, opens
-    /// the local capture and playback streams, and spawns the
-    /// negotiation driver. The returned [`AudioSession`] keeps every
+    /// Builds the str0m `Rtc`, binds a UDP socket for the media path,
+    /// opens the local capture and playback cpal streams, and spawns
+    /// the driver task. The returned [`AudioSession`] keeps every
     /// owned resource alive; drop it to tear the link down.
     pub async fn start(
         peer_machine_id: String,
@@ -143,10 +161,6 @@ impl AudioSession {
         role: SessionRole,
         events: mpsc::Sender<crate::bridge::AudioEvent>,
     ) -> Result<Self, AudioError> {
-        // Local capture is only opened if this peer is supposed to send
-        // audio (either because the global toggle is on or this peer
-        // has an override). Skipping the open keeps headless / mic-less
-        // hosts quiet on the answerer side.
         let want_send = peer_wants_send(cfg, &peer_machine_id);
         let (capture_stream, capture_rx) = if want_send {
             match capture::start_capture(cfg.input_device.as_deref()) {
@@ -166,12 +180,9 @@ impl AudioSession {
             (None, None)
         };
 
-        // Inbound: PC `on_track` fires once the answerer's track is
-        // negotiated. We open the playback stream up-front so the
-        // first packets aren't dropped by an unbuilt sink.
         let want_recv = peer_wants_recv(cfg, &peer_machine_id);
         let (playback_stream, playback_tx) = if want_recv {
-            match playback::start_playback(cfg.output_device.as_deref()) {
+            match playback_mod::start_playback(cfg.output_device.as_deref()) {
                 Ok((s, tx)) => (Some(s), Some(tx)),
                 Err(e) => {
                     warn!(?e, "audio playback unavailable; receive will be discarded");
@@ -203,17 +214,11 @@ impl AudioSession {
         .await
     }
 
-    /// Test-only entry point that hands in `mpsc` channels for capture
-    /// and playback instead of opening cpal devices. The loopback
-    /// integration test (`tests/loopback.rs`) uses this to drive two
+    /// Test-only entry point that hands in `mpsc` channels for
+    /// capture and playback instead of opening cpal devices. The
+    /// loopback integration test uses this to drive two
     /// `AudioSession`s on one machine without touching the host's
-    /// microphone or speakers — feeds synthetic PCM into `capture_rx`
-    /// and asserts on the frames that arrive at `playback_tx`.
-    ///
-    /// Not intended for production callers. Marked `#[doc(hidden)]` so
-    /// it doesn't pollute the public docs; kept `pub` only because
-    /// integration tests live outside the crate's `#[cfg(test)]`
-    /// boundary.
+    /// microphone or speakers.
     #[doc(hidden)]
     pub async fn start_for_test(
         peer_machine_id: String,
@@ -253,8 +258,32 @@ impl AudioSession {
             "audio session starting"
         );
 
-        let api = rtc::build_api()?;
-        let pc = rtc::new_peer_connection(&api).await?;
+        // Figure out which local IP to use for the media path. The
+        // signaling TCP already crossed the LAN successfully — its
+        // local endpoint is by definition a routable interface on
+        // this host. Falling back to the unspecified address would
+        // be fine for binding but doesn't make for a useful ICE host
+        // candidate.
+        let signal_local = signal
+            .local_addr()
+            .map_err(|e| AudioError::WebRtc(format!("signal local_addr: {e}")))?;
+
+        // Bind a UDP socket on the same interface, ephemeral port.
+        // We don't reuse the signaling TCP port — STUN/DTLS-SRTP
+        // multiplex on a different transport.
+        let udp = UdpSocket::bind((signal_local.ip(), 0))
+            .await
+            .map_err(|e| AudioError::WebRtc(format!("bind media udp: {e}")))?;
+        let media_addr = udp
+            .local_addr()
+            .map_err(|e| AudioError::WebRtc(format!("media local_addr: {e}")))?;
+
+        debug!(
+            peer = %peer_machine_id,
+            session = %session_id,
+            %media_addr,
+            "media socket bound"
+        );
 
         let status = Arc::new(StdMutex::new(PeerAudioStatus {
             machine_id: peer_machine_id.clone(),
@@ -265,8 +294,6 @@ impl AudioSession {
             last_error: None,
         }));
 
-        install_pc_state_handler(&pc, Arc::clone(&status), events.clone());
-
         let SessionIo {
             capture_rx,
             playback_tx,
@@ -274,121 +301,66 @@ impl AudioSession {
             playback_stream,
         } = io;
 
-        // Outbound L16 track. Added to the PeerConnection at different
-        // points depending on role (see below) — webrtc-rs 0.17's
-        // SRTP/transceiver state goes sideways if both sides add a
-        // track *before* SDP negotiation starts: the answerer ends up
-        // with two transceivers (one from its pre-negotiation
-        // `add_track`, one created from the offer's m-line), the
-        // negotiated answer only references the latter, and SRTP keys
-        // get derived against the wrong context. The symptom is
-        // `webrtc_srtp: failed to verify rtp auth tag` immediately
-        // after `peer_connection_state changed: connected`, with
-        // outbound packets accepted but every inbound packet dropped.
-        //
-        // The fix is the canonical WebRTC pattern: the offerer adds
-        // its track *before* `create_offer` so the offer carries a
-        // sendrecv m-line; the answerer adds its track *after*
-        // `set_remote_description(offer)` so the existing offer-
-        // created transceiver is reused instead of orphaned. The
-        // driver task owns whichever call applies for the role.
-        let outbound_track = rtc::build_outbound_track();
+        let (close_tx, close_rx) = oneshot::channel::<()>();
 
-        // Split the signaling channel so the writer task can drain the
-        // outgoing queue while the driver task blocks on inbound reads
-        // — they touch different halves of the underlying TCP stream,
-        // so neither can cancel-bug the other.
-        let (signal_reader, signal_writer) = signal.split();
-        let (out_tx, out_rx) = mpsc::channel::<AudioSignal>(SIGNAL_QUEUE_DEPTH);
-
-        // Hook the PC's ICE gatherer to push every local candidate into
-        // the outbound queue. A `None` candidate marks gathering complete
-        // per RFC 8838.
-        install_ice_handler(&pc, &session_id, out_tx.clone());
-
-        // Hook on_track to spawn an inbound-RTP pump per remote track.
-        if let Some(tx) = playback_tx.clone() {
-            install_on_track(&pc, tx, &session_id, Arc::clone(&status), events.clone());
-        }
-
-        // Spawn the writer task. It owns the CipherWriter and quits when
-        // the outbound queue is closed.
-        let writer_task = tokio::spawn(signal_writer_task(
-            signal_writer,
-            out_rx,
-            peer_machine_id.clone(),
-        ));
-
-        // Spawn the capture pump if we have a capture source. Safe to
-        // start before `add_track` lands on the answerer side: the
-        // pump's `write_rtp` calls return Err ("no bindings") until
-        // the track is bound to a negotiated transceiver, and that
-        // error is already swallowed at debug level — `sending_to_peer`
-        // only flips to true on the first Ok write.
-        let capture_task = capture_rx.map(|rx| {
-            tokio::spawn(capture_pump_task(
-                rx,
-                outbound_track.clone(),
-                peer_machine_id.clone(),
-                Arc::clone(&status),
-                events.clone(),
-            ))
-        });
-
-        // Spawn the negotiation driver task — runs the offer/answer
-        // dance and then loops on inbound signals. The driver owns the
-        // role-correct `add_track` call (see commentary above).
-        let driver_task = tokio::spawn(driver_task(
+        let driver = tokio::spawn(driver_task(
             session_id.clone(),
             peer_machine_id.clone(),
-            pc.clone(),
-            outbound_track.clone(),
-            signal_reader,
-            out_tx,
             role,
+            udp,
+            media_addr,
+            signal,
+            capture_rx,
+            playback_tx.clone(),
+            events.clone(),
+            Arc::clone(&status),
+            close_rx,
         ));
-
-        let mut tasks = vec![writer_task, driver_task];
-        if let Some(t) = capture_task {
-            tasks.push(t);
-        }
 
         Ok(Self {
             session_id,
             peer_machine_id,
-            peer_connection: pc,
+            close_tx: Some(close_tx),
             _capture_stream: capture_stream,
             _playback_stream: playback_stream,
             _playback_keepalive: playback_tx,
             status,
-            tasks,
+            tasks: vec![driver],
         })
     }
 
-    /// Snapshot of this session's current peer status. Cheap (one lock +
-    /// clone) so it's safe to call per-`QueryStatus`.
+    /// Snapshot of this session's current peer status. Cheap (one
+    /// lock + clone) so it's safe to call per `QueryStatus`.
     pub fn status(&self) -> PeerAudioStatus {
         self.status.lock().expect("peer status poisoned").clone()
     }
 
-    /// Tear down the PeerConnection and stop both audio streams.
-    pub async fn close(self, reason: Option<String>) {
+    /// Tear down the session. The driver task observes `close_tx`
+    /// dropping, drains any in-flight str0m output, and exits.
+    pub async fn close(mut self, reason: Option<String>) {
         debug!(
             peer = %self.peer_machine_id,
             session = %self.session_id,
             reason = ?reason,
             "audio session closing"
         );
-        // Closing the PC stops the interceptor pipeline; tasks notice
-        // their channels close and exit; Drop aborts whatever remains.
-        let _ = self.peer_connection.close().await;
+        // Best-effort signal; if the driver already exited the
+        // receive side is gone, which is fine.
+        if let Some(tx) = self.close_tx.take() {
+            let _ = tx.send(());
+        }
+        // `Drop` will abort the task; await briefly so any flushable
+        // output (RTCP BYE, ICE close) actually makes it onto the
+        // wire before we tear the UDP socket down.
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
 fn peer_wants_send(cfg: &AudioConfig, peer: &str) -> bool {
-    // No per-peer override = bidirectional default whenever the bridge
-    // is enabled. The bridge would never have started this session if
-    // `enabled` were false, so we don't double-check it here.
+    // No per-peer override = bidirectional default whenever the
+    // bridge is enabled. The bridge would never have started this
+    // session if `enabled` were false, so we don't double-check it
+    // here.
     cfg.per_peer
         .get(peer)
         .map(|p| p.enabled && p.send_to_peer)
@@ -402,136 +374,9 @@ fn peer_wants_recv(cfg: &AudioConfig, peer: &str) -> bool {
         .unwrap_or(true)
 }
 
-fn install_ice_handler(
-    pc: &Arc<RTCPeerConnection>,
-    session_id: &str,
-    out_tx: mpsc::Sender<AudioSignal>,
-) {
-    let sid = session_id.to_string();
-    pc.on_ice_candidate(Box::new(move |candidate| {
-        let sid = sid.clone();
-        let out_tx = out_tx.clone();
-        Box::pin(async move {
-            let signal = match candidate {
-                Some(c) => match c.to_json() {
-                    Ok(init) => AudioSignal::IceCandidate {
-                        session_id: sid,
-                        candidate: init.candidate,
-                        sdp_mid: init.sdp_mid,
-                        sdp_mline_index: init.sdp_mline_index,
-                    },
-                    Err(e) => {
-                        warn!(?e, "ICE candidate serialise failed");
-                        return;
-                    }
-                },
-                None => AudioSignal::IceComplete { session_id: sid },
-            };
-            if out_tx.send(signal).await.is_err() {
-                debug!("outbound signal queue closed; ICE handler dropping candidate");
-            }
-        })
-    }));
-}
-
-fn install_on_track(
-    pc: &Arc<RTCPeerConnection>,
-    playback_tx: mpsc::Sender<PcmFrame>,
-    session_id: &str,
-    status: Arc<StdMutex<PeerAudioStatus>>,
-    events: mpsc::Sender<crate::bridge::AudioEvent>,
-) {
-    let session_id = session_id.to_string();
-    pc.on_track(Box::new(move |track, _receiver, _transceiver| {
-        let playback_tx = playback_tx.clone();
-        let session_id = session_id.clone();
-        let status = Arc::clone(&status);
-        let events = events.clone();
-        Box::pin(async move {
-            if track.payload_type() != L16_PAYLOAD_TYPE {
-                warn!(
-                    pt = track.payload_type(),
-                    session = %session_id,
-                    "remote track has unexpected payload type"
-                );
-                return;
-            }
-            inbound_pump(track, playback_tx, session_id, status, events).await;
-        })
-    }));
-}
-
-async fn inbound_pump(
-    track: Arc<webrtc::track::track_remote::TrackRemote>,
-    playback_tx: mpsc::Sender<PcmFrame>,
-    session_id: String,
-    status: Arc<StdMutex<PeerAudioStatus>>,
-    events: mpsc::Sender<crate::bridge::AudioEvent>,
-) {
-    debug!(session = %session_id, "inbound RTP pump started");
-    let mut first_packet = true;
-    loop {
-        match track.read_rtp().await {
-            Ok((pkt, _attrs)) => {
-                let frame = depayload_l16(&pkt.payload);
-                if frame.is_empty() {
-                    continue;
-                }
-                if first_packet {
-                    first_packet = false;
-                    update_status(&status, &events, |s| s.receiving_from_peer = true);
-                }
-                if playback_tx.send(frame).await.is_err() {
-                    break;
-                }
-            }
-            Err(e) => {
-                debug!(?e, "inbound RTP read ended");
-                break;
-            }
-        }
-    }
-    update_status(&status, &events, |s| s.receiving_from_peer = false);
-}
-
-/// Installs the PeerConnection state-change handler that mirrors transport
-/// failures into the shared status. `Connected` clears any sticky error;
-/// `Failed`/`Disconnected` set one. `Closed` zeroes the send/receive flags
-/// so the GUI can show "idle" rather than the last `true` it saw.
-fn install_pc_state_handler(
-    pc: &Arc<RTCPeerConnection>,
-    status: Arc<StdMutex<PeerAudioStatus>>,
-    events: mpsc::Sender<crate::bridge::AudioEvent>,
-) {
-    pc.on_peer_connection_state_change(Box::new(move |state| {
-        let status = Arc::clone(&status);
-        let events = events.clone();
-        Box::pin(async move {
-            debug!(?state, "audio peer connection state change");
-            update_status(&status, &events, |s| match state {
-                RTCPeerConnectionState::Connected => {
-                    s.last_error = None;
-                }
-                RTCPeerConnectionState::Failed => {
-                    s.last_error = Some("connection failed".to_string());
-                }
-                RTCPeerConnectionState::Disconnected => {
-                    s.last_error = Some("connection disconnected".to_string());
-                }
-                RTCPeerConnectionState::Closed => {
-                    s.sending_to_peer = false;
-                    s.receiving_from_peer = false;
-                }
-                // New / Connecting / Unspecified: no user-visible change.
-                _ => {}
-            });
-        })
-    }));
-}
-
 /// Mutate the shared status and, if the mutation actually changed
-/// something, push a `PeerStatus` event onto the bridge's event channel.
-/// `try_send` so a clogged channel can't stall a callback task.
+/// something, push a `PeerStatus` event onto the bridge's event
+/// channel. `try_send` so a clogged channel can't stall the driver.
 fn update_status<F>(
     status: &Arc<StdMutex<PeerAudioStatus>>,
     events: &mpsc::Sender<crate::bridge::AudioEvent>,
@@ -553,292 +398,376 @@ fn update_status<F>(
     }
 }
 
-/// Decode RFC 3551 §4.5.7 L16: payload is big-endian i16 samples. We
-/// convert to little-endian `i16` for downstream cpal playback.
-fn depayload_l16(payload: &[u8]) -> PcmFrame {
-    let n = payload.len() / 2;
-    let mut samples = Vec::with_capacity(n);
-    for chunk in payload.chunks_exact(2) {
-        samples.push(i16::from_be_bytes([chunk[0], chunk[1]]));
-    }
-    PcmFrame::from(samples)
-}
-
-async fn signal_writer_task(
-    mut writer: CipherWriter,
-    mut queue: mpsc::Receiver<AudioSignal>,
-    peer_machine_id: String,
-) {
-    while let Some(signal) = queue.recv().await {
-        let body = match serde_json::to_vec(&signal) {
-            Ok(b) => b,
-            Err(e) => {
-                warn!(?e, peer = %peer_machine_id, "signal serialise failed");
-                continue;
-            }
-        };
-        if let Err(e) = writer.send(&body).await {
-            debug!(?e, peer = %peer_machine_id, "signaling writer ended");
-            break;
-        }
-    }
-    debug!(peer = %peer_machine_id, "signaling writer task exiting");
-}
-
-async fn capture_pump_task(
-    mut rx: mpsc::Receiver<PcmFrame>,
-    track: Arc<webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP>,
-    peer_machine_id: String,
-    status: Arc<StdMutex<PeerAudioStatus>>,
-    events: mpsc::Sender<crate::bridge::AudioEvent>,
-) {
-    // RTP sequence + timestamp need to start at random values per RFC
-    // 3550; the synchronization source (SSRC) is set by the binding
-    // when the track is bound to the PeerConnection so we leave it 0.
-    let mut sequence_number: u16 = rand::random();
-    let mut timestamp: u32 = rand::random();
-    let mut first_packet = true;
-
-    debug!(peer = %peer_machine_id, "capture pump started");
-    while let Some(frame) = rx.recv().await {
-        if frame.len() != FRAME_SAMPLES {
-            // Capture only emits exact-size frames in v1, but be
-            // defensive: skip anything else rather than ship a
-            // partial RTP packet.
-            warn!(len = frame.len(), "unexpected PCM frame size; dropping");
-            continue;
-        }
-        let payload = payload_l16(&frame);
-        let pkt = rtp::packet::Packet {
-            header: rtp::header::Header {
-                version: 2,
-                padding: false,
-                extension: false,
-                marker: false,
-                payload_type: L16_PAYLOAD_TYPE,
-                sequence_number,
-                timestamp,
-                ssrc: 0, // filled in by TrackBinding
-                csrc: Vec::new(),
-                extension_profile: 0,
-                extensions: Vec::new(),
-                extensions_padding: 0,
-            },
-            payload,
-        };
-        // `write_rtp_with_extensions` returns Err when no bindings are
-        // attached yet (pre-negotiation) — that's expected for the
-        // first few frames on the offerer side, so swallow rather than
-        // warn. We pass an empty extension list because L16 doesn't
-        // carry any header extensions.
-        match track.write_rtp_with_extensions(&pkt, &[]).await {
-            Ok(_) => {
-                if first_packet {
-                    first_packet = false;
-                    update_status(&status, &events, |s| s.sending_to_peer = true);
-                }
-            }
-            Err(e) => {
-                debug!(?e, peer = %peer_machine_id, "RTP write failed");
-            }
-        }
-        sequence_number = sequence_number.wrapping_add(1);
-        timestamp = timestamp.wrapping_add(SAMPLES_PER_PACKET);
-    }
-    update_status(&status, &events, |s| s.sending_to_peer = false);
-    debug!(peer = %peer_machine_id, "capture pump exiting");
-}
-
-/// Encode 960 little-endian `i16` PCM samples as an L16 RTP payload
-/// (big-endian on the wire per RFC 3551 §4.5.7).
-fn payload_l16(frame: &[i16]) -> Bytes {
-    let mut out = Vec::with_capacity(frame.len() * 2);
-    for s in frame {
-        out.extend_from_slice(&s.to_be_bytes());
-    }
-    Bytes::from(out)
-}
-
+#[allow(clippy::too_many_arguments)]
 async fn driver_task(
     session_id: String,
     peer_machine_id: String,
-    pc: Arc<RTCPeerConnection>,
-    outbound_track: Arc<webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP>,
-    mut reader: CipherReader,
-    out_tx: mpsc::Sender<AudioSignal>,
     role: SessionRole,
+    udp: UdpSocket,
+    media_addr: SocketAddr,
+    signal: CipherStream,
+    capture_rx: Option<mpsc::Receiver<PcmFrame>>,
+    playback_tx: Option<mpsc::Sender<PcmFrame>>,
+    events: mpsc::Sender<crate::bridge::AudioEvent>,
+    status: Arc<StdMutex<PeerAudioStatus>>,
+    close_rx: oneshot::Receiver<()>,
 ) {
+    let (signal_reader, signal_writer) = signal.split();
     if let Err(e) = run_driver(
         &session_id,
         &peer_machine_id,
-        &pc,
-        &outbound_track,
-        &mut reader,
-        &out_tx,
         role,
+        udp,
+        media_addr,
+        signal_reader,
+        signal_writer,
+        capture_rx,
+        playback_tx,
+        &events,
+        &status,
+        close_rx,
     )
     .await
     {
-        warn!(peer = %peer_machine_id, session = %session_id, ?e, "audio driver ended with error");
+        warn!(
+            peer = %peer_machine_id,
+            session = %session_id,
+            ?e,
+            "audio driver ended with error"
+        );
+        let _ = events
+            .send(crate::bridge::AudioEvent::Error {
+                peer: Some(peer_machine_id),
+                message: format!("{e}"),
+            })
+            .await;
     } else {
-        debug!(peer = %peer_machine_id, session = %session_id, "audio driver ended cleanly");
+        debug!(
+            peer = %peer_machine_id,
+            session = %session_id,
+            "audio driver ended cleanly"
+        );
     }
-    // Drop out_tx so the writer task finishes. (We're holding the last
-    // clone outside the PC's ICE handler — that one gets dropped when
-    // we close the PC.)
-    let _ = pc.close().await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_driver(
     session_id: &str,
     peer_machine_id: &str,
-    pc: &Arc<RTCPeerConnection>,
-    outbound_track: &Arc<webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP>,
-    reader: &mut CipherReader,
-    out_tx: &mpsc::Sender<AudioSignal>,
     role: SessionRole,
+    udp: UdpSocket,
+    media_addr: SocketAddr,
+    mut signal_reader: CipherReader,
+    mut signal_writer: CipherWriter,
+    mut capture_rx: Option<mpsc::Receiver<PcmFrame>>,
+    playback_tx: Option<mpsc::Sender<PcmFrame>>,
+    events: &mpsc::Sender<crate::bridge::AudioEvent>,
+    status: &Arc<StdMutex<PeerAudioStatus>>,
+    mut close_rx: oneshot::Receiver<()>,
 ) -> Result<(), AudioError> {
-    match role {
+    let start = Instant::now();
+    let mut rtc = build_rtc(start);
+
+    // Add our host candidate before the SDP exchange so the offer or
+    // answer carries it inline (str0m bundles candidates into the SDP
+    // when this is set ahead of `sdp_api().apply()`).
+    let candidate = Candidate::host(media_addr, Protocol::Udp)
+        .map_err(|e| AudioError::WebRtc(format!("host candidate: {e}")))?;
+    rtc.add_local_candidate(candidate);
+
+    // SDP exchange. For the offerer, we know the mid up front
+    // (returned by `add_media`); for the answerer, str0m will emit
+    // it as a `MediaAdded` event after `accept_offer`.
+    let mut mid: Option<Mid> = match role {
         SessionRole::Offerer => {
-            // Offerer: track BEFORE the offer so the m-line is
-            // sendrecv from the moment it leaves us. webrtc-rs's
-            // create_offer reads the transceiver list to build the
-            // SDP — calling it before add_track gives a zero-m-line
-            // offer the answerer can't reply to.
-            pc.add_track(outbound_track.clone() as _)
-                .await
-                .map_err(|e| AudioError::WebRtc(format!("add outbound track: {e}")))?;
-            let offer = pc
-                .create_offer(None)
-                .await
-                .map_err(|e| AudioError::WebRtc(format!("create_offer: {e}")))?;
-            // Bundle ICE candidates into the SDP rather than trickling
-            // them as separate signals — `gathering_complete_promise()`
-            // resolves once the agent stops producing host candidates,
-            // and the local description is then a single self-contained
-            // blob with every `a=candidate:` line baked in.
-            //
-            // This matches webrtc-rs's own internal `signal_pair` test
-            // helper. Trickle-ICE works in production WebRTC stacks but
-            // is racy with webrtc-rs 0.17's DTLS/SRTP context setup:
-            // sending the offer before ICE finishes lets the answerer
-            // pre-build its DTLS half against candidates that haven't
-            // landed yet, and the SRTP context derived once everything
-            // does land has stale keying material — `peer_connection
-            // state changed: connected` immediately followed by
-            // `webrtc_srtp: failed to verify rtp auth tag` on every
-            // inbound packet. See the loopback test in
-            // `tests/loopback.rs` for a sub-10-second reproduction.
-            let mut gathering_done = pc.gathering_complete_promise().await;
-            pc.set_local_description(offer)
-                .await
-                .map_err(|e| AudioError::WebRtc(format!("set_local_description(offer): {e}")))?;
-            let _ = gathering_done.recv().await;
-            let local = pc
-                .local_description()
-                .await
-                .ok_or_else(|| AudioError::WebRtc("no local description after gather".into()))?;
-            out_tx
-                .send(AudioSignal::Offer {
+            let mut change = rtc.sdp_api();
+            let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+            let (offer, pending) = change
+                .apply()
+                .ok_or_else(|| AudioError::WebRtc("sdp_api apply() returned None".into()))?;
+            send_signal(
+                &mut signal_writer,
+                &AudioSignal::Offer {
                     session_id: session_id.to_string(),
-                    sdp: local.sdp,
-                })
-                .await
-                .map_err(|_| AudioError::SignalClosed)?;
-            wait_for_answer(reader, pc).await?;
+                    sdp: offer.to_sdp_string(),
+                },
+            )
+            .await?;
+            let answer = wait_for_answer(&mut signal_reader).await?;
+            let parsed = SdpAnswer::from_sdp_string(&answer)
+                .map_err(|e| AudioError::WebRtc(format!("parse answer: {e}")))?;
+            rtc.sdp_api()
+                .accept_answer(pending, parsed)
+                .map_err(|e| AudioError::WebRtc(format!("accept_answer: {e}")))?;
+            Some(mid)
         }
         SessionRole::Answerer => {
-            // Answerer: add the local track BEFORE processing the
-            // offer. webrtc-rs's `add_track` always creates a fresh
-            // sendrecv transceiver, and `set_remote_description` then
-            // either reuses that transceiver for the offer's m-line
-            // (good) or creates a second one alongside it (bad). The
-            // former is what we want for the answer SDP to carry both
-            // directions on one m-line — see commentary in
-            // `start_inner` for why a mismatch here surfaces as
-            // `webrtc_srtp: failed to verify rtp auth tag`.
-            pc.add_track(outbound_track.clone() as _)
-                .await
-                .map_err(|e| AudioError::WebRtc(format!("add outbound track: {e}")))?;
-            let remote_sdp = wait_for_offer(reader).await?;
-            let offer = RTCSessionDescription::offer(remote_sdp)
-                .map_err(|e| AudioError::WebRtc(format!("wrap offer: {e}")))?;
-            pc.set_remote_description(offer)
-                .await
-                .map_err(|e| AudioError::WebRtc(format!("set_remote_description(offer): {e}")))?;
-            let answer = pc
-                .create_answer(None)
-                .await
-                .map_err(|e| AudioError::WebRtc(format!("create_answer: {e}")))?;
-            let mut gathering_done = pc.gathering_complete_promise().await;
-            pc.set_local_description(answer)
-                .await
-                .map_err(|e| AudioError::WebRtc(format!("set_local_description(answer): {e}")))?;
-            let _ = gathering_done.recv().await;
-            let local = pc
-                .local_description()
-                .await
-                .ok_or_else(|| AudioError::WebRtc("no local description after gather".into()))?;
-            out_tx
-                .send(AudioSignal::Answer {
+            let offer_sdp = wait_for_offer(&mut signal_reader).await?;
+            let offer = SdpOffer::from_sdp_string(&offer_sdp)
+                .map_err(|e| AudioError::WebRtc(format!("parse offer: {e}")))?;
+            let answer = rtc
+                .sdp_api()
+                .accept_offer(offer)
+                .map_err(|e| AudioError::WebRtc(format!("accept_offer: {e}")))?;
+            send_signal(
+                &mut signal_writer,
+                &AudioSignal::Answer {
                     session_id: session_id.to_string(),
-                    sdp: local.sdp,
-                })
-                .await
-                .map_err(|_| AudioError::SignalClosed)?;
+                    sdp: answer.to_sdp_string(),
+                },
+            )
+            .await?;
+            None
         }
-    }
+    };
 
-    info!(peer = %peer_machine_id, session = %session_id, "audio negotiation complete");
+    info!(
+        peer = %peer_machine_id,
+        session = %session_id,
+        "audio negotiation complete"
+    );
 
-    // Stay in the ICE candidate exchange loop until the peer Closes the
-    // session or the channel drops.
+    // Resolve the Opus PT from the codec config. The PT is the same
+    // on both sides after SDP negotiation; we pin it now and reuse
+    // for every outbound write.
+    let opus_pt: Pt = opus_payload_type(&rtc)
+        .ok_or_else(|| AudioError::WebRtc("Opus codec missing from negotiated config".into()))?;
+
+    let mut encoder = build_opus_encoder()?;
+    let mut decoder = build_opus_decoder()?;
+    let mut encode_buf = vec![0u8; OPUS_ENCODE_BUF];
+    let mut decode_buf = vec![0i16; OPUS_MAX_DECODE_SAMPLES];
+    let mut udp_buf = vec![0u8; UDP_RECV_BUF];
+    let mut first_send = true;
+    let mut first_recv = true;
+
     loop {
-        let bytes = match reader.recv().await {
-            Ok(b) => b,
-            Err(e) => {
-                debug!(?e, "signaling reader ended");
-                return Ok(());
+        // Drain everything str0m wants to emit right now. Each
+        // iteration moves outbound packets to the UDP socket and
+        // turns inbound media into PCM on the playback queue. The
+        // loop terminates either via an `Output::Timeout` (the
+        // happy path — that timeout is what we sleep on below) or
+        // a `poll_output` error (we propagate and tear down).
+        let next_timeout: Instant = loop {
+            match rtc.poll_output() {
+                Ok(Output::Transmit(t)) => {
+                    let dest = t.destination;
+                    let contents: Vec<u8> = t.contents.into();
+                    if let Err(e) = udp.send_to(&contents, dest).await {
+                        debug!(?e, peer = %peer_machine_id, "udp send_to failed");
+                    }
+                }
+                Ok(Output::Event(ev)) => match ev {
+                    Event::Connected => {
+                        update_status(status, events, |s| {
+                            s.last_error = None;
+                        });
+                        debug!(peer = %peer_machine_id, "rtc connected");
+                    }
+                    Event::MediaAdded(m) if mid.is_none() => {
+                        mid = Some(m.mid);
+                    }
+                    Event::MediaData(data) => {
+                        if let Some(tx) = &playback_tx {
+                            match decoder.decode(&data.data, &mut decode_buf, false) {
+                                Ok(n) => {
+                                    let frame: PcmFrame = Arc::from(&decode_buf[..n]);
+                                    if first_recv {
+                                        first_recv = false;
+                                        update_status(status, events, |s| {
+                                            s.receiving_from_peer = true;
+                                        });
+                                    }
+                                    // try_send so a stalled cpal
+                                    // playback can't back up the
+                                    // whole driver loop.
+                                    let _ = tx.try_send(frame);
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        ?e,
+                                        peer = %peer_machine_id,
+                                        "opus decode failed; dropping packet"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Event::IceConnectionStateChange(state) => {
+                        debug!(?state, peer = %peer_machine_id, "ice state change");
+                        use str0m::IceConnectionState as I;
+                        match state {
+                            I::Disconnected => {
+                                update_status(status, events, |s| {
+                                    s.last_error = Some("ice disconnected".to_string());
+                                });
+                            }
+                            I::Connected | I::Completed => {
+                                update_status(status, events, |s| {
+                                    s.last_error = None;
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                },
+                Ok(Output::Timeout(t)) => break t,
+                Err(e) => {
+                    warn!(?e, peer = %peer_machine_id, "rtc poll_output error");
+                    return Err(AudioError::WebRtc(format!("poll_output: {e}")));
+                }
             }
         };
-        let signal: AudioSignal = serde_json::from_slice(&bytes)?;
-        match signal {
-            AudioSignal::IceCandidate {
-                candidate,
-                sdp_mid,
-                sdp_mline_index,
-                ..
-            } => {
-                let init = webrtc::ice_transport::ice_candidate::RTCIceCandidateInit {
-                    candidate,
-                    sdp_mid,
-                    sdp_mline_index,
-                    username_fragment: None,
-                };
-                if let Err(e) = pc.add_ice_candidate(init).await {
-                    debug!(?e, "add_ice_candidate failed");
-                }
-            }
-            AudioSignal::IceComplete { .. } => {
-                let init = webrtc::ice_transport::ice_candidate::RTCIceCandidateInit {
-                    candidate: String::new(),
-                    sdp_mid: None,
-                    sdp_mline_index: None,
-                    username_fragment: None,
-                };
-                if let Err(e) = pc.add_ice_candidate(init).await {
-                    debug!(?e, "add_ice_candidate(end-of-candidates) failed");
-                }
-            }
-            AudioSignal::Close { reason, .. } => {
-                debug!(?reason, "remote requested session close");
+
+        // Now wait for the next thing that needs the driver's
+        // attention. The select! arms cover every event source:
+        // graceful close, inbound UDP, outbound capture frame, the
+        // scheduled timeout str0m gave us, and the signaling stream
+        // (which we mostly use to detect a `Close` signal from the
+        // peer).
+        let now = Instant::now();
+        let sleep = tokio::time::sleep(next_timeout.saturating_duration_since(now));
+        tokio::pin!(sleep);
+
+        tokio::select! {
+            biased;
+
+            _ = &mut close_rx => {
+                debug!(peer = %peer_machine_id, "close requested");
+                let _ = send_signal(
+                    &mut signal_writer,
+                    &AudioSignal::Close {
+                        session_id: session_id.to_string(),
+                        reason: Some("local close".into()),
+                    },
+                ).await;
                 return Ok(());
             }
-            other => {
-                debug!(?other, "ignoring unexpected signal in steady state");
+
+            recv = udp.recv_from(&mut udp_buf) => {
+                match recv {
+                    Ok((n, src)) => {
+                        let now = Instant::now();
+                        let view = match udp_buf[..n].try_into() {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        if let Err(e) = rtc.handle_input(Input::Receive(
+                            now,
+                            Receive {
+                                proto: Protocol::Udp,
+                                source: src,
+                                destination: media_addr,
+                                contents: view,
+                            },
+                        )) {
+                            debug!(?e, "rtc handle_input(Receive) failed");
+                        }
+                    }
+                    Err(e) => {
+                        debug!(?e, "udp recv_from error");
+                    }
+                }
+            }
+
+            frame = recv_capture_frame(&mut capture_rx) => {
+                let Some(frame) = frame else {
+                    // Capture closed — keep the session up (we can
+                    // still receive even if we can't send) but stop
+                    // polling this arm.
+                    continue;
+                };
+                if frame.len() != FRAME_SAMPLES {
+                    warn!(
+                        len = frame.len(),
+                        peer = %peer_machine_id,
+                        "unexpected PCM frame size; dropping"
+                    );
+                    continue;
+                }
+                let Some(mid) = mid else {
+                    // We haven't seen MediaAdded yet — drop the
+                    // pre-negotiation frame instead of buffering.
+                    continue;
+                };
+                match encoder.encode(&frame, &mut encode_buf) {
+                    Ok(n) => {
+                        let now = Instant::now();
+                        let rtp_time = now.saturating_duration_since(start);
+                        let Some(writer) = rtc.writer(mid) else {
+                            continue;
+                        };
+                        if let Err(e) = writer.write(
+                            opus_pt,
+                            now,
+                            rtp_time.into(),
+                            encode_buf[..n].to_vec(),
+                        ) {
+                            debug!(?e, peer = %peer_machine_id, "writer.write failed");
+                        } else if first_send {
+                            first_send = false;
+                            update_status(status, events, |s| {
+                                s.sending_to_peer = true;
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        debug!(?e, "opus encode failed; dropping frame");
+                    }
+                }
+            }
+
+            _ = &mut sleep => {
+                if let Err(e) = rtc.handle_input(Input::Timeout(Instant::now())) {
+                    debug!(?e, "rtc handle_input(Timeout) failed");
+                }
+            }
+
+            sig = signal_reader.recv() => {
+                match sig {
+                    Ok(bytes) => {
+                        match serde_json::from_slice::<AudioSignal>(&bytes) {
+                            Ok(AudioSignal::Close { reason, .. }) => {
+                                debug!(?reason, "peer requested close");
+                                return Ok(());
+                            }
+                            Ok(other) => {
+                                debug!(?other, "ignoring late signaling message");
+                            }
+                            Err(e) => {
+                                debug!(?e, "signal decode failed");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!(?e, "signaling reader ended");
+                        return Ok(());
+                    }
+                }
             }
         }
     }
+}
+
+/// Polled inside `select!` to draw the next PCM frame. Returns
+/// `None` if the capture channel is closed or there's no capture at
+/// all (in which case we want the arm to pend forever rather than
+/// fire repeatedly with `None`).
+async fn recv_capture_frame(capture_rx: &mut Option<mpsc::Receiver<PcmFrame>>) -> Option<PcmFrame> {
+    match capture_rx.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn send_signal(writer: &mut CipherWriter, signal: &AudioSignal) -> Result<(), AudioError> {
+    let body = serde_json::to_vec(signal)?;
+    writer
+        .send(&body)
+        .await
+        .map_err(|_| AudioError::SignalClosed)?;
+    Ok(())
 }
 
 async fn wait_for_offer(reader: &mut CipherReader) -> Result<String, AudioError> {
@@ -854,41 +783,12 @@ async fn wait_for_offer(reader: &mut CipherReader) -> Result<String, AudioError>
     }
 }
 
-async fn wait_for_answer(
-    reader: &mut CipherReader,
-    pc: &Arc<RTCPeerConnection>,
-) -> Result<(), AudioError> {
+async fn wait_for_answer(reader: &mut CipherReader) -> Result<String, AudioError> {
     loop {
         let bytes = reader.recv().await.map_err(|_| AudioError::SignalClosed)?;
         let signal: AudioSignal = serde_json::from_slice(&bytes)?;
         match signal {
-            AudioSignal::Answer { sdp, .. } => {
-                let answer = RTCSessionDescription::answer(sdp)
-                    .map_err(|e| AudioError::WebRtc(format!("wrap answer: {e}")))?;
-                pc.set_remote_description(answer).await.map_err(|e| {
-                    AudioError::WebRtc(format!("set_remote_description(answer): {e}"))
-                })?;
-                return Ok(());
-            }
-            AudioSignal::IceCandidate {
-                candidate,
-                sdp_mid,
-                sdp_mline_index,
-                ..
-            } => {
-                // Candidates may arrive before the answer; queue them
-                // into the PC, but `add_ice_candidate` requires a
-                // remote description so this will warn until we land
-                // the answer. Stash and re-apply isn't worth it on a
-                // LAN where the answer arrives within ~ms.
-                let init = webrtc::ice_transport::ice_candidate::RTCIceCandidateInit {
-                    candidate,
-                    sdp_mid,
-                    sdp_mline_index,
-                    username_fragment: None,
-                };
-                let _ = pc.add_ice_candidate(init).await;
-            }
+            AudioSignal::Answer { sdp, .. } => return Ok(sdp),
             other => {
                 debug!(?other, "discarding pre-answer signal");
             }
@@ -896,58 +796,9 @@ async fn wait_for_answer(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fresh_status() -> Arc<StdMutex<PeerAudioStatus>> {
-        Arc::new(StdMutex::new(PeerAudioStatus {
-            machine_id: "peer-A".into(),
-            display_name: "peer-A".into(),
-            sending_to_peer: false,
-            receiving_from_peer: false,
-            rtt_ms: None,
-            last_error: None,
-        }))
-    }
-
-    #[test]
-    fn update_status_emits_event_on_change() {
-        let status = fresh_status();
-        let (events_tx, mut events_rx) = mpsc::channel(8);
-
-        update_status(&status, &events_tx, |s| s.sending_to_peer = true);
-
-        let ev = events_rx.try_recv().expect("event should be emitted");
-        match ev {
-            crate::bridge::AudioEvent::PeerStatus(s) => assert!(s.sending_to_peer),
-            other => panic!("unexpected event: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn update_status_skips_event_when_unchanged() {
-        let status = fresh_status();
-        status.lock().unwrap().sending_to_peer = true;
-        let (events_tx, mut events_rx) = mpsc::channel(8);
-
-        // Same value → no event.
-        update_status(&status, &events_tx, |s| s.sending_to_peer = true);
-        assert!(events_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn payload_l16_round_trips() {
-        let original: Vec<i16> = (0..960).map(|i| (i as i16).wrapping_mul(37)).collect();
-        let payload = payload_l16(&original);
-        let back = depayload_l16(&payload);
-        assert_eq!(back.as_ref(), original.as_slice());
-    }
-
-    #[test]
-    fn payload_l16_is_big_endian() {
-        let frame = vec![0x1234i16];
-        let payload = payload_l16(&frame);
-        assert_eq!(&payload[..], &[0x12, 0x34]);
-    }
+fn opus_payload_type(rtc: &Rtc) -> Option<Pt> {
+    rtc.codec_config()
+        .iter()
+        .find(|p| p.spec().codec == Codec::Opus)
+        .map(PayloadParams::pt)
 }

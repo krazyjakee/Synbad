@@ -32,13 +32,18 @@ rubato = "2"
 # thread (real-time, must not block) and the tokio task that feeds RTP.
 ringbuf = "0.4"
 
-# WebRTC stack: PeerConnection, ICE, DTLS, SRTP, RTP framing. v0.17 is the
-# last Tokio-coupled stable release; v0.20+ is moving to sans-I/O.
-# We hand-roll L16 payloading on top of the rtp/rtcp crates because the
-# high-level `webrtc` MediaEngine only ships Opus/G722 presets.
-webrtc = "0.17"
-webrtc-media = "0.17"
-rtp = "0.17"
+# WebRTC stack — sans-I/O str0m. We previously used webrtc-rs 0.17
+# but hit an unresolvable DTLS-SRTP key-derivation bug that surfaced
+# as `failed to verify rtp auth tag` on every inbound packet. str0m's
+# `tests/bidirectional.rs` runs the exact same scenario cleanly, so
+# Phase 2 of the port (Cut after the str0m_validation test landed)
+# replaces the whole webrtc stack with this.
+str0m = { version = "0.19", default-features = false, features = ["aws-lc-rs"] }
+
+# Opus codec — the only str0m audio codec well-suited to LAN
+# microphone audio (PCMU/PCMA are 8 kHz telephony-grade). 48 kHz mono
+# at ~64 kbps fits comfortably; libopus is small and battle-tested.
+opus = "0.3"
 
 # Used directly: `Bytes` for RTP payloads (matches the type webrtc's RTP
 # stack already deals in) and `rand` for the per-session RTP sequence
@@ -48,12 +53,6 @@ rand = "0.9"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-# Loopback test prints webrtc-rs trace output on failure so the panic
-# message surfaces the real reason (typically an SRTP `aead::Error`).
+# Loopback test prints trace output on failure so the panic message
+# surfaces the real reason (DTLS/SRTP/ICE state, codec mismatches).
 tracing-subscriber = { workspace = true }
-# Phase 1 validation: confirm str0m can drive bidirectional audio
-# between two in-process Rtc instances without the SRTP key-derivation
-# bug we hit on webrtc-rs 0.17. Dev-only — if validation passes we
-# promote str0m to a runtime dependency and rewrite session.rs against
-# its sans-I/O driver loop.
-str0m = { version = "0.19", default-features = false, features = ["aws-lc-rs"] }
