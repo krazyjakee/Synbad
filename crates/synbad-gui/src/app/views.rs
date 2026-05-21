@@ -49,32 +49,290 @@ impl SynbadApp {
     }
 
     pub(super) fn draw_status(&mut self, ui: &mut egui::Ui) {
-        ui.label(format!("State: {}", state_text(&self.state)));
-        if let Some(active) = &self.active_screen {
-            ui.label(format!("Active screen: {}", active));
-        }
-        ui.label(format!(
-            "Connected peers: {}",
-            if self.connected_peers.is_empty() {
-                "none".to_string()
-            } else {
-                self.connected_peers
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            }
-        ));
-        ui.separator();
-        ui.label("Core log:");
-        egui::ScrollArea::vertical()
-            .stick_to_bottom(true)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                for line in &self.log {
-                    ui.label(egui::RichText::new(line).monospace());
+        // Hero summary — single glanceable line that tells the user
+        // whether everything's working. Derived from the same state the
+        // cards below break down. Colour matches the top-bar chip so the
+        // signal is consistent across the window.
+        let health = self.overall_health();
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(health.icon)
+                    .heading()
+                    .color(health.colour),
+            );
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(health.headline)
+                        .heading()
+                        .color(health.colour),
+                );
+                if let Some(detail) = health.detail.as_deref() {
+                    ui.label(egui::RichText::new(detail).weak());
                 }
             });
+        });
+        ui.add_space(8.0);
+
+        // Two columns of cards. Re-flowed by hand instead of using a grid
+        // so each card can grow vertically without dragging the others
+        // along with it.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.columns(2, |cols| {
+                    self.draw_connection_card(&mut cols[0]);
+                    self.draw_sharing_card(&mut cols[1]);
+                });
+                ui.add_space(8.0);
+                ui.columns(2, |cols| {
+                    self.draw_peers_card(&mut cols[0]);
+                    self.draw_audio_card(&mut cols[1]);
+                });
+                ui.add_space(8.0);
+                self.draw_sync_card(ui);
+
+                // The raw Core log is a technical aid — keep it out of
+                // the dashboard by default. Advanced mode pops it back
+                // in at the bottom.
+                if self.show_advanced {
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.collapsing("Core log", |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_source("core-log-scroll")
+                            .stick_to_bottom(true)
+                            .max_height(220.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for line in &self.log {
+                                    ui.label(egui::RichText::new(line).monospace().small());
+                                }
+                            });
+                    });
+                }
+            });
+    }
+
+    fn draw_connection_card(&self, ui: &mut egui::Ui) {
+        card(ui, "Connection", |ui| {
+            let (daemon_colour, daemon_text) = if self.connected {
+                (egui::Color32::LIGHT_GREEN, "Daemon connected")
+            } else {
+                (egui::Color32::LIGHT_RED, "Daemon offline")
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("●").color(daemon_colour));
+                ui.label(daemon_text);
+            });
+            let (core_colour, core_text) = match &self.state {
+                DaemonState::Running { pid } => (
+                    egui::Color32::LIGHT_GREEN,
+                    format!("Core running (pid {pid})"),
+                ),
+                DaemonState::Starting => (egui::Color32::YELLOW, "Core starting…".into()),
+                DaemonState::Stopped => (egui::Color32::GRAY, "Core stopped".into()),
+                DaemonState::Crashed { exit_code } => (
+                    egui::Color32::LIGHT_RED,
+                    format!("Core crashed (exit {exit_code:?})"),
+                ),
+            };
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("●").color(core_colour));
+                ui.label(core_text);
+            });
+            if let Some(err) = &self.last_error {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(err)
+                        .small()
+                        .color(egui::Color32::LIGHT_RED),
+                );
+            }
+        });
+    }
+
+    fn draw_sharing_card(&self, ui: &mut egui::Ui) {
+        card(ui, "Sharing", |ui| {
+            let role_text = match self.config.role {
+                NodeRole::Server => "Server (this machine drives input)",
+                NodeRole::Client => "Client (driven by another machine)",
+            };
+            ui.label(role_text);
+            if let Some(active) = &self.active_screen {
+                ui.horizontal(|ui| {
+                    ui.label("Active screen:");
+                    ui.label(egui::RichText::new(active).strong());
+                });
+            }
+            let linked = self.connected_peers.len();
+            ui.label(format!(
+                "{} {} linked",
+                linked,
+                if linked == 1 { "peer" } else { "peers" }
+            ));
+        });
+    }
+
+    fn draw_peers_card(&self, ui: &mut egui::Ui) {
+        card(ui, "Peers", |ui| {
+            let paired = self.trusted_peers.len();
+            let online = self
+                .trusted_peers
+                .keys()
+                .filter(|id| self.discovered_peers.contains_key(*id))
+                .count();
+            let unverified = self
+                .discovered_peers
+                .iter()
+                .filter(|(id, _)| !self.trusted_peers.contains_key(*id))
+                .count();
+            ui.label(format!(
+                "{} paired ({} online)",
+                paired, online,
+            ));
+            if unverified > 0 {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} unpaired on LAN — Peers tab to pair",
+                        unverified
+                    ))
+                    .color(egui::Color32::LIGHT_YELLOW),
+                );
+            } else if paired == 0 {
+                ui.label(
+                    egui::RichText::new("No peers yet. Start synbad on another machine.")
+                        .weak(),
+                );
+            }
+        });
+    }
+
+    fn draw_audio_card(&self, ui: &mut egui::Ui) {
+        card(ui, "Audio", |ui| {
+            if !self.config.audio.enabled {
+                ui.label(egui::RichText::new("Off").weak());
+                ui.label(
+                    egui::RichText::new("Enable in the Audio tab to stream mic / system audio.")
+                        .small()
+                        .weak(),
+                );
+                return;
+            }
+            let streaming = self
+                .audio_peer_status
+                .values()
+                .filter(|s| s.sending_to_peer || s.receiving_from_peer)
+                .count();
+            if streaming == 0 {
+                ui.label("On — no active streams");
+            } else {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} stream{} up",
+                        streaming,
+                        if streaming == 1 { "" } else { "s" }
+                    ))
+                    .color(egui::Color32::LIGHT_GREEN),
+                );
+            }
+            if let Some(err) = &self.audio_last_error {
+                ui.label(
+                    egui::RichText::new(format!("⚠ {err}"))
+                        .small()
+                        .color(egui::Color32::LIGHT_RED),
+                );
+            }
+        });
+    }
+
+    fn draw_sync_card(&self, ui: &mut egui::Ui) {
+        card(ui, "Layout sync", |ui| {
+            if !self.active_syncs.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Syncing with {} peer{}…",
+                        self.active_syncs.len(),
+                        if self.active_syncs.len() == 1 { "" } else { "s" }
+                    ))
+                    .color(egui::Color32::LIGHT_BLUE),
+                );
+            } else if let Some(s) = &self.last_sync_status {
+                let colour = if s.ok {
+                    egui::Color32::LIGHT_GREEN
+                } else {
+                    egui::Color32::LIGHT_RED
+                };
+                ui.label(egui::RichText::new(&s.message).color(colour));
+            } else if self.trusted_peers.is_empty() {
+                ui.label(
+                    egui::RichText::new("Pair a peer to start syncing layout edits.")
+                        .weak(),
+                );
+            } else {
+                ui.label(egui::RichText::new("Idle — layout is in sync.").weak());
+            }
+        });
+    }
+
+    /// Roll the per-card signals up into a single hero state. The
+    /// precedence is: connection failures first (you can't tell anything
+    /// is working without a daemon), then Core crash, then audio errors,
+    /// then "all good". The detail string is intentionally short — it
+    /// shows next to the icon, so it has to fit on one line.
+    fn overall_health(&self) -> HealthSummary {
+        if !self.connected {
+            return HealthSummary {
+                icon: "●",
+                colour: egui::Color32::LIGHT_RED,
+                headline: "Daemon offline",
+                detail: Some(
+                    "Synbad is trying to reconnect — the rest of the UI will catch up \
+                     once it's reachable."
+                        .into(),
+                ),
+            };
+        }
+        if let DaemonState::Crashed { exit_code } = &self.state {
+            return HealthSummary {
+                icon: "●",
+                colour: egui::Color32::LIGHT_RED,
+                headline: "Core crashed",
+                detail: Some(format!(
+                    "Last exit code: {:?}. See the log in advanced mode for details.",
+                    exit_code
+                )),
+            };
+        }
+        if let Some(err) = &self.audio_last_error {
+            return HealthSummary {
+                icon: "⚠",
+                colour: egui::Color32::LIGHT_YELLOW,
+                headline: "Audio bridge degraded",
+                detail: Some(err.clone()),
+            };
+        }
+        match &self.state {
+            DaemonState::Starting => HealthSummary {
+                icon: "●",
+                colour: egui::Color32::YELLOW,
+                headline: "Core starting…",
+                detail: None,
+            },
+            DaemonState::Stopped => HealthSummary {
+                icon: "●",
+                colour: egui::Color32::GRAY,
+                headline: "Idle",
+                detail: Some("Click Start to begin sharing input.".into()),
+            },
+            DaemonState::Running { .. } => HealthSummary {
+                icon: "●",
+                colour: egui::Color32::LIGHT_GREEN,
+                headline: "Everything's working",
+                detail: None,
+            },
+            DaemonState::Crashed { .. } => unreachable!("handled above"),
+        }
     }
 
     pub(super) fn draw_layout(&mut self, ui: &mut egui::Ui) {
@@ -550,108 +808,154 @@ impl SynbadApp {
     }
 
     pub(super) fn draw_settings(&mut self, ui: &mut egui::Ui) {
-        egui::Grid::new("settings").num_columns(2).show(ui, |ui| {
-            ui.label("Role");
-            ui.horizontal(|ui| {
-                let mut role = self.config.role;
-                if ui
-                    .radio_value(&mut role, NodeRole::Server, "Server")
-                    .changed()
-                    || ui
-                        .radio_value(&mut role, NodeRole::Client, "Client")
-                        .changed()
-                {
-                    self.config.role = role;
-                    self.dirty = true;
-                }
-            });
-            ui.end_row();
+        // Visible-by-default settings. Deliberately small — the GUI is
+        // meant to be turnkey, so the only knob most users ever need is
+        // whether the GUI also owns the daemon's lifecycle. Everything
+        // else lives behind "Show advanced".
+        let mut autostart = self.config.autostart;
+        let resp = ui.checkbox(&mut autostart, "Autostart synbadd with this app");
+        if resp.changed() {
+            self.config.autostart = autostart;
+            self.dirty = true;
+        }
+        resp.on_hover_text(
+            "On (default): the GUI launches synbadd when it starts and stops it on exit. \
+             Off: synbadd is managed externally (systemd user unit, launchd agent, manual) \
+             and the GUI just attaches to whatever it finds.",
+        );
 
-            ui.label("This machine's name");
-            let name_resp = ui.text_edit_singleline(&mut self.config.server_name);
-            if name_resp.changed() {
-                self.dirty = true;
-            }
-            name_resp.on_hover_text(
-                "The screen name this machine advertises (becomes `computerName` in \
-                 deskflow.ini).",
-            );
-            ui.end_row();
-
-            ui.label("Port");
-            let mut port = self.config.port as i32;
-            if ui
-                .add(egui::DragValue::new(&mut port).clamp_range(1..=65535))
-                .changed()
-            {
-                self.config.port = port.clamp(1, 65535) as u16;
-                self.dirty = true;
-            }
-            ui.end_row();
-
-            let client_mode = matches!(self.config.role, NodeRole::Client);
-            ui.label("Server address");
-            ui.horizontal(|ui| {
-                let mut addr = self.config.server_address.clone().unwrap_or_default();
-                let resp = ui.add_enabled(
-                    client_mode,
-                    egui::TextEdit::singleline(&mut addr)
-                        .hint_text("host or host:port (client mode only)"),
-                );
-                if resp.changed() {
-                    self.config.server_address = if addr.is_empty() { None } else { Some(addr) };
-                    self.dirty = true;
-                }
-                if !client_mode {
-                    resp.on_disabled_hover_text(
-                        "Only used in Client mode — switch the role above to enable.",
-                    );
-                }
-            });
-            ui.end_row();
-
-            ui.label("Share clipboard");
-            let mut share = self.config.clipboard_sharing;
-            let resp = ui.checkbox(&mut share, "");
-            if resp.changed() {
-                self.config.clipboard_sharing = share;
-                self.dirty = true;
-            }
-            resp.on_hover_text(
-                "When off, the Synergy Core won't relay clipboard contents between \
-                 machines (emits `clipboardSharing = false` into synergy.conf).",
-            );
-            ui.end_row();
-
-            ui.label("deskflow-core path (override)");
-            let mut core_bin = self
-                .config
-                .binaries
-                .core
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            let resp = ui.text_edit_singleline(&mut core_bin);
-            if resp.changed() {
-                self.config.binaries = BinaryPaths {
-                    core: opt_path(&core_bin),
-                };
-                self.dirty = true;
-            }
-            resp.on_hover_text(
-                "Leave blank to fetch the latest deskflow-core from \
-                 github.com/deskflow/deskflow on first start.",
-            );
-            ui.end_row();
-        });
-
-        ui.separator();
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.label(format!("Synbad version {}", env!("CARGO_PKG_VERSION")));
             if ui.button("Check for updates…").clicked() {
                 self.open_update_dialog(ui.ctx());
             }
         });
+
+        ui.add_space(8.0);
+        ui.checkbox(&mut self.show_advanced, "Show advanced settings")
+            .on_hover_text(
+                "Reveals the underlying Deskflow Core settings (role, ports, server \
+                 address, binary override) and the generated config previews. Most \
+                 users never need this — pairing fills in the role and address \
+                 automatically.",
+            );
+
+        if !self.show_advanced {
+            return;
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(
+            egui::RichText::new("Advanced")
+                .strong()
+                .color(egui::Color32::LIGHT_GRAY),
+        );
+        ui.add_space(4.0);
+
+        egui::Grid::new("settings-advanced")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("This machine's name");
+                let name_resp = ui.text_edit_singleline(&mut self.config.server_name);
+                if name_resp.changed() {
+                    self.dirty = true;
+                }
+                name_resp.on_hover_text(
+                    "The screen name this machine advertises (becomes `computerName` in \
+                     deskflow.ini).",
+                );
+                ui.end_row();
+
+                ui.label("Share clipboard");
+                let mut share = self.config.clipboard_sharing;
+                let resp = ui.checkbox(&mut share, "");
+                if resp.changed() {
+                    self.config.clipboard_sharing = share;
+                    self.dirty = true;
+                }
+                resp.on_hover_text(
+                    "When off, the Synergy Core won't relay clipboard contents between \
+                     machines (emits `clipboardSharing = false` into synergy.conf).",
+                );
+                ui.end_row();
+
+                ui.label("Role");
+                ui.horizontal(|ui| {
+                    let mut role = self.config.role;
+                    if ui
+                        .radio_value(&mut role, NodeRole::Server, "Server")
+                        .changed()
+                        || ui
+                            .radio_value(&mut role, NodeRole::Client, "Client")
+                            .changed()
+                    {
+                        self.config.role = role;
+                        self.dirty = true;
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Normally set by the pairing flow — click 'Use as server' in the \
+                     Peers tab and we'll switch to Client mode for you.",
+                );
+                ui.end_row();
+
+                ui.label("Port");
+                let mut port = self.config.port as i32;
+                if ui
+                    .add(egui::DragValue::new(&mut port).clamp_range(1..=65535))
+                    .changed()
+                {
+                    self.config.port = port.clamp(1, 65535) as u16;
+                    self.dirty = true;
+                }
+                ui.end_row();
+
+                let client_mode = matches!(self.config.role, NodeRole::Client);
+                ui.label("Server address");
+                ui.horizontal(|ui| {
+                    let mut addr = self.config.server_address.clone().unwrap_or_default();
+                    let resp = ui.add_enabled(
+                        client_mode,
+                        egui::TextEdit::singleline(&mut addr)
+                            .hint_text("host or host:port (client mode only)"),
+                    );
+                    if resp.changed() {
+                        self.config.server_address =
+                            if addr.is_empty() { None } else { Some(addr) };
+                        self.dirty = true;
+                    }
+                    if !client_mode {
+                        resp.on_disabled_hover_text(
+                            "Only used in Client mode — switch the role above to enable.",
+                        );
+                    }
+                });
+                ui.end_row();
+
+                ui.label("deskflow-core path (override)");
+                let mut core_bin = self
+                    .config
+                    .binaries
+                    .core
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                let resp = ui.text_edit_singleline(&mut core_bin);
+                if resp.changed() {
+                    self.config.binaries = BinaryPaths {
+                        core: opt_path(&core_bin),
+                    };
+                    self.dirty = true;
+                }
+                resp.on_hover_text(
+                    "Leave blank to fetch the latest deskflow-core from \
+                     github.com/deskflow/deskflow on first start.",
+                );
+                ui.end_row();
+            });
 
         ui.separator();
         ui.collapsing("Generated synergy.conf preview", |ui| {
@@ -675,6 +979,33 @@ impl SynbadApp {
             );
         });
     }
+}
+
+/// One-line dashboard hero summary. Built by [`SynbadApp::overall_health`].
+struct HealthSummary {
+    icon: &'static str,
+    colour: egui::Color32,
+    headline: &'static str,
+    detail: Option<String>,
+}
+
+/// Render a titled card with a subtle border. Used for the dashboard
+/// status tiles so each signal has its own visual chunk instead of
+/// running together as a wall of labels.
+fn card(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(10.0))
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(title)
+                    .small()
+                    .color(egui::Color32::LIGHT_GRAY)
+                    .strong(),
+            );
+            ui.add_space(4.0);
+            body(ui);
+        });
 }
 
 fn opt_path(s: &str) -> Option<std::path::PathBuf> {
@@ -743,11 +1074,3 @@ pub(super) fn state_chip(s: &DaemonState, connected: bool) -> (egui::Color32, St
     }
 }
 
-fn state_text(s: &DaemonState) -> String {
-    match s {
-        DaemonState::Stopped => "stopped".into(),
-        DaemonState::Starting => "starting".into(),
-        DaemonState::Running { pid } => format!("running (pid {})", pid),
-        DaemonState::Crashed { exit_code } => format!("crashed (exit {:?})", exit_code),
-    }
-}

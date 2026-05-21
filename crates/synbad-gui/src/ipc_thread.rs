@@ -319,12 +319,21 @@ fn event_loop(
                 )));
                 repaint();
 
-                // Auto-launch the daemon if nothing is listening. Throttled
-                // so a daemon that crashes on startup doesn't get re-spawned
-                // every backoff tick (which would also accumulate zombies).
-                let should_spawn = last_spawn
-                    .map(|t| t.elapsed() >= Duration::from_secs(3))
-                    .unwrap_or(true);
+                // Auto-launch the daemon if nothing is listening, unless
+                // the user has opted out. The autostart flag lives in
+                // `config.toml`; we read it straight off disk because the
+                // GUI hasn't been able to ask the daemon yet (and may
+                // never if autostart is off and no external daemon is
+                // running). Missing/unparsable config falls back to "on"
+                // so first-run users get a turnkey app.
+                //
+                // Throttled so a daemon that crashes on startup doesn't
+                // get re-spawned every backoff tick (which would also
+                // accumulate zombies).
+                let should_spawn = autostart_enabled()
+                    && last_spawn
+                        .map(|t| t.elapsed() >= Duration::from_secs(3))
+                        .unwrap_or(true);
                 if should_spawn {
                     last_spawn = Some(Instant::now());
                     match spawn_daemon() {
@@ -340,6 +349,22 @@ fn event_loop(
 
         thread::sleep(backoff);
         backoff = (backoff * 2).min(Duration::from_secs(10));
+    }
+}
+
+/// Read `autostart` straight off the on-disk config. Used by the event
+/// loop before any connection exists, so we can't ask the daemon for it.
+/// Defaults to `true` when the file is missing or malformed — first-run
+/// users (and anyone whose config got corrupted) should still get the
+/// turnkey "GUI launches the daemon" experience.
+fn autostart_enabled() -> bool {
+    match synbad_config::Config::load(&paths::config_file()) {
+        Ok(Some(cfg)) => cfg.autostart,
+        Ok(None) => true,
+        Err(e) => {
+            tracing::warn!(?e, "could not read autostart from config; defaulting to on");
+            true
+        }
     }
 }
 

@@ -147,6 +147,13 @@ pub struct SynbadApp {
     /// True once we've fetched the device list at least once. Lets the
     /// tab show "loading…" until the daemon replies.
     pub(super) audio_devices_loaded: bool,
+
+    /// Reveal the technical knobs (role, ports, server address, core path,
+    /// generated `.conf` previews, raw log) in the Settings + Status tabs.
+    /// Off by default — the visible UI is dashboard-style, advanced is a
+    /// reveal for power users. Session-scoped (no persistence) so we don't
+    /// silently dump advanced UI on someone who toggled it once.
+    pub(super) show_advanced: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +210,7 @@ impl SynbadApp {
             audio_peer_status: BTreeMap::new(),
             audio_last_error: None,
             audio_devices_loaded: false,
+            show_advanced: false,
         }
     }
 
@@ -284,11 +292,19 @@ impl SynbadApp {
     /// Tell the daemon to exit, at most once per process. Blocking but
     /// bounded (see [`ipc_thread::shutdown_daemon`]); only ever called on
     /// the way out.
+    ///
+    /// Skipped entirely when `config.autostart` is off — that mode means
+    /// the daemon's lifecycle is managed externally (systemd user unit,
+    /// launchd agent, manual `synbadd`), and the GUI is a thin attach
+    /// client that has no business killing it on window close.
     fn shutdown_daemon_once(&mut self) {
         if self.daemon_shutdown_sent {
             return;
         }
         self.daemon_shutdown_sent = true;
+        if !self.config.autostart {
+            return;
+        }
         ipc_thread::shutdown_daemon(paths::ipc_socket());
     }
 
@@ -640,7 +656,7 @@ impl eframe::App for SynbadApp {
             ui.horizontal(|ui| {
                 ui.heading("Synbad");
                 ui.separator();
-                ui.selectable_value(&mut self.tab, Tab::Status, "Status");
+                ui.selectable_value(&mut self.tab, Tab::Status, "Dashboard");
                 ui.selectable_value(&mut self.tab, Tab::Layout, "Layout");
                 let peers_label = if self.discovered_peers.is_empty() {
                     "Peers".to_string()
