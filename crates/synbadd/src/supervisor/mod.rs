@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use synbad_config::{paths, Config};
+use synbad_config::{paths, Config, NodeRole};
 use synbad_discovery::{Advertiser, Browser, DiscoveryEvent, Identity, TrustedPeerStore};
 use synbad_ipc::log_parse;
 use synbad_ipc::server::Listener;
@@ -619,7 +619,32 @@ impl Supervisor {
         if let Some(structured) = log_parse::parse(&line) {
             let _ = self.events.send(structured);
         }
+        self.maybe_force_reconnect(&line);
         let _ = self.events.send(Event::Log { line });
+    }
+
+    /// Some Deskflow Core builds log "disconnected from server" but keep
+    /// the process alive without reconnecting. The supervisor's exit-driven
+    /// retry loop never engages in that case, so we kill the child on the
+    /// signal — `handle_child_exit` then runs the normal client-reconnect
+    /// path capped by [`MAX_CLIENT_RECONNECTS`].
+    fn maybe_force_reconnect(&mut self, line: &str) {
+        // Don't recurse on our own "[synbad] disconnected from server …"
+        // status line emitted by `handle_child_exit`.
+        if line.starts_with("[synbad]") {
+            return;
+        }
+        if !matches!(self.config.role, NodeRole::Client) {
+            return;
+        }
+        if !log_parse::is_client_server_disconnect(line) {
+            return;
+        }
+        let Some(tx) = self.child_kill.take() else {
+            return;
+        };
+        tracing::warn!("core reported disconnect without exit; forcing restart");
+        let _ = tx.send(());
     }
 
     pub(super) fn set_state(&mut self, new_state: DaemonState) {
