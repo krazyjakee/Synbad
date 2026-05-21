@@ -480,7 +480,7 @@ fn synbadd_binary() -> PathBuf {
 /// process — the daemon outlives the GUI on its own.
 ///
 /// Returns the path we attempted to launch alongside the spawn result so
-/// callers can show "could not launch synbadd at <path>" without re-resolving.
+/// callers can show `could not launch synbadd at <path>` without re-resolving.
 fn spawn_daemon() -> (PathBuf, std::io::Result<std::process::Child>) {
     let binary = synbadd_binary();
     let log_path = paths::state_dir().join("synbadd.log");
