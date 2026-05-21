@@ -41,6 +41,9 @@ use serde::{Deserialize, Serialize};
 
 mod archive;
 mod elevate;
+mod restart;
+
+pub use restart::{restart_daemon, spawn_self};
 
 /// GitHub repo the updater talks to. Hardcoded — auto-update can only point at
 /// one canonical release feed.

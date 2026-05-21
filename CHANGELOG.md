@@ -10,6 +10,20 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+- Auto-update on Linux/macOS appeared to update only the daemon. The
+  on-disk swap was actually doing both binaries, but the running GUI
+  process stayed on the old inode: closing the window only hides to
+  tray, and re-launching forwards to the still-running process via the
+  single-instance socket. The post-install dialog now offers a
+  **Relaunch now** button that bounces the daemon supervisor
+  (`systemctl --user restart synbadd.service` on Linux,
+  `launchctl kickstart -k gui/$UID/dev.synbad.synbadd` on macOS,
+  `schtasks /End` + `/Run SynbadDaemon` on Windows), unlinks the
+  single-instance socket, spawns a fresh `synbad-gui`, and exits — so
+  both halves of the install actually take effect without the user
+  having to chase down systemd / launchctl by hand.
+
 ## [0.1.2] - 2026-05-21
 
 ### Fixed

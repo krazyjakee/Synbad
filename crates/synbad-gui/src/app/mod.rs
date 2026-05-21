@@ -26,6 +26,7 @@ use synbad_ipc::{
 use crate::ipc_thread::{self, Cmd, IpcHandle, Update};
 use crate::layout_editor::LayoutEditor;
 use crate::monitors;
+use crate::single_instance;
 use crate::tray;
 use crate::update::{self, UpdateState};
 
@@ -784,6 +785,52 @@ impl eframe::App for SynbadApp {
                 update::Action::Install(info) => {
                     self.update_state = Some(update::spawn_install(ctx, info));
                 }
+                update::Action::Relaunch { exe } => {
+                    self.relaunch_after_update(&exe);
+                }
+            }
+        }
+    }
+}
+
+impl SynbadApp {
+    /// Bounce the daemon supervisor, spawn a fresh GUI from `exe`, and exit
+    /// this process. Called from the post-install dialog so the user picks
+    /// up the new binary without manually quitting + reopening (which on
+    /// Linux/macOS would just forward to this still-running process via the
+    /// single-instance socket).
+    ///
+    /// The single-instance socket is unlinked first so the freshly-spawned
+    /// process can bind cleanly. Daemon restart errors are logged but don't
+    /// block the relaunch — a missing supervisor (e.g. `cargo run` builds
+    /// with no systemd unit installed) shouldn't trap the user inside the
+    /// old binary.
+    fn relaunch_after_update(&mut self, exe: &std::path::Path) {
+        let _ = std::fs::remove_file(single_instance::default_socket_path());
+
+        if let Err(e) = synbad_update::restart_daemon() {
+            tracing::warn!(
+                error = ?e,
+                "failed to restart daemon supervisor; new binary will take effect on next manual restart",
+            );
+        }
+
+        match synbad_update::spawn_self(exe) {
+            Ok(()) => {
+                tracing::info!(?exe, "spawned replacement synbad-gui; exiting");
+                // Hard exit: skipping eframe's normal shutdown is fine here
+                // because the new GUI will install its own tray + bind its
+                // own IPC socket. Going through the close handler would
+                // try to send the daemon a Shutdown, which we don't want
+                // — restart_daemon already bounced it.
+                std::process::exit(0);
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = ?e,
+                    "failed to spawn replacement GUI; staying in the old binary",
+                );
+                self.last_error = Some(format!("relaunch failed: {e:#}"));
             }
         }
     }
