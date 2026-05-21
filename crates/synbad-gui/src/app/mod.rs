@@ -64,6 +64,11 @@ pub struct SynbadApp {
 
     pub(super) connected: bool,
     pub(super) last_error: Option<String>,
+    /// Soft "we're booting synbadd right now" status. Set by the IPC
+    /// thread between firing off a spawn and the socket becoming
+    /// reachable. Rendered in a neutral colour so the user doesn't see
+    /// a red "could not connect" while the daemon is still coming up.
+    pub(super) launching_status: Option<String>,
     pub(super) state: DaemonState,
     pub(super) log: VecDeque<String>,
 
@@ -182,6 +187,7 @@ impl SynbadApp {
             tab: Tab::Status,
             connected: false,
             last_error: None,
+            launching_status: None,
             state: DaemonState::Stopped,
             log: VecDeque::with_capacity(LOG_CAP),
             config: Config::default(),
@@ -309,10 +315,20 @@ impl SynbadApp {
                 Update::Connected => {
                     self.connected = true;
                     self.last_error = None;
+                    self.launching_status = None;
                 }
                 Update::Disconnected(msg) => {
                     self.connected = false;
                     self.last_error = Some(msg);
+                    self.launching_status = None;
+                }
+                Update::Launching(msg) => {
+                    // The IPC thread only emits Launching when its most
+                    // recent spawn attempt succeeded, so any pinned
+                    // launch-failure error is now stale — clear it.
+                    self.connected = false;
+                    self.launching_status = Some(msg);
+                    self.last_error = None;
                 }
                 Update::Status { state, recent_log } => {
                     self.state = state;
@@ -729,6 +745,13 @@ impl eframe::App for SynbadApp {
                         if let Some(err) = &self.last_error {
                             ui.colored_label(egui::Color32::LIGHT_RED, err);
                         }
+                    });
+                } else if let Some(status) = &self.launching_status {
+                    // No error to show, but the daemon is mid-boot —
+                    // surface a soft status so the user knows things are
+                    // in flight instead of staring at an empty bar.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.colored_label(egui::Color32::LIGHT_BLUE, status);
                     });
                 }
             });
