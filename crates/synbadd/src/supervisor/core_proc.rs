@@ -23,7 +23,8 @@ use synbad_ipc::{DaemonState, Event};
 use crate::binaries::{CoreLayout, ResolvedCore, Resolver};
 
 use super::{
-    CoreResolveOutcome, Supervisor, FAST_FAIL_WINDOW, MAX_BACKOFF, MAX_FAST_FAILS, MIN_BACKOFF,
+    CoreResolveOutcome, Supervisor, FAST_FAIL_WINDOW, MAX_BACKOFF, MAX_CLIENT_RECONNECTS,
+    MAX_FAST_FAILS, MIN_BACKOFF,
 };
 
 impl Supervisor {
@@ -207,24 +208,40 @@ impl Supervisor {
             return;
         }
 
-        // For client role, a fast exit is almost always "server unreachable"
-        // (DNS miss, server down, network drop) — exactly the case where the
-        // user wants us to keep trying. Stay in the retry loop with capped
-        // backoff instead of triggering the fast-fail give-up that exists
-        // for server-role startup problems (port in use, missing libs).
+        // Both roles cap consecutive instant-fails, but for different
+        // reasons: server-role usually means a startup problem (port in
+        // use, missing libs) and client-role means the server is
+        // unreachable. The thresholds and messaging differ; the reset
+        // path (a child that runs longer than FAST_FAIL_WINDOW) is shared,
+        // so a client that successfully connects and is later dropped
+        // gets a fresh budget of MAX_CLIENT_RECONNECTS retries.
         let is_client = matches!(self.config.role, NodeRole::Client);
+        let limit = if is_client {
+            MAX_CLIENT_RECONNECTS
+        } else {
+            MAX_FAST_FAILS
+        };
 
-        if !is_client && self.fast_fail_count >= MAX_FAST_FAILS {
+        if self.fast_fail_count >= limit {
             // Give up. The exit code stays on the chip so the GUI surfaces
             // what happened, and we record a log line explaining why we
             // stopped retrying.
             self.desired_running = false;
-            let msg = format!(
-                "[synbad] core exited within {:?} on {} consecutive attempts (exit {:?}); \
-                 giving up. Check that Deskflow's runtime deps (Qt6) are installed, \
-                 then click Start.",
-                FAST_FAIL_WINDOW, self.fast_fail_count, code
-            );
+            let msg = if is_client {
+                format!(
+                    "[synbad] could not reach server after {} reconnect attempts \
+                     (exit {:?}); giving up. Check the server is running and \
+                     reachable, then click Start.",
+                    self.fast_fail_count, code
+                )
+            } else {
+                format!(
+                    "[synbad] core exited within {:?} on {} consecutive attempts (exit {:?}); \
+                     giving up. Check that Deskflow's runtime deps (Qt6) are installed, \
+                     then click Start.",
+                    FAST_FAIL_WINDOW, self.fast_fail_count, code
+                )
+            };
             tracing::error!("{}", msg);
             self.record_log(msg);
             self.set_state(DaemonState::Crashed { exit_code: code });
@@ -236,10 +253,16 @@ impl Supervisor {
         self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
         if is_client {
             // Surface reconnect attempts in the user-visible log so the chip
-            // doesn't just look stuck at "Crashed" while we back off.
+            // doesn't just look stuck at "Crashed" while we back off. Only
+            // count fast-fail retries against the cap — a long-lived run
+            // that just got dropped is "attempt 1 of N" again.
             self.record_log(format!(
-                "[synbad] disconnected from server (exit {:?}); reconnecting in {:?}",
-                code, delay
+                "[synbad] disconnected from server (exit {:?}); reconnecting in {:?} \
+                 (attempt {} of {})",
+                code,
+                delay,
+                self.fast_fail_count + 1,
+                MAX_CLIENT_RECONNECTS
             ));
         }
         tracing::warn!(

@@ -56,6 +56,11 @@ pub(super) const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// after [`MAX_FAST_FAILS`] of them.
 pub(super) const FAST_FAIL_WINDOW: Duration = Duration::from_secs(2);
 pub(super) const MAX_FAST_FAILS: u32 = 5;
+/// Client role: cap consecutive failed reconnects. A child that ran long
+/// enough to clear [`FAST_FAIL_WINDOW`] resets the counter, so a transient
+/// mid-session disconnect still gets a fresh budget — only an unreachable
+/// server (3 fast failures in a row) makes us give up.
+pub(super) const MAX_CLIENT_RECONNECTS: u32 = 3;
 
 pub struct Supervisor {
     pub(super) config_path: PathBuf,
