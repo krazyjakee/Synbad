@@ -10,6 +10,14 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-05-21
+
+### Documentation
+- README now points macOS users at [BlackHole](https://github.com/ExistentialAudio/BlackHole)
+  (`brew install blackhole-2ch`) for routing system-audio output into the
+  Synbad audio bridge, since CoreAudio doesn't expose a first-party
+  loopback source on macOS &lt; 13.
+
 ## [0.1.5] - 2026-05-21
 
 ### Changed
