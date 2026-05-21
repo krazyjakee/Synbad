@@ -291,20 +291,14 @@ impl SynbadApp {
 
     /// Tell the daemon to exit, at most once per process. Blocking but
     /// bounded (see [`ipc_thread::shutdown_daemon`]); only ever called on
-    /// the way out.
-    ///
-    /// Skipped entirely when `config.autostart` is off — that mode means
-    /// the daemon's lifecycle is managed externally (systemd user unit,
-    /// launchd agent, manual `synbadd`), and the GUI is a thin attach
-    /// client that has no business killing it on window close.
+    /// the way out. Always runs — `synbadd` is GUI-only, so when the GUI
+    /// closes the daemon should go with it regardless of the autostart
+    /// setting (which controls *startup*, not shutdown).
     fn shutdown_daemon_once(&mut self) {
         if self.daemon_shutdown_sent {
             return;
         }
         self.daemon_shutdown_sent = true;
-        if !self.config.autostart {
-            return;
-        }
         ipc_thread::shutdown_daemon(paths::ipc_socket());
     }
 
@@ -679,10 +673,16 @@ impl eframe::App for SynbadApp {
                 let online = self.connected;
                 let offline_tip = "Waiting for the synbadd daemon. Actions will be available \
                                    once it's reachable.";
-                let start = ui
-                    .add_enabled(online, egui::Button::new("Start"))
-                    .on_disabled_hover_text(offline_tip);
-                if start.clicked() {
+                // Start is always enabled — clicking it both spawns the
+                // daemon (if autostart was off and it isn't running yet)
+                // *and* tells it to bring up the Core. The command
+                // dispatcher waits a few seconds for the daemon's socket,
+                // so the user gets one-click "start sharing" instead of
+                // having to wait for `connected` to flip before retrying.
+                if ui.button("Start").clicked() {
+                    self.ipc
+                        .daemon_wanted
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     self.send(Cmd::Start);
                 }
                 let stop = ui

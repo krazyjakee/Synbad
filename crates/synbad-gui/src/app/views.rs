@@ -116,10 +116,16 @@ impl SynbadApp {
 
     fn draw_connection_card(&self, ui: &mut egui::Ui) {
         card(ui, "Connection", |ui| {
+            let wants_daemon = self
+                .ipc
+                .daemon_wanted
+                .load(std::sync::atomic::Ordering::Relaxed);
             let (daemon_colour, daemon_text) = if self.connected {
                 (egui::Color32::LIGHT_GREEN, "Daemon connected")
-            } else {
+            } else if wants_daemon {
                 (egui::Color32::LIGHT_RED, "Daemon offline")
+            } else {
+                (egui::Color32::GRAY, "Daemon not started")
             };
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("●").color(daemon_colour));
@@ -279,6 +285,24 @@ impl SynbadApp {
     /// shows next to the icon, so it has to fit on one line.
     fn overall_health(&self) -> HealthSummary {
         if !self.connected {
+            // Two distinct "offline" stories: the user has autostart off
+            // and just hasn't clicked Start yet (calm idle state) vs. we
+            // *wanted* the daemon up and can't reach it (something's
+            // wrong). `daemon_wanted` is the session flag the event loop
+            // is gated on, so it captures both initial autostart and a
+            // Start click that happened mid-session.
+            let wants_daemon = self
+                .ipc
+                .daemon_wanted
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if !wants_daemon {
+                return HealthSummary {
+                    icon: "●",
+                    colour: egui::Color32::GRAY,
+                    headline: "Not started",
+                    detail: Some("Click Start to launch synbadd and begin sharing.".into()),
+                };
+            }
             return HealthSummary {
                 icon: "●",
                 colour: egui::Color32::LIGHT_RED,
@@ -807,18 +831,25 @@ impl SynbadApp {
     pub(super) fn draw_settings(&mut self, ui: &mut egui::Ui) {
         // Visible-by-default settings. Deliberately small — the GUI is
         // meant to be turnkey, so the only knob most users ever need is
-        // whether the GUI also owns the daemon's lifecycle. Everything
+        // whether the daemon also boots when the window opens. Everything
         // else lives behind "Show advanced".
         let mut autostart = self.config.autostart;
         let resp = ui.checkbox(&mut autostart, "Autostart synbadd with this app");
         if resp.changed() {
             self.config.autostart = autostart;
             self.dirty = true;
+            // The user just told us their preference for the *startup*
+            // path — propagate it to the live session flag so the event
+            // loop's reconnect/respawn logic picks it up immediately
+            // without waiting for the next GUI launch.
+            self.ipc
+                .daemon_wanted
+                .store(autostart, std::sync::atomic::Ordering::Relaxed);
         }
         resp.on_hover_text(
-            "On (default): the GUI launches synbadd when it starts and stops it on exit. \
-             Off: synbadd is managed externally (systemd user unit, launchd agent, manual) \
-             and the GUI just attaches to whatever it finds.",
+            "On (default): synbadd launches when this app opens. \
+             Off: synbadd stays down until you click Start. Either way the GUI \
+             owns the daemon's lifecycle — closing the window stops it.",
         );
 
         ui.add_space(8.0);
