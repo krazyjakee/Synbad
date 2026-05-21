@@ -169,11 +169,19 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub async fn new(config_path: PathBuf, events: broadcast::Sender<Event>) -> Result<Self> {
+    /// `log_tx` / `log_rx` are owned by the caller because `main.rs` also
+    /// attaches a tracing subscriber layer to the same sender, so synbad's
+    /// own info/warn lines appear in the GUI's in-app log alongside Core's
+    /// stdout/stderr.
+    pub async fn new(
+        config_path: PathBuf,
+        events: broadcast::Sender<Event>,
+        log_tx: mpsc::Sender<String>,
+        log_rx: mpsc::Receiver<String>,
+    ) -> Result<Self> {
         let config = Config::load(&config_path)?.unwrap_or_default();
         let versions_path = paths::config_versions_file();
 
-        let (log_tx, log_rx) = mpsc::channel::<String>(1024);
         let (exit_tx, exit_rx) = mpsc::channel::<std::process::ExitStatus>(16);
         let (fs_tx, fs_rx) = mpsc::channel::<()>(16);
 
