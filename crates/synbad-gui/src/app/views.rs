@@ -488,10 +488,11 @@ impl SynbadApp {
             });
 
         if audio_changed {
+            // Audio is pushed and persisted immediately, so it doesn't
+            // participate in the dirty/Apply flow — flipping `dirty` here
+            // would light up Apply/Revert and the "remote config" banner
+            // for a change the daemon has already saved.
             self.config.audio = audio.clone();
-            self.dirty = true;
-            // Push immediately — the daemon de-bounces same-value writes
-            // and the rest of the Config is unchanged.
             self.send(Cmd::SetAudioConfig(audio));
         }
 
