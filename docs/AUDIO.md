@@ -83,9 +83,11 @@ flow. After the handshake the connection becomes an `AudioSignal` channel:
 { "kind": "close",          "session_id": "...", "reason": "..." }
 ```
 
-The domain string `b"synbad-audio-v1"` is mixed into the transport
-transcript so an accidentally cross-wired sync/audio port cannot
-confuse the two protocols.
+Audio signaling and config sync each bind their own TCP port, so a
+misconnected client lands on a listener that simply rejects the
+opposite protocol's JSON. The cipher transport itself is the same
+handshake the rest of Synbad uses; cross-protocol confusion is
+prevented by port separation and application-layer schema checks.
 
 ### Why no STUN/TURN
 
