@@ -10,6 +10,36 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-05-21
+
+### Changed
+- Audio bridge routing model simplified to "bidirectional when enabled."
+  Dropped the `send_mic_to_peers` / `receive_peer_audio` per-side
+  toggles from `AudioConfig` and the GUI Audio tab — they had to be
+  ticked on both ends for a session to form, which never matched the
+  user model of "flip Enabled, audio works." The master switch is now
+  the only thing needed on each end; `[audio.per_peer."<machine-id>"]`
+  remains as the way to mute one direction or a whole link for a
+  specific peer. Legacy TOMLs that still carry the removed keys load
+  cleanly (regression test covers it).
+
+### Fixed
+- Per-peer status table in the Audio tab stopped showing stale rows.
+  `AudioEvent::SessionClosed` was previously dropped on the floor in
+  the supervisor with a comment claiming the GUI would see the change
+  from "the next snapshot" — but the GUI only ever requests one
+  snapshot, on tab open. A new `Event::AudioPeerRemoved { machine_id }`
+  propagates closures so disconnected peers drop out of the table, and
+  the reconcile loop's redial repopulates them when the session comes
+  back up.
+- Per-peer table now renders without depending on the system font's
+  unicode coverage. Replaced the `✓ → ←` glyphs (which rendered as
+  tofu boxes on some Linux setups) with plain ASCII column headers
+  (`Peer | Send | Receive | State`) and `on`/`off` cells. The new
+  State column surfaces `last_error` in red, `connected` in green, or
+  `negotiating…` so the row carries real information instead of
+  flashing an empty Error column.
+
 ## [0.1.3] - 2026-05-21
 
 ### Fixed
