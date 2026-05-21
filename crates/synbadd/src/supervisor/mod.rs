@@ -722,7 +722,7 @@ impl Supervisor {
     /// - no other dial to that peer is in flight, and
     /// - per-peer backoff has elapsed.
     ///
-    /// Called from [`reconcile_audio_sessions`]; not directly anywhere
+    /// Called from [`Self::reconcile_audio_sessions`]; not directly anywhere
     /// else. The reconcile path is the only place this should fire —
     /// keeping it single-entry means the inflight/backoff bookkeeping is
     /// guaranteed consistent.
@@ -771,13 +771,13 @@ impl Supervisor {
     }
 
     /// Walk every visible peer and dial the ones that should have a
-    /// session but don't. The single-entry helper [`dial_audio_one`]
+    /// session but don't. The single-entry helper [`Self::dial_audio_one`]
     /// enforces all the per-peer gates; this function just iterates.
     ///
     /// Triggered from three places:
     /// 1. The 5 s `audio_reconcile` interval (safety net for failed
     ///    dials, dropped sessions, and config changes the bridge missed).
-    /// 2. Right after [`ensure_audio_subsystem`] brings the subsystem up
+    /// 2. Right after [`Self::ensure_audio_subsystem`] brings the subsystem up
     ///    so the user doesn't wait a tick for the first dial.
     /// 3. On each `DiscoveryEvent::Found` so newly-arrived peers are
     ///    snappy.
