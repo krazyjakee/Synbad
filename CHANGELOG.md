@@ -10,6 +10,55 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-21
+
+### Fixed
+- Audio playback dropped roughly 75% of received samples: the cpal
+  output callback called `Vec::drain(..)` across the whole shared
+  buffer but only consumed the per-callback slice, so the rest was
+  discarded on drop. The drain range is now bounded to what's actually
+  consumed, with a regression test. Replaces the 1 s clear-on-overrun
+  with a 200 ms jitter cap that drops only the oldest samples down to
+  half-cap, and removes a blocking `std::thread::sleep` from the
+  bridge task.
+- Toggling `audio.enabled` was a silent no-op until daemon restart.
+  The supervisor now emits an `Event::AudioError` so the GUI banner
+  explains the restart requirement instead of looking like the change
+  took.
+- Audio settings edits no longer fake an unsaved-changes state. The
+  GUI was marking the config `dirty` after `SetAudioConfig`, so the
+  daemon's `ConfigChanged` round-trip lit up Apply/Revert and the
+  orange "remote config" banner for a change the user had just made.
+- Audio toggles no longer bounce active input sharing.
+  `core_inputs_differ` now zeroes `c.audio` alongside the existing
+  `service_port` / `sync_port` exclusions, so an audio change doesn't
+  trigger `stop_core()` + `start_core()`.
+
+### Changed
+- Client-role Core caps at 3 consecutive fast-fail reconnects instead
+  of retrying forever. A child that survives past `FAST_FAIL_WINDOW`
+  still resets the counter, so a transient mid-session drop gets a
+  fresh budget of 3 — only a truly unreachable server gives up.
+  Reconnect log lines include "(attempt N of 3)". Walks back the
+  retry-indefinitely policy from 0.1.1.
+- Audio tab: send/receive/device controls gray out when the master
+  switch is off, matching their runtime behavior. The always-blank
+  "RTT" column is removed from the per-peer status grid; `rtt_ms`
+  stays on the IPC type for future RTCP wiring.
+- `cargo-deny` audit is green again: extend the license allowlist for
+  permissive transitive deps (0BSD, BSL-1.0, CDLA-Permissive-2.0,
+  bzip2-1.0.6, OFL-1.1, LicenseRef-UFL-1.0), mark workspace crates as
+  `publish = false` with `allow-wildcard-paths = true`, and ignore
+  the unmaintained gtk-rs / proc-macro-error / fxhash advisories
+  (all transitive through eframe / winit / webrtc with no upstream
+  migration path right now).
+
+### Removed
+- Dead `SIGNAL_DOMAIN` constant from the audio bridge. AUDIO.md
+  claimed it was mixed into the transport transcript but it wasn't;
+  the doc paragraph now describes what actually keeps the audio and
+  sync protocols apart (port separation + application-layer schema).
+
 ## [0.1.1] - 2026-05-20
 
 ### Added
