@@ -170,7 +170,9 @@ mod tests {
 
     #[test]
     fn detects_client_disconnect_with_and_without_prefixes() {
-        assert!(is_client_server_disconnect("NOTE: disconnected from server"));
+        assert!(is_client_server_disconnect(
+            "NOTE: disconnected from server"
+        ));
         assert!(is_client_server_disconnect(
             "2026-05-19T12:34:56 NOTE: disconnected from server"
         ));
