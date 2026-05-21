@@ -48,8 +48,13 @@ pub struct AudioListenerDeps {
 /// failure.
 #[derive(Debug)]
 pub enum AudioDialOutcome {
-    Ok { peer_machine_id: String },
-    Err { peer_machine_id: String, error: String },
+    Ok {
+        peer_machine_id: String,
+    },
+    Err {
+        peer_machine_id: String,
+        error: String,
+    },
 }
 
 /// Bind the audio signaling listener on `bind_port`. Returns a JoinHandle

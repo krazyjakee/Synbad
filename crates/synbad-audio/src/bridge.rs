@@ -71,7 +71,9 @@ pub enum AudioEvent {
     /// transport state). Supervisor uses this to evict its liveness cache
     /// so the reconcile loop will re-dial without waiting for the next
     /// mDNS refresh.
-    SessionClosed { peer: String },
+    SessionClosed {
+        peer: String,
+    },
 }
 
 /// Handle the supervisor keeps after spawning the bridge.

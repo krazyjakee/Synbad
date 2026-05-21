@@ -226,9 +226,7 @@ impl Supervisor {
             let demoted: Vec<String> = self
                 .peers
                 .keys()
-                .filter(|id| {
-                    peer_audio_active(&old_audio, id) && !peer_audio_active(&audio, id)
-                })
+                .filter(|id| peer_audio_active(&old_audio, id) && !peer_audio_active(&audio, id))
                 .cloned()
                 .collect();
             // Demoted peers must be evicted from `audio_live` so the

@@ -557,9 +557,7 @@ impl Supervisor {
                     self.audio_live.insert(status.machine_id.clone());
                     self.audio_backoff.remove(&status.machine_id);
                 }
-                let _ = self
-                    .events
-                    .send(Event::AudioPeerStatus { status });
+                let _ = self.events.send(Event::AudioPeerStatus { status });
             }
             A::Error { peer, message } => {
                 let _ = self.events.send(Event::AudioError { peer, message });
@@ -629,7 +627,9 @@ impl Supervisor {
             DiscoveryEvent::Lost { machine_id } => {
                 if self.peers.remove(&machine_id).is_some() {
                     tracing::info!(%machine_id, "peer lost");
-                    let _ = self.events.send(Event::PeerLost { machine_id: machine_id.clone() });
+                    let _ = self.events.send(Event::PeerLost {
+                        machine_id: machine_id.clone(),
+                    });
                     // Drop liveness/backoff so a re-find dials cleanly.
                     self.audio_live.remove(&machine_id);
                     self.audio_backoff.remove(&machine_id);
@@ -764,11 +764,8 @@ impl Supervisor {
         }
         tracing::debug!(peer = %peer.machine_id, "dialing audio session");
         self.audio_inflight.insert(peer.machine_id.clone());
-        let handle = crate::audio::spawn_outbound(
-            peer,
-            dial_deps.clone(),
-            self.audio_dial_done_tx.clone(),
-        );
+        let handle =
+            crate::audio::spawn_outbound(peer, dial_deps.clone(), self.audio_dial_done_tx.clone());
         self.audio_tasks.push(handle);
         self.gc_audio_tasks();
     }
@@ -799,10 +796,7 @@ impl Supervisor {
     /// Resolve an outbound dial. On success we leave inflight set — the
     /// bridge will emit a `PeerStatus` event shortly that flips the peer
     /// into `audio_live`. On failure we evict inflight and arm backoff.
-    pub(super) fn handle_audio_dial_outcome(
-        &mut self,
-        outcome: crate::audio::AudioDialOutcome,
-    ) {
+    pub(super) fn handle_audio_dial_outcome(&mut self, outcome: crate::audio::AudioDialOutcome) {
         use crate::audio::AudioDialOutcome as O;
         match outcome {
             O::Ok { peer_machine_id } => {
@@ -817,8 +811,7 @@ impl Supervisor {
                 error,
             } => {
                 self.audio_inflight.remove(&peer_machine_id);
-                let next =
-                    AudioBackoff::after_failure(self.audio_backoff.get(&peer_machine_id));
+                let next = AudioBackoff::after_failure(self.audio_backoff.get(&peer_machine_id));
                 tracing::debug!(
                     peer = %peer_machine_id,
                     attempts = next.attempts,
