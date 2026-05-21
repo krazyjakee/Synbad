@@ -102,6 +102,51 @@ To use a hand-built or differently-versioned `deskflow-core`, set
 right escape hatch if you're on a distro whose Qt is too new (rather than
 too old) for the pinned release.
 
+### macOS: capturing system audio with BlackHole
+
+The LAN audio bridge can pick up mic input on macOS out of the box, but
+CoreAudio doesn't expose a first-party loopback source for **system
+audio output** until macOS 13's ScreenCaptureKit (which `cpal` doesn't
+surface). To stream the Mac's system sound to a peer, install a virtual
+audio device and select it as the input in the Audio tab.
+
+The easiest option is [BlackHole](https://github.com/ExistentialAudio/BlackHole):
+
+```sh
+brew install blackhole-2ch
+```
+
+Then, in macOS:
+
+1. Open **Audio MIDI Setup** and create a **Multi-Output Device** that
+   includes both your usual speakers/headphones and "BlackHole 2ch", so
+   you still hear audio locally while it's being mirrored.
+2. Set that Multi-Output Device as the system output in
+   **System Settings → Sound → Output**.
+3. In Synbad's **Audio** tab on the Mac, pick **BlackHole 2ch** as the
+   input device for the peer that should receive the system audio.
+
+Without BlackHole (or an equivalent virtual device such as Loopback),
+the GUI surfaces a clear error rather than silently failing. Microphone
+capture is unaffected and works without any extra software — though
+the first time `synbadd` opens an input stream you'll still get the
+TCC microphone-permission prompt.
+
+#### Clearing the Gatekeeper quarantine flag
+
+Synbad's macOS builds aren't (yet) signed and notarized, so the first
+time you launch `Synbad.app` after dragging it out of the release DMG,
+Gatekeeper will refuse to open it ("Apple could not verify… is free of
+malware"). Strip the quarantine extended attribute and the app will
+launch normally:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Synbad.app
+```
+
+Run that once per install (or after each upgrade). If you keep the app
+somewhere other than `/Applications`, adjust the path accordingly.
+
 ### IPC transport
 
 `synbad-gui` talks to `synbadd` over a local socket abstracted by
