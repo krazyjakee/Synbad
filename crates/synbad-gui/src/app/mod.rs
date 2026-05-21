@@ -834,6 +834,16 @@ impl SynbadApp {
     fn relaunch_after_update(&mut self, exe: &std::path::Path) {
         let _ = std::fs::remove_file(single_instance::default_socket_path());
 
+        // Send the running daemon a Shutdown over IPC before bouncing the
+        // supervisor. The GUI typically spawns `synbadd` directly as a
+        // detached child (see ipc_thread::spawn_daemon), in which case the
+        // supervisor call below is a no-op and skipping this leaves an
+        // orphaned old-binary daemon clinging to the IPC socket. For
+        // supervisor-managed installs the daemon exits and the supervisor
+        // restarts it on the new binary — `restart_daemon` then either
+        // succeeds again or fails harmlessly.
+        self.shutdown_daemon_once();
+
         if let Err(e) = synbad_update::restart_daemon() {
             tracing::warn!(
                 error = ?e,
@@ -846,9 +856,7 @@ impl SynbadApp {
                 tracing::info!(?exe, "spawned replacement synbad-gui; exiting");
                 // Hard exit: skipping eframe's normal shutdown is fine here
                 // because the new GUI will install its own tray + bind its
-                // own IPC socket. Going through the close handler would
-                // try to send the daemon a Shutdown, which we don't want
-                // — restart_daemon already bounced it.
+                // own IPC socket and the daemon was already shut down above.
                 std::process::exit(0);
             }
             Err(e) => {
