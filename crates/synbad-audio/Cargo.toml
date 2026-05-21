@@ -51,3 +51,9 @@ tokio = { workspace = true, features = ["test-util"] }
 # Loopback test prints webrtc-rs trace output on failure so the panic
 # message surfaces the real reason (typically an SRTP `aead::Error`).
 tracing-subscriber = { workspace = true }
+# Phase 1 validation: confirm str0m can drive bidirectional audio
+# between two in-process Rtc instances without the SRTP key-derivation
+# bug we hit on webrtc-rs 0.17. Dev-only — if validation passes we
+# promote str0m to a runtime dependency and rewrite session.rs against
+# its sans-I/O driver loop.
+str0m = { version = "0.19", default-features = false, features = ["aws-lc-rs"] }
