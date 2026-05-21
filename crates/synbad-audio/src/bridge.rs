@@ -66,6 +66,14 @@ pub enum AudioEvent {
     /// OS notified us that the set of devices changed. The supervisor
     /// forwards this to the GUI so it can refresh dropdowns.
     DevicesChanged,
+    /// Bridge removed a session from its map (glare replace, reconfigure,
+    /// trust revoke, shutdown drain, or a session reporting fatal
+    /// transport state). Supervisor uses this to evict its liveness cache
+    /// so the reconcile loop will re-dial without waiting for the next
+    /// mDNS refresh.
+    SessionClosed {
+        peer: String,
+    },
 }
 
 /// Handle the supervisor keeps after spawning the bridge.
@@ -138,6 +146,11 @@ impl AudioBridge {
                     if let Some(old) = self.sessions.remove(&peer_machine_id) {
                         warn!(peer = %peer_machine_id, "replacing existing audio session");
                         old.close(Some("superseded by new connection".into())).await;
+                        let _ = events
+                            .send(AudioEvent::SessionClosed {
+                                peer: peer_machine_id.clone(),
+                            })
+                            .await;
                     }
                     match AudioSession::start(
                         peer_machine_id.clone(),
@@ -186,6 +199,9 @@ impl AudioBridge {
                         if let Some(session) = self.sessions.remove(&peer) {
                             info!(peer = %peer, "closing session on reconfigure");
                             session.close(Some("reconfigure".into())).await;
+                            let _ = events
+                                .send(AudioEvent::SessionClosed { peer: peer.clone() })
+                                .await;
                         }
                     }
                     // Flip-on doesn't auto-dial: the supervisor walks
@@ -206,6 +222,11 @@ impl AudioBridge {
                     if let Some(session) = self.sessions.remove(&peer_machine_id) {
                         info!(peer = %peer_machine_id, "closing session on request");
                         session.close(Some("closed by supervisor".into())).await;
+                        let _ = events
+                            .send(AudioEvent::SessionClosed {
+                                peer: peer_machine_id,
+                            })
+                            .await;
                     }
                 }
                 AudioCommand::Shutdown => {
@@ -216,8 +237,9 @@ impl AudioBridge {
         }
 
         // Drain sessions on exit.
-        for (_peer, session) in self.sessions.drain() {
+        for (peer, session) in self.sessions.drain() {
             session.close(Some("bridge shutting down".into())).await;
+            let _ = events.send(AudioEvent::SessionClosed { peer }).await;
         }
         info!("audio bridge run loop exited");
     }

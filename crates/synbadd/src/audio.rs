@@ -40,6 +40,23 @@ pub struct AudioListenerDeps {
     pub bridge_commands: mpsc::Sender<AudioCommand>,
 }
 
+/// Result of an outbound dial reported back to the supervisor so it can
+/// clear its in-flight set and bump per-peer backoff. The success arm
+/// fires after the bridge has accepted the signaling stream — i.e. the
+/// session itself may still be negotiating, but the handshake plumbing
+/// is established. The error arm fires on connect/handshake/trust
+/// failure.
+#[derive(Debug)]
+pub enum AudioDialOutcome {
+    Ok {
+        peer_machine_id: String,
+    },
+    Err {
+        peer_machine_id: String,
+        error: String,
+    },
+}
+
 /// Bind the audio signaling listener on `bind_port`. Returns a JoinHandle
 /// for the accept loop — drop it to stop accepting connections.
 pub async fn spawn_listener(
@@ -81,15 +98,29 @@ pub async fn spawn_listener(
 pub fn spawn_outbound(
     peer: DiscoveredPeer,
     deps: Arc<AudioListenerDeps>,
+    outcome_tx: mpsc::Sender<AudioDialOutcome>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = run_outbound(peer.clone(), deps).await {
-            debug!(
-                peer = %peer.machine_id,
-                ?e,
-                "outbound audio handshake failed"
-            );
-        }
+        let peer_id = peer.machine_id.clone();
+        let outcome = match run_outbound(peer.clone(), deps).await {
+            Ok(()) => AudioDialOutcome::Ok {
+                peer_machine_id: peer_id,
+            },
+            Err(e) => {
+                debug!(
+                    peer = %peer.machine_id,
+                    ?e,
+                    "outbound audio handshake failed"
+                );
+                AudioDialOutcome::Err {
+                    peer_machine_id: peer_id,
+                    error: format!("{e:#}"),
+                }
+            }
+        };
+        // Best-effort: if the supervisor's receiver is gone we're
+        // shutting down anyway.
+        let _ = outcome_tx.send(outcome).await;
     })
 }
 
