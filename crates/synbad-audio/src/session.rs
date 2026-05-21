@@ -110,6 +110,25 @@ impl Drop for AudioSession {
     }
 }
 
+/// Internal bundle of "where do PCM frames come from / where do they go"
+/// passed into [`AudioSession::start_inner`]. Production builds this from
+/// cpal in [`AudioSession::start`]; integration tests build it from in-memory
+/// `mpsc` channels via [`AudioSession::start_for_test`].
+struct SessionIo {
+    /// `None` means "this side has no microphone to send" — the capture
+    /// pump task isn't spawned and no outbound RTP packets are written.
+    capture_rx: Option<mpsc::Receiver<PcmFrame>>,
+    /// `None` means "drop any audio the peer sends us" — `on_track` is
+    /// still installed implicitly via the absence path below, but the
+    /// inbound pump isn't wired to a sink.
+    playback_tx: Option<mpsc::Sender<PcmFrame>>,
+    /// cpal `Stream` handle kept alive for the session's lifetime. cpal
+    /// stops capturing the moment this drops. `None` in tests.
+    capture_stream: Option<Stream>,
+    /// As above, for the playback side.
+    playback_stream: Option<Stream>,
+}
+
 impl AudioSession {
     /// Start a fully-driven session.
     ///
@@ -124,34 +143,6 @@ impl AudioSession {
         role: SessionRole,
         events: mpsc::Sender<crate::bridge::AudioEvent>,
     ) -> Result<Self, AudioError> {
-        let session_id = Uuid::new_v4().to_string();
-        info!(
-            peer = %peer_machine_id,
-            session = %session_id,
-            ?role,
-            "audio session starting"
-        );
-
-        let api = rtc::build_api()?;
-        let pc = rtc::new_peer_connection(&api).await?;
-
-        let status = Arc::new(StdMutex::new(PeerAudioStatus {
-            machine_id: peer_machine_id.clone(),
-            display_name: peer_machine_id.clone(),
-            sending_to_peer: false,
-            receiving_from_peer: false,
-            rtt_ms: None,
-            last_error: None,
-        }));
-
-        install_pc_state_handler(&pc, Arc::clone(&status), events.clone());
-
-        // Outbound: cpal mic/loopback → L16 packets → outbound track.
-        let outbound_track = rtc::build_outbound_track();
-        pc.add_track(outbound_track.clone())
-            .await
-            .map_err(|e| AudioError::WebRtc(format!("add outbound track: {e}")))?;
-
         // Local capture is only opened if this peer is supposed to send
         // audio (either because the global toggle is on or this peer
         // has an override). Skipping the open keeps headless / mic-less
@@ -197,6 +188,112 @@ impl AudioSession {
             (None, None)
         };
 
+        Self::start_inner(
+            peer_machine_id,
+            signal,
+            role,
+            events,
+            SessionIo {
+                capture_rx,
+                playback_tx,
+                capture_stream,
+                playback_stream,
+            },
+        )
+        .await
+    }
+
+    /// Test-only entry point that hands in `mpsc` channels for capture
+    /// and playback instead of opening cpal devices. The loopback
+    /// integration test (`tests/loopback.rs`) uses this to drive two
+    /// `AudioSession`s on one machine without touching the host's
+    /// microphone or speakers — feeds synthetic PCM into `capture_rx`
+    /// and asserts on the frames that arrive at `playback_tx`.
+    ///
+    /// Not intended for production callers. Marked `#[doc(hidden)]` so
+    /// it doesn't pollute the public docs; kept `pub` only because
+    /// integration tests live outside the crate's `#[cfg(test)]`
+    /// boundary.
+    #[doc(hidden)]
+    pub async fn start_for_test(
+        peer_machine_id: String,
+        signal: CipherStream,
+        role: SessionRole,
+        events: mpsc::Sender<crate::bridge::AudioEvent>,
+        capture_rx: Option<mpsc::Receiver<PcmFrame>>,
+        playback_tx: Option<mpsc::Sender<PcmFrame>>,
+    ) -> Result<Self, AudioError> {
+        Self::start_inner(
+            peer_machine_id,
+            signal,
+            role,
+            events,
+            SessionIo {
+                capture_rx,
+                playback_tx,
+                capture_stream: None,
+                playback_stream: None,
+            },
+        )
+        .await
+    }
+
+    async fn start_inner(
+        peer_machine_id: String,
+        signal: CipherStream,
+        role: SessionRole,
+        events: mpsc::Sender<crate::bridge::AudioEvent>,
+        io: SessionIo,
+    ) -> Result<Self, AudioError> {
+        let session_id = Uuid::new_v4().to_string();
+        info!(
+            peer = %peer_machine_id,
+            session = %session_id,
+            ?role,
+            "audio session starting"
+        );
+
+        let api = rtc::build_api()?;
+        let pc = rtc::new_peer_connection(&api).await?;
+
+        let status = Arc::new(StdMutex::new(PeerAudioStatus {
+            machine_id: peer_machine_id.clone(),
+            display_name: peer_machine_id.clone(),
+            sending_to_peer: false,
+            receiving_from_peer: false,
+            rtt_ms: None,
+            last_error: None,
+        }));
+
+        install_pc_state_handler(&pc, Arc::clone(&status), events.clone());
+
+        let SessionIo {
+            capture_rx,
+            playback_tx,
+            capture_stream,
+            playback_stream,
+        } = io;
+
+        // Outbound L16 track. Added to the PeerConnection at different
+        // points depending on role (see below) — webrtc-rs 0.17's
+        // SRTP/transceiver state goes sideways if both sides add a
+        // track *before* SDP negotiation starts: the answerer ends up
+        // with two transceivers (one from its pre-negotiation
+        // `add_track`, one created from the offer's m-line), the
+        // negotiated answer only references the latter, and SRTP keys
+        // get derived against the wrong context. The symptom is
+        // `webrtc_srtp: failed to verify rtp auth tag` immediately
+        // after `peer_connection_state changed: connected`, with
+        // outbound packets accepted but every inbound packet dropped.
+        //
+        // The fix is the canonical WebRTC pattern: the offerer adds
+        // its track *before* `create_offer` so the offer carries a
+        // sendrecv m-line; the answerer adds its track *after*
+        // `set_remote_description(offer)` so the existing offer-
+        // created transceiver is reused instead of orphaned. The
+        // driver task owns whichever call applies for the role.
+        let outbound_track = rtc::build_outbound_track();
+
         // Split the signaling channel so the writer task can drain the
         // outgoing queue while the driver task blocks on inbound reads
         // — they touch different halves of the underlying TCP stream,
@@ -222,7 +319,12 @@ impl AudioSession {
             peer_machine_id.clone(),
         ));
 
-        // Spawn the capture pump if we opened a capture stream.
+        // Spawn the capture pump if we have a capture source. Safe to
+        // start before `add_track` lands on the answerer side: the
+        // pump's `write_rtp` calls return Err ("no bindings") until
+        // the track is bound to a negotiated transceiver, and that
+        // error is already swallowed at debug level — `sending_to_peer`
+        // only flips to true on the first Ok write.
         let capture_task = capture_rx.map(|rx| {
             tokio::spawn(capture_pump_task(
                 rx,
@@ -234,11 +336,13 @@ impl AudioSession {
         });
 
         // Spawn the negotiation driver task — runs the offer/answer
-        // dance and then loops on inbound signals.
+        // dance and then loops on inbound signals. The driver owns the
+        // role-correct `add_track` call (see commentary above).
         let driver_task = tokio::spawn(driver_task(
             session_id.clone(),
             peer_machine_id.clone(),
             pc.clone(),
+            outbound_track.clone(),
             signal_reader,
             out_tx,
             role,
@@ -559,6 +663,7 @@ async fn driver_task(
     session_id: String,
     peer_machine_id: String,
     pc: Arc<RTCPeerConnection>,
+    outbound_track: Arc<webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP>,
     mut reader: CipherReader,
     out_tx: mpsc::Sender<AudioSignal>,
     role: SessionRole,
@@ -567,6 +672,7 @@ async fn driver_task(
         &session_id,
         &peer_machine_id,
         &pc,
+        &outbound_track,
         &mut reader,
         &out_tx,
         role,
@@ -587,29 +693,73 @@ async fn run_driver(
     session_id: &str,
     peer_machine_id: &str,
     pc: &Arc<RTCPeerConnection>,
+    outbound_track: &Arc<webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP>,
     reader: &mut CipherReader,
     out_tx: &mpsc::Sender<AudioSignal>,
     role: SessionRole,
 ) -> Result<(), AudioError> {
     match role {
         SessionRole::Offerer => {
+            // Offerer: track BEFORE the offer so the m-line is
+            // sendrecv from the moment it leaves us. webrtc-rs's
+            // create_offer reads the transceiver list to build the
+            // SDP — calling it before add_track gives a zero-m-line
+            // offer the answerer can't reply to.
+            pc.add_track(outbound_track.clone() as _)
+                .await
+                .map_err(|e| AudioError::WebRtc(format!("add outbound track: {e}")))?;
             let offer = pc
                 .create_offer(None)
                 .await
                 .map_err(|e| AudioError::WebRtc(format!("create_offer: {e}")))?;
-            pc.set_local_description(offer.clone())
+            // Bundle ICE candidates into the SDP rather than trickling
+            // them as separate signals — `gathering_complete_promise()`
+            // resolves once the agent stops producing host candidates,
+            // and the local description is then a single self-contained
+            // blob with every `a=candidate:` line baked in.
+            //
+            // This matches webrtc-rs's own internal `signal_pair` test
+            // helper. Trickle-ICE works in production WebRTC stacks but
+            // is racy with webrtc-rs 0.17's DTLS/SRTP context setup:
+            // sending the offer before ICE finishes lets the answerer
+            // pre-build its DTLS half against candidates that haven't
+            // landed yet, and the SRTP context derived once everything
+            // does land has stale keying material — `peer_connection
+            // state changed: connected` immediately followed by
+            // `webrtc_srtp: failed to verify rtp auth tag` on every
+            // inbound packet. See the loopback test in
+            // `tests/loopback.rs` for a sub-10-second reproduction.
+            let mut gathering_done = pc.gathering_complete_promise().await;
+            pc.set_local_description(offer)
                 .await
                 .map_err(|e| AudioError::WebRtc(format!("set_local_description(offer): {e}")))?;
+            let _ = gathering_done.recv().await;
+            let local = pc
+                .local_description()
+                .await
+                .ok_or_else(|| AudioError::WebRtc("no local description after gather".into()))?;
             out_tx
                 .send(AudioSignal::Offer {
                     session_id: session_id.to_string(),
-                    sdp: offer.sdp,
+                    sdp: local.sdp,
                 })
                 .await
                 .map_err(|_| AudioError::SignalClosed)?;
             wait_for_answer(reader, pc).await?;
         }
         SessionRole::Answerer => {
+            // Answerer: add the local track BEFORE processing the
+            // offer. webrtc-rs's `add_track` always creates a fresh
+            // sendrecv transceiver, and `set_remote_description` then
+            // either reuses that transceiver for the offer's m-line
+            // (good) or creates a second one alongside it (bad). The
+            // former is what we want for the answer SDP to carry both
+            // directions on one m-line — see commentary in
+            // `start_inner` for why a mismatch here surfaces as
+            // `webrtc_srtp: failed to verify rtp auth tag`.
+            pc.add_track(outbound_track.clone() as _)
+                .await
+                .map_err(|e| AudioError::WebRtc(format!("add outbound track: {e}")))?;
             let remote_sdp = wait_for_offer(reader).await?;
             let offer = RTCSessionDescription::offer(remote_sdp)
                 .map_err(|e| AudioError::WebRtc(format!("wrap offer: {e}")))?;
@@ -620,13 +770,19 @@ async fn run_driver(
                 .create_answer(None)
                 .await
                 .map_err(|e| AudioError::WebRtc(format!("create_answer: {e}")))?;
-            pc.set_local_description(answer.clone())
+            let mut gathering_done = pc.gathering_complete_promise().await;
+            pc.set_local_description(answer)
                 .await
                 .map_err(|e| AudioError::WebRtc(format!("set_local_description(answer): {e}")))?;
+            let _ = gathering_done.recv().await;
+            let local = pc
+                .local_description()
+                .await
+                .ok_or_else(|| AudioError::WebRtc("no local description after gather".into()))?;
             out_tx
                 .send(AudioSignal::Answer {
                     session_id: session_id.to_string(),
-                    sdp: answer.sdp,
+                    sdp: local.sdp,
                 })
                 .await
                 .map_err(|_| AudioError::SignalClosed)?;

@@ -48,3 +48,6 @@ rand = "0.9"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+# Loopback test prints webrtc-rs trace output on failure so the panic
+# message surfaces the real reason (typically an SRTP `aead::Error`).
+tracing-subscriber = { workspace = true }
