@@ -671,7 +671,11 @@ mod tests {
         // synbadd_binary resolves to either an adjacent candidate or a
         // bare PathBuf — but the file name should always match the
         // platform-appropriate executable name.
-        let expected = if cfg!(windows) { "synbadd.exe" } else { "synbadd" };
+        let expected = if cfg!(windows) {
+            "synbadd.exe"
+        } else {
+            "synbadd"
+        };
         let path = synbadd_binary();
         assert_eq!(
             path.file_name().and_then(|s| s.to_str()),
