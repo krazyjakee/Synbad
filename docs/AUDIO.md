@@ -26,46 +26,63 @@ Core wire protocol. Toggling it doesn't disturb input sharing.
 
 ## Non-goals (v1, deliberately deferred)
 
-- **Opus encoding** — we ship raw L16 PCM (~1.5 Mbps stereo). Cheap on a
-  LAN; saves a libopus C dep. Revisit when bandwidth becomes a complaint.
 - **Echo cancellation / noise suppression** — WebRTC's AEC lives in
-  libwebrtc (C++), not in [webrtc-rs](https://github.com/webrtc-rs/webrtc).
-  Use OS-level alternatives (PipeWire `echo-cancel`, Win11 Voice Clarity).
-- **Multi-channel** — mono only.
+  libwebrtc (C++); neither [str0m](https://github.com/algesten/str0m) nor
+  any other pure-Rust stack ships an equivalent. Use OS-level alternatives
+  (PipeWire `echo-cancel`, Win11 Voice Clarity).
+- **Multi-channel / stereo** — mono only. Each direction is a single mic
+  stream; stereo would double bandwidth for no gain on speech.
+- **Codec negotiation beyond Opus** — we offer Opus only. str0m supports
+  PCMU/PCMA too but they're 8 kHz telephony-grade and not worth the
+  branching for a LAN bridge.
 - **Auto follow-the-focused-screen routing** — initial UX is static
   per-peer toggles. Hooking it into the Core's "active screen" event needs
   a new IPC plumbing pass.
-- **NAT traversal** — by design. Synbad is LAN-only.
+- **NAT traversal** — by design. Synbad is LAN-only, so the ICE candidate
+  set is host-only and there are no STUN/TURN servers.
 
 ## Architecture
 
 ```
 +--------------------+        TCP (synbad-crypto authenticated)        +--------------------+
 | synbadd (peer A)   |  <----------------- signaling ----------------> | synbadd (peer B)   |
-|  ├─ AudioBridge    |     SDP offer/answer + ICE candidates            |  ├─ AudioBridge    |
-|  ├─ cpal capture   |     (newline-delimited JSON, see below)          |  ├─ cpal capture   |
-|  └─ cpal playback  |                                                   |  └─ cpal playback  |
+|  ├─ AudioBridge    |        SDP offer/answer (ICE candidates           |  ├─ AudioBridge    |
+|  ├─ cpal capture   |         embedded in the SDP — no trickle)         |  ├─ cpal capture   |
+|  └─ cpal playback  |        (length-prefixed JSON, see below)          |  └─ cpal playback  |
 |         │ │        |                                                   |         │ │        |
 |         ▼ ▲        |                                                   |         ▼ ▲        |
-|     +-------+      |    direct UDP (DTLS+SRTP, RTP payload type 96)    |     +-------+      |
-|     | wrtc  | <==================== media =====================>      | wrtc  |             |
+|     +-------+      |  direct UDP (DTLS+SRTP, Opus 48k/mono, PT 111)    |     +-------+      |
+|     | str0m | <==================== media =====================>      | str0m |             |
 |     +-------+      |                                                   |     +-------+      |
 +--------------------+                                                   +--------------------+
 ```
 
-- **Transport: `webrtc-rs` 0.17.** Pure Rust, no libwebrtc/C++. Picks up
-  ICE host candidates from local interfaces, runs DTLS+SRTP, packetizes
-  audio into RTP.
-- **Codec: L16/48k/mono** (RFC 3551 §4.5.7) registered on `MediaEngine`
-  as payload type 96. webrtc-rs ships built-in payloaders for Opus and
-  G722 only; L16 packetization is hand-rolled on top of the `rtp` crate.
+- **Transport: [`str0m`](https://github.com/algesten/str0m) 0.19.** A
+  sans-I/O WebRTC stack in pure Rust (no libwebrtc/C++). We feed it
+  network bytes + a clock and it emits `Output::Transmit` / `Event::
+  MediaData` events; the session task in `session.rs` is the I/O wrapper
+  around a `tokio::net::UdpSocket`. Crypto runs through `aws-lc-rs`
+  (enabled via the `aws-lc-rs` Cargo feature). We migrated here from
+  webrtc-rs 0.17 in v0.1.5 because that stack derived mismatched
+  DTLS-SRTP keys in our bidirectional bring-up and every inbound packet
+  failed AEAD authentication; str0m completes the same handshake
+  cleanly (see `tests/str0m_validation.rs`).
+- **Codec: Opus 48 kHz mono, ~64 kbps.** libopus via the `opus` crate,
+  20 ms frames (960 samples), application = `Voip`. 64 kbps is well
+  below libopus's 510 kbps ceiling but comfortable for mono speech;
+  thinning starts around 32 kbps. Opus is the only str0m audio codec
+  well-suited to LAN microphone audio — PCMU/PCMA are 8 kHz telephony.
 - **Audio I/O: `cpal` 0.17.** Cross-platform shim over ALSA / CoreAudio /
-  WASAPI. Capture and playback each run on cpal's real-time thread and
-  shuttle 20 ms (`960 i16`) frames to/from tokio via bounded channels.
+  WASAPI. Capture and playback each run on cpal's real-time callback
+  thread and shuttle 20 ms (`960 i16`) PCM frames to/from the session
+  task via a lock-free `ringbuf` SPSC queue. Devices whose native sample
+  rate isn't 48 kHz are resampled with `rubato` before encode / after
+  decode.
 - **Signaling: reuses `synbad-crypto::CipherStream`.** The same
-  authenticated + AEAD-encrypted transport that backs pairing and config
-  sync; an audio signaling session is just an additional listener on its
-  own TCP port (`audio.signal_port`, default 24852).
+  authenticated + AEAD-encrypted (ChaCha20-Poly1305) transport that backs
+  pairing and config sync; an audio signaling session is just an
+  additional listener on its own TCP port (`audio.signal_port`,
+  default 24852).
 
 ### Signaling protocol
 
@@ -75,13 +92,17 @@ Authenticated`); an untrusted peer is rejected before any audio bytes
 flow. After the handshake the connection becomes an `AudioSignal` channel:
 
 ```jsonc
-{ "kind": "offer",          "session_id": "...", "sdp": "..." }
-{ "kind": "answer",         "session_id": "...", "sdp": "..." }
-{ "kind": "ice_candidate",  "session_id": "...", "candidate": "...",
-  "sdp_mid": "0", "sdp_mline_index": 0 }
-{ "kind": "ice_complete",   "session_id": "..." }
-{ "kind": "close",          "session_id": "...", "reason": "..." }
+{ "kind": "offer",  "session_id": "...", "sdp": "..." }
+{ "kind": "answer", "session_id": "...", "sdp": "..." }
+{ "kind": "close",  "session_id": "...", "reason": "..." }
 ```
+
+There are no `ice_candidate` / `ice_complete` messages: str0m bundles
+every host candidate into the SDP itself (driven by
+`add_local_candidate` before `sdp_api().apply()`), so the two peers
+have nothing to trickle. Keeping the protocol to three variants
+removes a class of "candidate arrived before remote-description" races
+that the earlier webrtc-rs design had to defend against.
 
 Audio signaling and config sync each bind their own TCP port, so a
 misconnected client lands on a listener that simply rejects the
@@ -92,9 +113,11 @@ prevented by port separation and application-layer schema checks.
 ### Why no STUN/TURN
 
 Synbad peers discover each other via mDNS on the same LAN and exchange
-ICE host candidates over the trusted signaling channel. Internet NAT
-traversal is out of scope, so the `RTCConfiguration.ice_servers` list
-is empty. This also keeps the bridge offline-capable.
+ICE host candidates (embedded in the SDP) over the trusted signaling
+channel. Internet NAT traversal is out of scope, so we never call any
+STUN/TURN servers — the only candidates str0m sees are the host
+candidates we add for each local interface. This also keeps the bridge
+offline-capable.
 
 ## Configuration
 
@@ -170,11 +193,11 @@ The audio path inherits the existing pairing/trust model:
 | Crate / file | Responsibility |
 |--------------|----------------|
 | `synbad-audio/src/bridge.rs` | Top-level orchestration; command/event channels. |
-| `synbad-audio/src/session.rs` | Per-peer PeerConnection + signaling state machine. |
-| `synbad-audio/src/rtc.rs` | webrtc-rs `MediaEngine`/`API` setup, L16 codec registration. |
-| `synbad-audio/src/protocol.rs` | `AudioSignal` wire types + domain string. |
-| `synbad-audio/src/capture.rs` | cpal input → 20 ms `i16` PCM frames. |
-| `synbad-audio/src/playback.rs` | `i16` PCM frames → cpal output. |
+| `synbad-audio/src/session.rs` | Per-peer `str0m::Rtc` + UDP socket + SDP signaling state machine. |
+| `synbad-audio/src/rtc.rs` | `str0m::Rtc` builder + Opus encoder/decoder helpers (48 kHz mono, 20 ms frames). |
+| `synbad-audio/src/protocol.rs` | `AudioSignal` wire types (Offer / Answer / Close). |
+| `synbad-audio/src/capture.rs` | cpal input → 20 ms `i16` PCM frames (resampled to 48 kHz via `rubato` when needed). |
+| `synbad-audio/src/playback.rs` | `i16` PCM frames → cpal output (resampled from 48 kHz when needed). |
 | `synbad-audio/src/devices.rs` | Device enumeration + loopback detection. |
 | `synbadd/src/audio.rs` | TCP listener; hands authenticated streams to the bridge. |
 | `synbadd/src/supervisor/mod.rs` | Owns the bridge handle and the listener task. |
