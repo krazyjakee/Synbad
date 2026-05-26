@@ -23,9 +23,9 @@ impl Supervisor {
                 recent_log: self.log_tail.iter().cloned().collect(),
             },
             Request::GetConfig => Response::Config {
-                config: self.config.clone(),
+                config: Box::new(self.config.clone()),
             },
-            Request::SetConfig { config } => match self.set_config(config).await {
+            Request::SetConfig { config } => match self.set_config(*config).await {
                 Ok(()) => Response::Ok,
                 Err(e) => Response::Error {
                     message: e.to_string(),

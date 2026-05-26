@@ -10,6 +10,17 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-05-26
+
+### Added
+- Audio bridge gains input and output volume sliders (0–200 % linear),
+  applied live without restarting peer sessions. Persists alongside the
+  existing audio device picks in `AudioConfig`. (#45)
+- Periodic playback-buffer telemetry: every ~2 s the pump task emits a
+  `debug` log with peak jitter-buffer depth (samples and ms), mpsc
+  queue pressure, and cumulative dropped-sample count, so post-mortems
+  on perceived audio latency have something concrete to point at. (#44)
+
 ## [0.1.6] - 2026-05-21
 
 ### Documentation

@@ -78,7 +78,10 @@ pub enum Request {
     GetConfig,
     /// Replace the Synbad config. The daemon persists it, regenerates the
     /// Core `.conf`, and restarts the Core if it was running.
-    SetConfig { config: Config },
+    ///
+    /// Boxed to keep `Request`'s by-value size small — see the matching
+    /// `Response::Config` for the same reason.
+    SetConfig { config: Box<Config> },
     /// Spawn the Core process (according to current config role).
     Start,
     /// Terminate the Core process.
@@ -134,7 +137,11 @@ pub enum Response {
         recent_log: Vec<String>,
     },
     Config {
-        config: Config,
+        // Boxed so this variant doesn't inflate the size of every
+        // `Response` value passed by value on the IPC path. Config grew
+        // past clippy's `large_enum_variant` 200-byte threshold once
+        // we added audio gain fields.
+        config: Box<Config>,
     },
     Peers {
         peers: Vec<DiscoveredPeer>,

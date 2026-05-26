@@ -67,6 +67,7 @@ use uuid::Uuid;
 
 use crate::capture::{self, PcmFrame};
 use crate::errors::AudioError;
+use crate::gain::GainHandle;
 use crate::playback as playback_mod;
 use crate::protocol::AudioSignal;
 use crate::rtc::{
@@ -160,10 +161,12 @@ impl AudioSession {
         cfg: &AudioConfig,
         role: SessionRole,
         events: mpsc::Sender<crate::bridge::AudioEvent>,
+        input_gain: GainHandle,
+        output_gain: GainHandle,
     ) -> Result<Self, AudioError> {
         let want_send = peer_wants_send(cfg, &peer_machine_id);
         let (capture_stream, capture_rx) = if want_send {
-            match capture::start_capture(cfg.input_device.as_deref()) {
+            match capture::start_capture(cfg.input_device.as_deref(), input_gain.clone()) {
                 Ok((s, rx)) => (Some(s), Some(rx)),
                 Err(e) => {
                     warn!(?e, "audio capture unavailable; sending silence-free");
@@ -182,7 +185,7 @@ impl AudioSession {
 
         let want_recv = peer_wants_recv(cfg, &peer_machine_id);
         let (playback_stream, playback_tx) = if want_recv {
-            match playback_mod::start_playback(cfg.output_device.as_deref()) {
+            match playback_mod::start_playback(cfg.output_device.as_deref(), output_gain.clone()) {
                 Ok((s, tx)) => (Some(s), Some(tx)),
                 Err(e) => {
                     warn!(?e, "audio playback unavailable; receive will be discarded");

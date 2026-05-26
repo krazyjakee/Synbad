@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::errors::AudioError;
+use crate::gain::{apply_gain_i16, GainHandle};
 
 /// One 20 ms frame at 48 kHz mono = 960 samples.
 pub const FRAME_SAMPLES: usize = 960;
@@ -35,6 +36,7 @@ pub type PcmFrame = Arc<[i16]>;
 /// is being drained — dropping it stops the cpal callback.
 pub fn start_capture(
     device_name: Option<&str>,
+    gain: GainHandle,
 ) -> Result<(Stream, mpsc::Receiver<PcmFrame>), AudioError> {
     let host = cpal::default_host();
     let device = pick_input_device(&host, device_name)?;
@@ -54,7 +56,7 @@ pub fn start_capture(
         "capture: opening cpal input"
     );
 
-    let accumulator = MonoAccumulator::new(channels, native_rate)?;
+    let accumulator = MonoAccumulator::new(channels, native_rate, gain)?;
     let (frame_tx, frame_rx) = mpsc::channel::<Arc<[i16]>>(32);
     let stream = match format {
         SampleFormat::I16 => build_input::<i16>(&device, &cfg, frame_tx, accumulator)?,
@@ -152,6 +154,9 @@ struct MonoAccumulator {
     /// `None` when the device already runs at 48 kHz; the no-resample path
     /// keeps the cost down for what is by far the common case.
     resampler: Option<ResamplerState>,
+    /// Linear gain applied after f32→i16 conversion and before the
+    /// frame is handed off to the encoder. Live-updated from the GUI.
+    gain: GainHandle,
 }
 
 struct ResamplerState {
@@ -161,7 +166,7 @@ struct ResamplerState {
 }
 
 impl MonoAccumulator {
-    fn new(channels: u16, native_rate: u32) -> Result<Self, AudioError> {
+    fn new(channels: u16, native_rate: u32, gain: GainHandle) -> Result<Self, AudioError> {
         let resampler = if native_rate == TARGET_RATE_HZ {
             None
         } else {
@@ -188,11 +193,16 @@ impl MonoAccumulator {
             channels,
             pending_48k: Vec::with_capacity(FRAME_SAMPLES * 2),
             resampler,
+            gain,
         })
     }
 
     fn feed<S: ToMonoF32>(&mut self, data: &[S]) -> Vec<PcmFrame> {
         let ch = self.channels.max(1) as usize;
+        // Sampled once per feed call rather than per sample so a slider
+        // tweak applies in one ~20 ms tick but doesn't pay an atomic load
+        // per sample.
+        let gain = self.gain.get();
         let Self {
             pending_48k,
             resampler,
@@ -220,7 +230,7 @@ impl MonoAccumulator {
                 match rs.inner.process(&adapter, 0, None) {
                     Ok(out) => {
                         for s in out.take_data() {
-                            pending_48k.push(f32_to_i16(s));
+                            pending_48k.push(apply_gain_i16(f32_to_i16(s), gain));
                         }
                     }
                     Err(e) => {
@@ -230,7 +240,7 @@ impl MonoAccumulator {
             }
         } else {
             for chunk in data.chunks_exact(ch) {
-                pending_48k.push(f32_to_i16(S::mono_f32(chunk)));
+                pending_48k.push(apply_gain_i16(f32_to_i16(S::mono_f32(chunk)), gain));
             }
         }
 
@@ -275,7 +285,8 @@ mod tests {
 
     #[test]
     fn mono_accumulator_at_native_48k_emits_full_frames() {
-        let mut acc = MonoAccumulator::new(1, 48_000).expect("build accumulator");
+        let mut acc =
+            MonoAccumulator::new(1, 48_000, GainHandle::default()).expect("build accumulator");
         let frames = acc.feed::<i16>(&vec![1234i16; 2000]);
         assert_eq!(frames.len(), 2, "2000 samples → two 960-sample frames");
         assert_eq!(frames[0].len(), FRAME_SAMPLES);
@@ -287,7 +298,8 @@ mod tests {
     #[test]
     fn mono_accumulator_resamples_44k1_up_to_48k() {
         // 1 second of audio at 44.1 kHz should produce ~50 frames at 48 kHz.
-        let mut acc = MonoAccumulator::new(1, 44_100).expect("build accumulator");
+        let mut acc =
+            MonoAccumulator::new(1, 44_100, GainHandle::default()).expect("build accumulator");
         let input = vec![0.25f32; 44_100];
         let mut emitted = 0;
         // Feed in cpal-callback-sized chunks so we exercise the loop.
@@ -304,7 +316,8 @@ mod tests {
 
     #[test]
     fn mono_accumulator_downsamples_96k_to_48k() {
-        let mut acc = MonoAccumulator::new(2, 96_000).expect("build accumulator");
+        let mut acc =
+            MonoAccumulator::new(2, 96_000, GainHandle::default()).expect("build accumulator");
         // 1 s stereo at 96 kHz = 192_000 interleaved samples.
         let input = vec![0.1f32; 192_000];
         let mut emitted = 0;
@@ -314,6 +327,22 @@ mod tests {
         assert!(
             emitted >= 45,
             "expected ~50 frames out of 1 s @ 96k, got {emitted}"
+        );
+    }
+
+    #[test]
+    fn mono_accumulator_applies_input_gain() {
+        let gain = GainHandle::new(0.5);
+        let mut acc = MonoAccumulator::new(1, 48_000, gain).expect("build accumulator");
+        // Feed a constant nonzero signal; with 0.5 gain the output i16
+        // should be roughly half magnitude.
+        let frames = acc.feed::<i16>(&vec![20_000i16; FRAME_SAMPLES]);
+        assert_eq!(frames.len(), 1);
+        let sample = frames[0][0];
+        // f32→i16 conversion isn't bit-exact, allow a few units of slop.
+        assert!(
+            (9_800..=10_200).contains(&sample),
+            "expected ~10000, got {sample}"
         );
     }
 }

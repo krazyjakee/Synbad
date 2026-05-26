@@ -26,6 +26,7 @@ pub mod bridge;
 pub mod capture;
 pub mod devices;
 pub mod errors;
+pub mod gain;
 pub mod playback;
 pub mod protocol;
 pub mod rtc;

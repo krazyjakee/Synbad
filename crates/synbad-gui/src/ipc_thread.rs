@@ -567,7 +567,9 @@ fn command_loop(
                     Cmd::Start => Request::Start,
                     Cmd::Stop => Request::Stop,
                     Cmd::Restart => Request::Restart,
-                    Cmd::SetConfig(config) => Request::SetConfig { config },
+                    Cmd::SetConfig(config) => Request::SetConfig {
+                        config: Box::new(config),
+                    },
                     Cmd::Refresh => Request::GetStatus,
                     Cmd::RefreshPeers => Request::ListPeers,
                     Cmd::StartPairing { machine_id } => Request::StartPairing { machine_id },
@@ -584,7 +586,7 @@ fn command_loop(
                         let _ = update_tx.send(Update::Status { state, recent_log });
                     }
                     Ok(Response::Config { config }) => {
-                        let _ = update_tx.send(Update::Config(config));
+                        let _ = update_tx.send(Update::Config(*config));
                     }
                     Ok(Response::Peers { peers }) => {
                         let _ = update_tx.send(Update::PeerSnapshot(peers));
@@ -627,7 +629,7 @@ fn bootstrap(conn: &mut Connection, update_tx: &Sender<Update>) -> Result<(), St
         .request(Request::GetConfig)
         .map_err(|e| e.to_string())?;
     if let Response::Config { config } = cfg {
-        let _ = update_tx.send(Update::Config(config));
+        let _ = update_tx.send(Update::Config(*config));
     }
     let st = conn
         .request(Request::GetStatus)
@@ -662,7 +664,7 @@ fn refetch_config(socket_path: &Path) -> Option<Config> {
     let mut c = Connection::connect(socket_path).ok()?;
     let r = c.request(Request::GetConfig).ok()?;
     if let Response::Config { config } = r {
-        Some(config)
+        Some(*config)
     } else {
         None
     }
