@@ -35,18 +35,14 @@ license and ships its own independent name, branding, and GUI.
   paired peers using WebRTC, so the machine you're driving sounds like
   the one you're sitting at. See [docs/AUDIO.md](docs/AUDIO.md).
 
-## Status
-
-Early planning. See [`docs/`](docs/) for the architecture, roadmap, and the
-licensing rationale.
+## Documentation
 
 | Doc | Purpose |
 |-----|---------|
 | [docs/USER-GUIDE.md](docs/USER-GUIDE.md) | Install, pair, share input across machines |
 | [docs/SECURITY.md](docs/SECURITY.md) | Threat model, identity, pairing, encrypted transport |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | Phased delivery plan and open decisions |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Component layout and Core integration strategy |
-| [docs/AUDIO.md](docs/AUDIO.md) | LAN audio bridge design (webrtc-rs + cpal) |
+| [docs/AUDIO.md](docs/AUDIO.md) | LAN audio bridge design |
 | [docs/DISCOVERY.md](docs/DISCOVERY.md) | LAN auto-discovery design |
 | [docs/CONFIG-SYNC.md](docs/CONFIG-SYNC.md) | LAN config-sync design |
 | [docs/LICENSING.md](docs/LICENSING.md) | License obligations and trademark constraints |

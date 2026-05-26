@@ -7,9 +7,9 @@
 ## Guiding principle
 
 Synbad is a **GUI + LAN orchestration layer** around the unmodified open-source
-Synergy Core. We do not fork or patch the Core in Phase 1. This keeps the Core
-swappable, minimizes C++ build pain, and keeps the licensing boundary clean
-(see [LICENSING.md](LICENSING.md)).
+Synergy Core. We do not fork or patch the Core. This keeps the Core swappable,
+minimizes C++ build pain, and keeps the licensing boundary clean (see
+[LICENSING.md](LICENSING.md)).
 
 ## Components
 
@@ -81,16 +81,19 @@ host-candidates only on the LAN. See [AUDIO.md](AUDIO.md).
 Splitting GUI from daemon lets discovery/sync keep running headless and keeps
 the GUI restartable without dropping input-sharing sessions.
 
-## Workspace layout (planned)
+## Workspace layout
 
 ```
 crates/
-  synbad-gui/        # Rust GUI (framework: see ROADMAP open decision)
+  synbad-gui/        # Rust GUI (egui)
   synbadd/           # daemon: supervision + discovery + sync
   synbad-discovery/  # mDNS/DNS-SD service (see DISCOVERY.md)
   synbad-config/     # config model, serialization, Core .conf generation
   synbad-sync/       # LAN peer-to-peer config sync (see CONFIG-SYNC.md)
+  synbad-crypto/     # authenticated, encrypted transport
+  synbad-audio/      # LAN audio bridge (see AUDIO.md)
   synbad-ipc/        # GUI <-> daemon IPC, and Core IPC client
+  synbad-update/     # in-app update checks
 docs/
 ```
 

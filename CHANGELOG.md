@@ -276,5 +276,5 @@ All notable changes to Synbad land here. Format follows
 
 ## [0.1.0] - TBD
 
-Initial public scaffold. See [docs/ROADMAP.md](docs/ROADMAP.md) for the phase
-plan; nothing is shipping in 0.1.0 yet beyond crate skeletons and design docs.
+Initial public scaffold; nothing is shipping in 0.1.0 yet beyond crate
+skeletons and design docs.
