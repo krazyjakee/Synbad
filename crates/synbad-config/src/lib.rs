@@ -14,7 +14,11 @@ use serde::{Deserialize, Serialize};
 pub mod paths;
 
 /// Top-level configuration model.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `Eq` is intentionally not derived because `AudioConfig` carries f32
+/// gain values; `PartialEq` is enough for the FS-watcher equality check
+/// in the supervisor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Role this machine plays: server (input source) or client.
@@ -232,7 +236,7 @@ pub struct BinaryPaths {
 /// brings up a bidirectional session with every trusted peer. The
 /// per-peer map is the only knob for muting one direction (or the whole
 /// link) on a specific peer.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AudioConfig {
     /// Master switch. When `false`, the audio subsystem doesn't bind its
     /// signaling listener and won't accept incoming sessions. When
@@ -246,6 +250,16 @@ pub struct AudioConfig {
     /// User-chosen output device name. `None` means "OS default."
     #[serde(default)]
     pub output_device: Option<String>,
+    /// Linear multiplier applied to captured (microphone) samples before
+    /// they're encoded. `1.0` = unity, `0.0` = mute, `2.0` = +6 dB.
+    /// Saturating-clamped to `[-1.0, 1.0]` after multiplication, so
+    /// values above 1.0 will clip loud sources.
+    #[serde(default = "default_gain")]
+    pub input_gain: f32,
+    /// Linear multiplier applied to received samples before they're
+    /// written to the output device. Same semantics as `input_gain`.
+    #[serde(default = "default_gain")]
+    pub output_gain: f32,
     /// Per-peer overrides keyed by `machine_id`. Absent = bidirectional
     /// when `enabled` is true.
     #[serde(default)]
@@ -256,12 +270,18 @@ pub struct AudioConfig {
     pub signal_port: u16,
 }
 
+fn default_gain() -> f32 {
+    1.0
+}
+
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             input_device: None,
             output_device: None,
+            input_gain: default_gain(),
+            output_gain: default_gain(),
             per_peer: BTreeMap::new(),
             signal_port: default_audio_signal_port(),
         }

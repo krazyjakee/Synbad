@@ -15,6 +15,7 @@ use tracing::{info, warn};
 
 use crate::devices;
 use crate::errors::AudioError;
+use crate::gain::GainHandle;
 use crate::session::{AudioSession, SessionRole};
 
 /// Commands the supervisor sends into the bridge. Not `Debug` because
@@ -89,6 +90,12 @@ pub struct AudioBridge {
     _identity: Arc<Identity>,
     _trust: Arc<Mutex<TrustedPeerStore>>,
     sessions: HashMap<String, AudioSession>,
+    /// Source-of-truth gain handles. Sessions clone these at start;
+    /// reconfigures store new f32 bits in-place so the live cpal streams
+    /// pick up the new value on the next callback without a session
+    /// restart.
+    input_gain: GainHandle,
+    output_gain: GainHandle,
 }
 
 impl AudioBridge {
@@ -97,11 +104,15 @@ impl AudioBridge {
         identity: Arc<Identity>,
         trust: Arc<Mutex<TrustedPeerStore>>,
     ) -> Self {
+        let input_gain = GainHandle::new(config.input_gain);
+        let output_gain = GainHandle::new(config.output_gain);
         Self {
             config,
             _identity: identity,
             _trust: trust,
             sessions: HashMap::new(),
+            input_gain,
+            output_gain,
         }
     }
 
@@ -158,6 +169,8 @@ impl AudioBridge {
                         &self.config,
                         role,
                         events.clone(),
+                        self.input_gain.clone(),
+                        self.output_gain.clone(),
                     )
                     .await
                     {
@@ -177,6 +190,16 @@ impl AudioBridge {
                 AudioCommand::Reconfigure(new_cfg) => {
                     let old_cfg = std::mem::replace(&mut self.config, new_cfg);
                     let new_cfg = &self.config;
+                    // Gain changes are live-updatable — write the new
+                    // values into the shared handles and every active
+                    // session's capture/playback callback picks them up
+                    // on the next tick. No teardown.
+                    if old_cfg.input_gain != new_cfg.input_gain {
+                        self.input_gain.set(new_cfg.input_gain);
+                    }
+                    if old_cfg.output_gain != new_cfg.output_gain {
+                        self.output_gain.set(new_cfg.output_gain);
+                    }
                     // A device swap invalidates every cpal stream we hold,
                     // so every session needs a clean restart. Per-peer
                     // routing flipping off is the other "active state

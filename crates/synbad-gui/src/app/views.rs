@@ -754,6 +754,53 @@ impl SynbadApp {
                 });
                 ui.end_row();
 
+                // Linear sliders, 0..=2.0. Unity is 100 %, 0 % mutes,
+                // 200 % is +6 dB (clamped at i16 saturation so loud
+                // sources clip rather than wrap). Matches the
+                // device-picker behaviour: change applies immediately
+                // and persists via SetAudioConfig.
+                ui.label("Input volume");
+                ui.add_enabled_ui(active, |ui| {
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut audio.input_gain, 0.0..=2.0)
+                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                .custom_parser(|s| {
+                                    s.trim_end_matches('%').parse::<f64>().ok().map(|n| n / 100.0)
+                                }),
+                        )
+                        .on_hover_text(
+                            "Microphone gain. 100% is unity; values above 100% \
+                             boost the signal but will clip loud sources.",
+                        )
+                        .changed()
+                    {
+                        audio_changed = true;
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Output volume");
+                ui.add_enabled_ui(active, |ui| {
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut audio.output_gain, 0.0..=2.0)
+                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                .custom_parser(|s| {
+                                    s.trim_end_matches('%').parse::<f64>().ok().map(|n| n / 100.0)
+                                }),
+                        )
+                        .on_hover_text(
+                            "Playback gain applied to received peer audio. \
+                             100% is unity; values above clip on loud peers.",
+                        )
+                        .changed()
+                    {
+                        audio_changed = true;
+                    }
+                });
+                ui.end_row();
+
                 ui.label("Signaling port");
                 let mut port = audio.signal_port as i32;
                 if ui

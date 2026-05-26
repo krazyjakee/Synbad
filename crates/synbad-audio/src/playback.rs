@@ -9,8 +9,10 @@
 
 #![allow(deprecated)] // cpal 0.17 `DeviceTrait::name`; see devices.rs.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, Stream, StreamConfig};
@@ -21,6 +23,7 @@ use tracing::{debug, trace, warn};
 
 use crate::capture::{FRAME_SAMPLES, TARGET_RATE_HZ};
 use crate::errors::AudioError;
+use crate::gain::{apply_gain_i16, GainHandle};
 
 /// Maximum tolerated jitter buffer depth, in seconds. Anything beyond this is
 /// dropped on the pump side to keep latency bounded — at 200 ms a listener can
@@ -32,6 +35,7 @@ const JITTER_CAP_SECS: f32 = 0.2;
 /// frames. Drop the [`Stream`] to stop playback.
 pub fn start_playback(
     device_name: Option<&str>,
+    gain: GainHandle,
 ) -> Result<(Stream, mpsc::Sender<crate::capture::PcmFrame>), AudioError> {
     let host = cpal::default_host();
     let device = pick_output_device(&host, device_name)?;
@@ -55,14 +59,26 @@ pub fn start_playback(
     let buffer: Arc<Mutex<Vec<i16>>> =
         Arc::new(Mutex::new(Vec::with_capacity(native_rate as usize)));
     let (tx, mut rx) = mpsc::channel::<Arc<[i16]>>(32);
+    // Cumulative dropped-sample counter shared between the pump task
+    // (writer) and the periodic logger (reader). AtomicU64 keeps it
+    // lock-free; we only ever increment.
+    let dropped_samples = Arc::new(AtomicU64::new(0));
 
     // Pump task: resamples (if needed) and shuttles incoming frames into
     // the shared buffer. When the buffer would exceed the jitter cap, drop
     // the oldest samples rather than the entire buffer so the audible gap
     // stays as short as possible.
     let pump_buffer = Arc::clone(&buffer);
+    let pump_drops = Arc::clone(&dropped_samples);
     let jitter_cap = ((native_rate as f32) * JITTER_CAP_SECS) as usize;
+    let pump_tx_for_pressure = tx.downgrade();
     tokio::spawn(async move {
+        // Periodic log of buffer depth + drop count so the user has
+        // something to point at when they say "the audio feels laggy".
+        // Sampled every ~2 s at debug level — quiet enough to leave on,
+        // loud enough to see steady-state vs. burst behaviour.
+        let mut last_log = Instant::now();
+        let mut peak_depth_samples: usize = 0;
         while let Some(frame) = rx.recv().await {
             let samples = match resampler.as_mut() {
                 Some(rs) => rs.process(&frame),
@@ -71,23 +87,46 @@ pub fn start_playback(
             if samples.is_empty() {
                 continue;
             }
-            let mut buf = pump_buffer.lock().expect("playback buffer poisoned");
-            let projected = buf.len() + samples.len();
-            if projected > jitter_cap {
-                let drop_n = projected - jitter_cap / 2;
-                let drop_n = drop_n.min(buf.len());
-                if drop_n > 0 {
-                    buf.drain(..drop_n);
-                    trace!(dropped = drop_n, "playback jitter cap exceeded");
+            let depth_after = {
+                let mut buf = pump_buffer.lock().expect("playback buffer poisoned");
+                let projected = buf.len() + samples.len();
+                if projected > jitter_cap {
+                    let drop_n = projected - jitter_cap / 2;
+                    let drop_n = drop_n.min(buf.len());
+                    if drop_n > 0 {
+                        buf.drain(..drop_n);
+                        pump_drops.fetch_add(drop_n as u64, Ordering::Relaxed);
+                        trace!(dropped = drop_n, "playback jitter cap exceeded");
+                    }
                 }
+                buf.extend_from_slice(&samples);
+                buf.len()
+            };
+            peak_depth_samples = peak_depth_samples.max(depth_after);
+
+            if last_log.elapsed() >= Duration::from_secs(2) {
+                let queue_pressure = pump_tx_for_pressure
+                    .upgrade()
+                    .map(|sender| 32 - sender.capacity())
+                    .unwrap_or(0);
+                let peak_ms = (peak_depth_samples as f32) * 1000.0 / native_rate as f32;
+                debug!(
+                    peak_depth_samples,
+                    peak_depth_ms = format!("{peak_ms:.1}"),
+                    cap_samples = jitter_cap,
+                    queue_pressure,
+                    dropped_total = pump_drops.load(Ordering::Relaxed),
+                    "playback buffer telemetry"
+                );
+                last_log = Instant::now();
+                peak_depth_samples = 0;
             }
-            buf.extend_from_slice(&samples);
         }
     });
 
     let stream = match format {
-        SampleFormat::I16 => build_output::<i16>(&device, &cfg, channels, buffer)?,
-        SampleFormat::F32 => build_output::<f32>(&device, &cfg, channels, buffer)?,
+        SampleFormat::I16 => build_output::<i16>(&device, &cfg, channels, buffer, gain)?,
+        SampleFormat::F32 => build_output::<f32>(&device, &cfg, channels, buffer, gain)?,
         other => {
             return Err(AudioError::StreamBuild(format!(
                 "unsupported sample format: {other:?}"
@@ -120,6 +159,7 @@ fn build_output<S>(
     cfg: &StreamConfig,
     channels: u16,
     buffer: Arc<Mutex<Vec<i16>>>,
+    gain: GainHandle,
 ) -> Result<Stream, AudioError>
 where
     S: cpal::SizedSample + FromMonoI16 + cpal::Sample + 'static,
@@ -131,7 +171,11 @@ where
             cfg,
             move |out: &mut [S], _info| {
                 let mut buf = buffer.lock().expect("playback buffer poisoned");
-                fill_output_from_buffer::<S>(out, &mut buf, ch);
+                // Sampled once per callback so a slider tweak applies in
+                // one buffer tick (~10 ms) without an atomic load per
+                // sample.
+                let g = gain.get();
+                fill_output_from_buffer::<S>(out, &mut buf, ch, g);
             },
             err_fn,
             None,
@@ -147,15 +191,16 @@ where
 /// every element the iterator hasn't yielded by the time it drops, which
 /// would lose ~75 % of audio when the cpal callback is smaller than the
 /// jitter buffer it's reading from.
-fn fill_output_from_buffer<S: FromMonoI16>(out: &mut [S], buf: &mut Vec<i16>, ch: usize) {
+fn fill_output_from_buffer<S: FromMonoI16>(out: &mut [S], buf: &mut Vec<i16>, ch: usize, gain: f32) {
     let ch = ch.max(1);
     let want = out.len() / ch;
     let take = want.min(buf.len());
     let mut buf_iter = buf.drain(..take);
     for frame in out.chunks_mut(ch) {
         let sample = buf_iter.next().unwrap_or(0);
+        let amplified = apply_gain_i16(sample, gain);
         for slot in frame.iter_mut() {
-            *slot = S::from_mono_i16(sample);
+            *slot = S::from_mono_i16(amplified);
         }
     }
 }
@@ -273,7 +318,7 @@ mod tests {
         // than the buffered audio must leave the tail in the buffer.
         let mut buf: Vec<i16> = (0..2000i16).collect();
         let mut out = vec![0i16; 480]; // mono callback, 480 samples
-        fill_output_from_buffer::<i16>(&mut out, &mut buf, 1);
+        fill_output_from_buffer::<i16>(&mut out, &mut buf, 1, 1.0);
 
         assert_eq!(out.first(), Some(&0));
         assert_eq!(out.last(), Some(&479));
@@ -285,7 +330,7 @@ mod tests {
     fn fill_output_fans_mono_to_stereo() {
         let mut buf: Vec<i16> = vec![1000, 2000, 3000];
         let mut out = vec![0i16; 6]; // 3 frames * 2 channels
-        fill_output_from_buffer::<i16>(&mut out, &mut buf, 2);
+        fill_output_from_buffer::<i16>(&mut out, &mut buf, 2, 1.0);
         assert_eq!(out, vec![1000, 1000, 2000, 2000, 3000, 3000]);
         assert!(buf.is_empty());
     }
@@ -294,9 +339,25 @@ mod tests {
     fn fill_output_pads_underrun_with_silence() {
         let mut buf: Vec<i16> = vec![7777];
         let mut out = vec![123i16; 4]; // stereo, 2 frames; only one sample available
-        fill_output_from_buffer::<i16>(&mut out, &mut buf, 2);
+        fill_output_from_buffer::<i16>(&mut out, &mut buf, 2, 1.0);
         assert_eq!(out, vec![7777, 7777, 0, 0]);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn fill_output_applies_gain() {
+        let mut buf: Vec<i16> = vec![10_000, -10_000];
+        let mut out = vec![0i16; 2]; // mono, 2 samples
+        fill_output_from_buffer::<i16>(&mut out, &mut buf, 1, 0.5);
+        assert_eq!(out, vec![5_000, -5_000]);
+    }
+
+    #[test]
+    fn fill_output_zero_gain_mutes() {
+        let mut buf: Vec<i16> = vec![20_000; 4];
+        let mut out = vec![0i16; 4];
+        fill_output_from_buffer::<i16>(&mut out, &mut buf, 1, 0.0);
+        assert_eq!(out, vec![0, 0, 0, 0]);
     }
 
     #[test]

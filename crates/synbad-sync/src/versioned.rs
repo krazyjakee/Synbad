@@ -154,7 +154,10 @@ pub enum MergeOutcome {
 /// `clock` is the local Lamport counter — bumped on every local edit and
 /// raised to `max(self, peer)` on every merge. Subsequent local edits
 /// always carry a stamp higher than anything we've ever observed.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `Eq` is intentionally not derived because `Config` carries f32 fields
+/// (audio gains); `PartialEq` is enough for all current callers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VersionedConfig {
     pub config: Config,
     #[serde(default)]
