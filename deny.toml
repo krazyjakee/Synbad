@@ -22,6 +22,11 @@ ignore = [
     "RUSTSEC-2024-0370",
     # Transitive via webrtc crates; no migration path until upstream moves off.
     "RUSTSEC-2025-0057", # fxhash
+    # Transitive via opus 0.3 (audiopus_sys is its -sys build crate). The
+    # CMake 4.0 incompatibility flagged in the advisory is the same one we
+    # work around in release builds (see PR #39); revisit if the `opus`
+    # crate moves to a maintained -sys shim.
+    "RUSTSEC-2026-0150", # audiopus_sys
 ]
 
 [licenses]
