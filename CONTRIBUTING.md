@@ -4,9 +4,8 @@
 
 # Contributing to Synbad
 
-Thanks for your interest! Synbad is early-stage; the most useful contributions
-right now are design feedback, packaging fixes, and small focused PRs that
-move the [roadmap](docs/ROADMAP.md) forward.
+Thanks for your interest! The most useful contributions right now are
+design feedback, packaging fixes, and small focused PRs.
 
 ## Before you start
 
