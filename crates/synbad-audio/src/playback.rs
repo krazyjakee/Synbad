@@ -25,11 +25,18 @@ use crate::capture::{FRAME_SAMPLES, TARGET_RATE_HZ};
 use crate::errors::AudioError;
 use crate::gain::{apply_gain_i16, GainHandle};
 
-/// Maximum tolerated jitter buffer depth, in seconds. Anything beyond this is
-/// dropped on the pump side to keep latency bounded — at 200 ms a listener can
-/// tell something glitched but the bridge stays responsive instead of building
-/// up unbounded delay when the network bursts ahead of playback.
-const JITTER_CAP_SECS: f32 = 0.2;
+/// Maximum tolerated jitter buffer depth, in seconds. Beyond this the pump
+/// drops oldest samples down to [`JITTER_TARGET_SECS`] so steady-state
+/// latency converges on the target instead of oscillating up to the cap.
+/// 60 ms gives ~3 Opus frames of jitter tolerance on a LAN — enough to
+/// absorb scheduling hiccups without users hearing the lag.
+const JITTER_CAP_SECS: f32 = 0.06;
+
+/// After a cap hit, the post-drop depth the pump leaves in the buffer.
+/// Set above one Opus frame (20 ms) so we don't underrun on the very next
+/// cpal callback, but well below the cap so the catch-up drop is visible
+/// in the telemetry.
+const JITTER_TARGET_SECS: f32 = 0.03;
 
 /// Build a playback stream and return the sender used to feed it PCM
 /// frames. Drop the [`Stream`] to stop playback.
@@ -71,6 +78,7 @@ pub fn start_playback(
     let pump_buffer = Arc::clone(&buffer);
     let pump_drops = Arc::clone(&dropped_samples);
     let jitter_cap = ((native_rate as f32) * JITTER_CAP_SECS) as usize;
+    let jitter_target = ((native_rate as f32) * JITTER_TARGET_SECS) as usize;
     let pump_tx_for_pressure = tx.downgrade();
     tokio::spawn(async move {
         // Periodic log of buffer depth + drop count so the user has
@@ -91,8 +99,7 @@ pub fn start_playback(
                 let mut buf = pump_buffer.lock().expect("playback buffer poisoned");
                 let projected = buf.len() + samples.len();
                 if projected > jitter_cap {
-                    let drop_n = projected - jitter_cap / 2;
-                    let drop_n = drop_n.min(buf.len());
+                    let drop_n = projected.saturating_sub(jitter_target).min(buf.len());
                     if drop_n > 0 {
                         buf.drain(..drop_n);
                         pump_drops.fetch_add(drop_n as u64, Ordering::Relaxed);
@@ -114,6 +121,7 @@ pub fn start_playback(
                     peak_depth_samples,
                     peak_depth_ms = format!("{peak_ms:.1}"),
                     cap_samples = jitter_cap,
+                    target_samples = jitter_target,
                     queue_pressure,
                     dropped_total = pump_drops.load(Ordering::Relaxed),
                     "playback buffer telemetry"
