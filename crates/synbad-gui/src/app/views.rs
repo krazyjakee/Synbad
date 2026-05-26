@@ -766,7 +766,10 @@ impl SynbadApp {
                             egui::Slider::new(&mut audio.input_gain, 0.0..=2.0)
                                 .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
                                 .custom_parser(|s| {
-                                    s.trim_end_matches('%').parse::<f64>().ok().map(|n| n / 100.0)
+                                    s.trim_end_matches('%')
+                                        .parse::<f64>()
+                                        .ok()
+                                        .map(|n| n / 100.0)
                                 }),
                         )
                         .on_hover_text(
@@ -787,7 +790,10 @@ impl SynbadApp {
                             egui::Slider::new(&mut audio.output_gain, 0.0..=2.0)
                                 .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
                                 .custom_parser(|s| {
-                                    s.trim_end_matches('%').parse::<f64>().ok().map(|n| n / 100.0)
+                                    s.trim_end_matches('%')
+                                        .parse::<f64>()
+                                        .ok()
+                                        .map(|n| n / 100.0)
                                 }),
                         )
                         .on_hover_text(

@@ -191,7 +191,12 @@ where
 /// every element the iterator hasn't yielded by the time it drops, which
 /// would lose ~75 % of audio when the cpal callback is smaller than the
 /// jitter buffer it's reading from.
-fn fill_output_from_buffer<S: FromMonoI16>(out: &mut [S], buf: &mut Vec<i16>, ch: usize, gain: f32) {
+fn fill_output_from_buffer<S: FromMonoI16>(
+    out: &mut [S],
+    buf: &mut Vec<i16>,
+    ch: usize,
+    gain: f32,
+) {
     let ch = ch.max(1);
     let want = out.len() / ch;
     let take = want.min(buf.len());
