@@ -14,6 +14,14 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # audiopus_sys 0.2.2 bundles libopus, whose CMakeLists.txt declares
+  # cmake_minimum_required(VERSION < 3.5) — the CMake 4.x now shipping on the
+  # Windows runners rejects that outright. The Linux/macOS jobs dodge the
+  # bundled build (system deps via pkg-config / Homebrew opus), but Windows has
+  # no system libopus and builds the bundled copy. Setting this env var
+  # (CMake 4.0.3+) tells CMake to configure legacy projects anyway. Harmless on
+  # platforms that don't invoke CMake. Mirrors release.yml (PR #39).
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
   fmt:
