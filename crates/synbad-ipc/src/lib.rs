@@ -323,12 +323,73 @@ pub struct PeerAudioStatus {
 pub enum DaemonState {
     Stopped,
     Starting,
-    Running { pid: u32 },
-    Crashed { exit_code: Option<i32> },
+    Running {
+        pid: u32,
+    },
+    /// Client role: the link to the server dropped (or was never established)
+    /// and the supervisor is gently retrying with capped exponential backoff.
+    /// This is **not** a terminal state — a paired, enabled client keeps
+    /// trying and recovers on its own once the server is reachable again.
+    /// `attempt` is the consecutive fast-fail count; `next_retry_secs` is the
+    /// backoff before the next dial.
+    Reconnecting {
+        attempt: u32,
+        next_retry_secs: u64,
+    },
+    Crashed {
+        exit_code: Option<i32>,
+    },
 }
 
 impl DaemonState {
     pub fn is_running(&self) -> bool {
         matches!(self, DaemonState::Running { .. } | DaemonState::Starting)
+    }
+
+    /// `true` while the supervisor still intends to bring the link up —
+    /// either it's up/coming-up, or it's a client retrying a reachable
+    /// server. Distinct from a terminal `Crashed`/`Stopped`.
+    pub fn is_active(&self) -> bool {
+        self.is_running() || matches!(self, DaemonState::Reconnecting { .. })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnecting_is_active_but_not_running() {
+        // The Core is gone while reconnecting, so the GUI must treat it as
+        // not-running (peers can't survive a dead Core) — but it is still
+        // "active" (the supervisor keeps trying), not terminal like Crashed.
+        let s = DaemonState::Reconnecting {
+            attempt: 2,
+            next_retry_secs: 4,
+        };
+        assert!(!s.is_running());
+        assert!(s.is_active());
+    }
+
+    #[test]
+    fn crashed_and_stopped_are_neither_running_nor_active() {
+        for s in [
+            DaemonState::Crashed { exit_code: Some(1) },
+            DaemonState::Stopped,
+        ] {
+            assert!(!s.is_running());
+            assert!(!s.is_active());
+        }
+    }
+
+    #[test]
+    fn reconnecting_round_trips_through_json() {
+        // It rides the same IPC event channel as every other state.
+        let s = DaemonState::Reconnecting {
+            attempt: 7,
+            next_retry_secs: 30,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert_eq!(s, serde_json::from_str(&json).unwrap());
     }
 }

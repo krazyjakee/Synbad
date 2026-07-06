@@ -10,6 +10,31 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+### Changed
+- Client role now retries the server **indefinitely** with capped exponential
+  backoff instead of giving up after 3 reconnect attempts. A paired, enabled
+  link is level-triggered: if the server reboots, hits a network blip, or
+  simply starts after the client, the client recovers on its own with no
+  restart. A new non-terminal `DaemonState::Reconnecting { attempt,
+  next_retry_secs }` surfaces "reconnecting to server…" in the UI instead of a
+  terminal "crashed". Server role is unchanged (still gives up after
+  `MAX_FAST_FAILS` startup failures). The reconnect backoff now actually
+  escalates across consecutive fast-fails — it was previously reset to the
+  minimum on every spawn. (#50)
+
+### Security
+- `memmap2` 0.9.10 → 0.9.11 (RUSTSEC-2026-0186: unchecked pointer offset). (#68)
+- `quinn-proto` 0.11.14 → 0.11.16 (RUSTSEC-2026-0185: unbounded out-of-order
+  stream reassembly). (#67)
+- `anyhow` is on 1.0.103, which carries the fix for RUSTSEC-2026-0190
+  (`Error::downcast_mut` unsoundness). (#75)
+- Added `.cargo/audit.toml` so `cargo audit` / the audit-check workflow agree
+  with `deny.toml` on the set of transitive advisories with no in-range fix
+  (GTK3 stack, `glib`, `paste`, `proc-macro-error`, `fxhash`, `audiopus_sys`,
+  `ttf-parser`, `quick-xml` build/`xcb`-only reach). These are acknowledged and
+  tracked to the next eframe / opus / str0m bump, not left unhandled.
+  (#51–#62, #70–#74)
+
 ## [0.1.7] - 2026-05-26
 
 ### Added

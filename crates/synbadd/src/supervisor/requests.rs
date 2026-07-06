@@ -12,7 +12,7 @@ use tokio::sync::oneshot;
 
 use crate::pairing;
 
-use super::Supervisor;
+use super::{Supervisor, MIN_BACKOFF};
 
 impl Supervisor {
     pub(super) async fn handle_request(&mut self, req: IncomingRequest) {
@@ -35,8 +35,10 @@ impl Supervisor {
                 self.desired_running = true;
                 // Explicit user action resets the give-up state from a
                 // prior instant-fail loop — they may have fixed the
-                // missing-deps issue and want us to try again.
+                // missing-deps issue and want us to try again. Reset the
+                // reconnect backoff too so the retry starts fast.
                 self.fast_fail_count = 0;
+                self.backoff = MIN_BACKOFF;
                 match self.start_core().await {
                     Ok(()) => Response::Ok,
                     Err(e) => Response::Error {
@@ -53,6 +55,7 @@ impl Supervisor {
             Request::Restart => {
                 self.desired_running = true;
                 self.fast_fail_count = 0;
+                self.backoff = MIN_BACKOFF;
                 self.stop_core().await;
                 match self.start_core().await {
                     Ok(()) => Response::Ok,

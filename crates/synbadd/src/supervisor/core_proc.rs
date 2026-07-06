@@ -23,8 +23,7 @@ use synbad_ipc::{DaemonState, Event};
 use crate::binaries::{CoreLayout, ResolvedCore, Resolver};
 
 use super::{
-    CoreResolveOutcome, Supervisor, FAST_FAIL_WINDOW, MAX_BACKOFF, MAX_CLIENT_RECONNECTS,
-    MAX_FAST_FAILS, MIN_BACKOFF,
+    CoreResolveOutcome, Supervisor, FAST_FAIL_WINDOW, MAX_BACKOFF, MAX_FAST_FAILS, MIN_BACKOFF,
 };
 
 impl Supervisor {
@@ -120,7 +119,12 @@ impl Supervisor {
         });
 
         self.set_state(DaemonState::Running { pid });
-        self.backoff = MIN_BACKOFF;
+        // NB: backoff is intentionally *not* reset here. Spawning is not proof
+        // the link came up — a client dialing an unreachable server spawns,
+        // instantly fails, and respawns. Resetting on spawn would pin the
+        // backoff at MIN and hammer the server every ~500ms. It's reset only
+        // once a child clears FAST_FAIL_WINDOW (see `handle_child_exit`) or on
+        // an explicit user Start/Restart.
         self.started_at = Some(Instant::now());
         Ok(())
     }
@@ -200,7 +204,12 @@ impl Supervisor {
         if instant_fail {
             self.fast_fail_count += 1;
         } else {
+            // The child proved it could stay up past the fast-fail window —
+            // this is a mid-session drop, not a startup/reachability failure.
+            // Reset both the fast-fail budget and the reconnect backoff so
+            // recovery starts fast again.
             self.fast_fail_count = 0;
+            self.backoff = MIN_BACKOFF;
         }
 
         if !self.desired_running {
@@ -208,67 +217,58 @@ impl Supervisor {
             return;
         }
 
-        // Both roles cap consecutive instant-fails, but for different
-        // reasons: server-role usually means a startup problem (port in
-        // use, missing libs) and client-role means the server is
-        // unreachable. The thresholds and messaging differ; the reset
-        // path (a child that runs longer than FAST_FAIL_WINDOW) is shared,
-        // so a client that successfully connects and is later dropped
-        // gets a fresh budget of MAX_CLIENT_RECONNECTS retries.
+        // The two roles fail for different reasons and so are handled
+        // differently. Server-role instant-fails usually mean a startup
+        // problem (port in use, missing libs) that retrying won't fix, so we
+        // give up after MAX_FAST_FAILS. Client-role means the server is
+        // unreachable — a paired, enabled link is level-triggered, so we keep
+        // gently retrying with capped exponential backoff and recover on our
+        // own once the server comes back (reboot, network blip, or a server
+        // that simply started after us). The shared reset path (a child that
+        // clears FAST_FAIL_WINDOW) gives a mid-session drop a fresh, fast
+        // budget for either role.
         let is_client = matches!(self.config.role, NodeRole::Client);
-        let limit = if is_client {
-            MAX_CLIENT_RECONNECTS
-        } else {
-            MAX_FAST_FAILS
-        };
 
-        if self.fast_fail_count >= limit {
-            // Give up. The exit code stays on the chip so the GUI surfaces
-            // what happened, and we record a log line explaining why we
-            // stopped retrying.
+        if !is_client && self.fast_fail_count >= MAX_FAST_FAILS {
+            // Server role gives up. The exit code stays on the chip so the GUI
+            // surfaces what happened, plus a log line explaining the stop.
             self.desired_running = false;
-            let msg = if is_client {
-                format!(
-                    "[synbad] could not reach server after {} reconnect attempts \
-                     (exit {:?}); giving up. Check the server is running and \
-                     reachable, then click Start.",
-                    self.fast_fail_count, code
-                )
-            } else {
-                format!(
-                    "[synbad] core exited within {:?} on {} consecutive attempts (exit {:?}); \
-                     giving up. Check that Deskflow's runtime deps (Qt6) are installed, \
-                     then click Start.",
-                    FAST_FAIL_WINDOW, self.fast_fail_count, code
-                )
-            };
+            let msg = format!(
+                "[synbad] core exited within {:?} on {} consecutive attempts (exit {:?}); \
+                 giving up. Check that Deskflow's runtime deps (Qt6) are installed, \
+                 then click Start.",
+                FAST_FAIL_WINDOW, self.fast_fail_count, code
+            );
             tracing::error!("{}", msg);
             self.record_log(msg);
             self.set_state(DaemonState::Crashed { exit_code: code });
             return;
         }
 
-        self.set_state(DaemonState::Crashed { exit_code: code });
         let delay = self.backoff;
         self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
         if is_client {
-            // Surface reconnect attempts in the user-visible log so the chip
-            // doesn't just look stuck at "Crashed" while we back off. Only
-            // count fast-fail retries against the cap — a long-lived run
-            // that just got dropped is "attempt 1 of N" again.
+            // Level-triggered reconnect: surface a non-terminal `Reconnecting`
+            // status (not `Crashed`) so the UI shows we're still trying, and
+            // keep retrying indefinitely until the server is reachable or the
+            // user stops. `attempt` is the consecutive fast-fail count; a
+            // long-lived run that just got dropped resets it to "attempt 1".
+            let attempt = self.fast_fail_count.saturating_add(1);
+            self.set_state(DaemonState::Reconnecting {
+                attempt,
+                next_retry_secs: delay.as_secs(),
+            });
             self.record_log(format!(
-                "[synbad] disconnected from server (exit {:?}); reconnecting in {:?} \
-                 (attempt {} of {})",
-                code,
-                delay,
-                self.fast_fail_count + 1,
-                MAX_CLIENT_RECONNECTS
+                "[synbad] can't reach server (exit {:?}); retrying in {:?} (attempt {})",
+                code, delay, attempt
             ));
+        } else {
+            self.set_state(DaemonState::Crashed { exit_code: code });
         }
         tracing::warn!(
             ?delay,
             attempt = self.fast_fail_count,
-            "core crashed, will restart"
+            "core exited, will restart"
         );
         tokio::time::sleep(delay).await;
         if self.desired_running {

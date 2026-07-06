@@ -138,6 +138,15 @@ impl SynbadApp {
                 ),
                 DaemonState::Starting => (egui::Color32::YELLOW, "Core starting…".into()),
                 DaemonState::Stopped => (egui::Color32::GRAY, "Core stopped".into()),
+                DaemonState::Reconnecting {
+                    attempt,
+                    next_retry_secs,
+                } => (
+                    egui::Color32::YELLOW,
+                    format!(
+                        "Reconnecting to server… (attempt {attempt}, retry in {next_retry_secs}s)"
+                    ),
+                ),
                 DaemonState::Crashed { exit_code } => (
                     egui::Color32::LIGHT_RED,
                     format!("Core crashed (exit {exit_code:?})"),
@@ -314,6 +323,22 @@ impl SynbadApp {
                 ),
             };
         }
+        if let DaemonState::Reconnecting {
+            attempt,
+            next_retry_secs,
+        } = &self.state
+        {
+            return HealthSummary {
+                icon: "●",
+                colour: egui::Color32::YELLOW,
+                headline: "Reconnecting to server",
+                detail: Some(format!(
+                    "Can't reach the server yet — retrying in {next_retry_secs}s \
+                     (attempt {attempt}). This recovers on its own once the server \
+                     is back."
+                )),
+            };
+        }
         if let DaemonState::Crashed { exit_code } = &self.state {
             return HealthSummary {
                 icon: "●",
@@ -352,7 +377,9 @@ impl SynbadApp {
                 headline: "Everything's working",
                 detail: None,
             },
-            DaemonState::Crashed { .. } => unreachable!("handled above"),
+            DaemonState::Reconnecting { .. } | DaemonState::Crashed { .. } => {
+                unreachable!("handled above")
+            }
         }
     }
 
@@ -1145,6 +1172,13 @@ pub(super) fn state_chip(s: &DaemonState, connected: bool) -> (egui::Color32, St
         DaemonState::Running { pid } => {
             (egui::Color32::LIGHT_GREEN, format!("running (pid {})", pid))
         }
+        DaemonState::Reconnecting {
+            attempt,
+            next_retry_secs,
+        } => (
+            egui::Color32::YELLOW,
+            format!("reconnecting (attempt {}, {}s)", attempt, next_retry_secs),
+        ),
         DaemonState::Crashed { exit_code } => (
             egui::Color32::LIGHT_RED,
             format!("crashed (exit {:?})", exit_code),
