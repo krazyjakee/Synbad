@@ -10,7 +10,14 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-07-18
+
 ### Changed
+- Playback jitter buffer cap dropped from 200 ms to 60 ms with an explicit
+  30 ms post-drop target, so the pump converges on the target instead of
+  oscillating up to the cap. Knocks ~100 ms off steady-state perceived input
+  lag without touching any other audio path; telemetry gains a
+  `target_samples` field. (#49)
 - Client role now retries the server **indefinitely** with capped exponential
   backoff instead of giving up after 3 reconnect attempts. A paired, enabled
   link is level-triggered: if the server reboots, hits a network blip, or
