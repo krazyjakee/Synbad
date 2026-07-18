@@ -1,0 +1,41 @@
+# cargo-audit config — consumed by `cargo audit` and the rustsec/audit-check
+# GitHub Action (.github/workflows/audit.yml), which is what files the
+# RUSTSEC advisory issues on this repo.
+#
+# Every ID below is a *transitive* advisory with no in-range upgrade: the
+# vulnerable crate is pinned by a parent we can't move without a major bump of
+# the GUI (eframe/winit → GTK3), the audio stack (opus → audiopus_sys), or the
+# WebRTC stack (str0m → fxhash). They are acknowledged, not unaddressed —
+# mirrors the `ignore` set in deny.toml, kept in sync so both tools agree.
+#
+# Directly-fixable advisories are NOT ignored here — they're fixed in Cargo.lock
+# instead (memmap2 0.9.11, quinn-proto 0.11.16, anyhow 1.0.103). Revisit this
+# list on the next eframe / opus / str0m bump and drop whatever no longer fires.
+[advisories]
+ignore = [
+    # --- GTK3 stack: transitive via eframe → winit. GUI stays on GTK3 until
+    #     eframe ships a maintained replacement; revisit on the next eframe bump.
+    "RUSTSEC-2024-0412", # gdk           unmaintained
+    "RUSTSEC-2024-0413", # atk           unmaintained
+    "RUSTSEC-2024-0415", # gtk           unmaintained
+    "RUSTSEC-2024-0416", # atk-sys       unmaintained
+    "RUSTSEC-2024-0418", # gdk-sys       unmaintained
+    "RUSTSEC-2024-0419", # gtk3-macros   unmaintained
+    "RUSTSEC-2024-0420", # gtk-sys       unmaintained
+    "RUSTSEC-2024-0429", # glib          unsound (VariantStrIter; synbad never
+                         #               iterates a glib Variant of strings)
+    # --- proc-macro / build-time deps ---
+    "RUSTSEC-2024-0370", # proc-macro-error unmaintained (via winit dialog stack)
+    "RUSTSEC-2024-0436", # paste            unmaintained (build-time proc macro)
+    # --- audio stack ---
+    "RUSTSEC-2026-0150", # audiopus_sys  unmaintained (opus 0.3 -sys build crate)
+    # --- WebRTC stack ---
+    "RUSTSEC-2025-0057", # fxhash        unmaintained (via str0m/webrtc)
+    # --- font / XML parsers reached only with trusted, local input ---
+    "RUSTSEC-2026-0192", # ttf-parser    unmaintained (epaint parses bundled fonts)
+    "RUSTSEC-2026-0194", # quick-xml     quadratic dup-attr check. Reached only at
+                         #               build time (wayland-scanner) and by xcb on
+                         #               local X protocol data — not untrusted XML.
+    "RUSTSEC-2026-0195", # quick-xml     unbounded NsReader alloc; same trusted,
+                         #               non-remote reach as 0194.
+]

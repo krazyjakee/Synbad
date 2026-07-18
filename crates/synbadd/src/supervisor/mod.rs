@@ -52,16 +52,15 @@ pub(super) const MIN_BACKOFF: Duration = Duration::from_millis(500);
 pub(super) const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// A child that exits within this window of being spawned is treated as an
 /// "instant fail" — usually a missing shared library, bad CLI, or refused
-/// permission. We count consecutive instant-fails and stop the restart loop
-/// after [`MAX_FAST_FAILS`] of them.
+/// permission. We count consecutive instant-fails; in the **server** role we
+/// stop the restart loop after [`MAX_FAST_FAILS`] of them (a startup problem
+/// retrying won't fix). The **client** role never gives up — an unreachable
+/// server is level-triggered, so it keeps gently retrying with capped
+/// exponential backoff and recovers on its own (see `handle_child_exit`). A
+/// child that clears this window resets the counter and the backoff for both
+/// roles, so a mid-session drop always gets a fresh, fast budget.
 pub(super) const FAST_FAIL_WINDOW: Duration = Duration::from_secs(2);
 pub(super) const MAX_FAST_FAILS: u32 = 5;
-/// Client role: cap consecutive failed reconnects. A child that ran long
-/// enough to clear [`FAST_FAIL_WINDOW`] resets the counter, so a transient
-/// mid-session disconnect still gets a fresh budget — only an unreachable
-/// server (3 fast failures in a row) makes us give up.
-pub(super) const MAX_CLIENT_RECONNECTS: u32 = 3;
-
 /// How often the supervisor sweeps visible+trusted peers looking for
 /// audio sessions that *should* exist but don't, and dials the missing
 /// ones. The handshake/connect path is the only failure-prone step
@@ -919,10 +918,10 @@ impl Supervisor {
     /// the process alive without reconnecting. The supervisor's exit-driven
     /// retry loop never engages in that case, so we kill the child on the
     /// signal — `handle_child_exit` then runs the normal client-reconnect
-    /// path capped by [`MAX_CLIENT_RECONNECTS`].
+    /// path (gentle capped-backoff retry that never gives up).
     fn maybe_force_reconnect(&mut self, line: &str) {
-        // Don't recurse on our own "[synbad] disconnected from server …"
-        // status line emitted by `handle_child_exit`.
+        // Don't recurse on our own "[synbad] can't reach server …" status
+        // line emitted by `handle_child_exit`.
         if line.starts_with("[synbad]") {
             return;
         }
