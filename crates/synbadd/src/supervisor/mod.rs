@@ -119,7 +119,10 @@ pub struct Supervisor {
     pub(super) log_tail: VecDeque<String>,
     pub(super) events: broadcast::Sender<Event>,
     /// `true` after a Start (or after a SetConfig while already running).
-    /// Drives auto-restart when the Core exits unexpectedly.
+    /// Drives auto-restart when the Core exits unexpectedly, and gates
+    /// the audio subsystem: audio is online only while this is true *and*
+    /// `config.audio.enabled` (see [`Supervisor::reconcile_audio_subsystem`])
+    /// so input sharing and audio go up and down together.
     pub(super) desired_running: bool,
     /// Send `()` to terminate the supervised child. `None` when not running.
     pub(super) child_kill: Option<oneshot::Sender<()>>,
@@ -193,9 +196,10 @@ pub struct Supervisor {
     /// handles like we do with pairing tasks.
     pub(super) sync_tasks: Vec<tokio::task::JoinHandle<()>>,
 
-    /// Audio bridge handle (commands + events). `None` if audio is
-    /// disabled in config at startup. Toggling `audio.enabled` requires a
-    /// daemon restart in v1.
+    /// Audio bridge handle (commands + events). `None` whenever the
+    /// audio subsystem is offline — i.e. Synbad isn't started or
+    /// `config.audio.enabled` is false. Brought up / torn down live by
+    /// [`Supervisor::reconcile_audio_subsystem`]; no daemon restart needed.
     pub(super) audio: Option<synbad_audio::AudioBridgeHandle>,
     /// Run-loop task driving the bridge. Held so the bridge isn't dropped.
     pub(super) _audio_task: Option<tokio::task::JoinHandle<()>>,
@@ -440,14 +444,12 @@ impl Supervisor {
             },
         };
 
-        // Bring the audio subsystem up if it was enabled in the saved
-        // config. Failure here is logged but non-fatal — the daemon
-        // still serves IPC and other peers continue to work.
-        if supervisor.config.audio.enabled {
-            if let Err(e) = supervisor.ensure_audio_subsystem().await {
-                tracing::warn!(?e, "audio subsystem failed to start");
-            }
-        }
+        // Audio is coupled to the run state: it comes up only once
+        // Synbad is started. At construction `desired_running` is false
+        // (the Core hasn't been told to start yet), so this is a no-op —
+        // the Start handler brings audio up alongside the Core. Routing
+        // through the same reconcile keeps startup and runtime coherent.
+        let _ = supervisor.reconcile_audio_subsystem().await;
 
         Ok(supervisor)
     }
@@ -739,6 +741,36 @@ impl Supervisor {
             }
         }
         tracing::info!("audio subsystem offline");
+    }
+
+    /// Drive the audio subsystem to the state implied by the run state
+    /// and config: it should be online iff Synbad is started
+    /// (`desired_running`) *and* audio is enabled in config. This is the
+    /// single level-triggered entry point — called from startup, the
+    /// Start/Stop/Restart handlers, and the audio-config toggle — so
+    /// input sharing and audio activate and deactivate together and
+    /// never diverge.
+    ///
+    /// Idempotent: brings the bridge up or tears it down as needed. On a
+    /// failed bring-up it surfaces an `AudioError` to the GUI and returns
+    /// the error so the caller can react further; teardown can't fail.
+    pub(super) async fn reconcile_audio_subsystem(&mut self) -> anyhow::Result<()> {
+        let want = self.desired_running && self.config.audio.enabled;
+        if !want {
+            if self.audio.is_some() {
+                self.teardown_audio_subsystem().await;
+            }
+            return Ok(());
+        }
+        if let Err(e) = self.ensure_audio_subsystem().await {
+            tracing::warn!(?e, "audio subsystem failed to start");
+            let _ = self.events.send(Event::AudioError {
+                peer: None,
+                message: format!("Audio could not start: {e}"),
+            });
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Open an outbound audio session to a single peer iff every gate

@@ -242,6 +242,11 @@ impl Supervisor {
             tracing::error!("{}", msg);
             self.record_log(msg);
             self.set_state(DaemonState::Crashed { exit_code: code });
+            // Giving up clears the run state, so audio must follow it down —
+            // keep the "audio online iff started" invariant that the Start/Stop
+            // handlers uphold, rather than leaving a bridge up under a stopped
+            // Synbad. No-op if audio was never online.
+            let _ = self.reconcile_audio_subsystem().await;
             return;
         }
 

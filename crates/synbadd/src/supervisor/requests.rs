@@ -39,7 +39,13 @@ impl Supervisor {
                 // reconnect backoff too so the retry starts fast.
                 self.fast_fail_count = 0;
                 self.backoff = MIN_BACKOFF;
-                match self.start_core().await {
+                let started = self.start_core().await;
+                // Audio rides with input: bring the bridge up alongside
+                // the Core so a started Synbad always asserts its (enabled)
+                // audio session. Best-effort — a failed bring-up surfaces
+                // its own AudioError and never blocks the Core starting.
+                let _ = self.reconcile_audio_subsystem().await;
+                match started {
                     Ok(()) => Response::Ok,
                     Err(e) => Response::Error {
                         message: e.to_string(),
@@ -50,6 +56,9 @@ impl Supervisor {
                 self.desired_running = false;
                 self.fast_fail_count = 0;
                 self.stop_core().await;
+                // Input and audio deactivate together: tear the bridge
+                // down so a stopped Synbad has no lingering audio session.
+                let _ = self.reconcile_audio_subsystem().await;
                 Response::Ok
             }
             Request::Restart => {
@@ -57,7 +66,11 @@ impl Supervisor {
                 self.fast_fail_count = 0;
                 self.backoff = MIN_BACKOFF;
                 self.stop_core().await;
-                match self.start_core().await {
+                let started = self.start_core().await;
+                // `desired_running` stays true across a restart, so this
+                // just re-asserts audio (no-op if the session survived).
+                let _ = self.reconcile_audio_subsystem().await;
+                match started {
                     Ok(()) => Response::Ok,
                     Err(e) => Response::Error {
                         message: e.to_string(),
@@ -193,25 +206,13 @@ impl Supervisor {
         // teardown see the up-to-date master switch.
         self.set_config(new_config).await?;
 
+        // Audio activation is coupled to the run state: enabling the
+        // toggle only brings the bridge up if Synbad is started. Route
+        // through the same level-triggered reconcile the Start/Stop
+        // handlers use so the toggle and the run state never diverge.
+        // Errors are surfaced to the GUI inside the reconcile.
         if old_audio.enabled != audio.enabled {
-            if audio.enabled {
-                match self.ensure_audio_subsystem().await {
-                    Ok(()) => {
-                        tracing::info!("audio subsystem brought up live");
-                    }
-                    Err(e) => {
-                        tracing::warn!(?e, "failed to bring audio subsystem up live");
-                        let _ = self.events.send(Event::AudioError {
-                            peer: None,
-                            message: format!(
-                                "Audio could not start: {e}. Restart the Synbad daemon to retry."
-                            ),
-                        });
-                    }
-                }
-            } else {
-                self.teardown_audio_subsystem().await;
-            }
+            let _ = self.reconcile_audio_subsystem().await;
         }
         // Push the live bridge a Reconfigure so device picks / per-peer
         // toggles take effect immediately.
