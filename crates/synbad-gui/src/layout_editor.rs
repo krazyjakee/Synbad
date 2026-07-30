@@ -173,7 +173,7 @@ impl LayoutEditor {
             } else {
                 Color32::from_gray(180)
             };
-            painter.rect(*r, 4.0, fill, Stroke::new(1.5, stroke_color));
+            painter.rect(*r, 4.0, fill, Stroke::new(1.5_f32, stroke_color));
 
             // Per-monitor sub-rects. Only worth drawing for multi-monitor
             // setups — a single-monitor screen is already represented by
@@ -242,7 +242,7 @@ fn draw_monitors(painter: &egui::Painter, outer: Rect, screen: &Screen) {
         min_x = min_x.min(m.x);
         min_y = min_y.min(m.y);
     }
-    let stroke = Stroke::new(1.0, Color32::from_gray(140));
+    let stroke = Stroke::new(1.0_f32, Color32::from_gray(140));
     for m in &screen.monitors {
         let top_left = outer.min
             + Vec2::new(
@@ -265,7 +265,7 @@ fn draw_monitors(painter: &egui::Painter, outer: Rect, screen: &Screen) {
 }
 
 fn draw_grid(painter: &egui::Painter, rect: Rect, origin: Pos2) {
-    let stroke = Stroke::new(1.0, Color32::from_rgb(35, 35, 40));
+    let stroke = Stroke::new(1.0_f32, Color32::from_rgb(35, 35, 40));
     let step = GRID;
     let start_x = origin.x - ((origin.x - rect.left()) / step).floor() * step;
     let start_y = origin.y - ((origin.y - rect.top()) / step).floor() * step;
@@ -286,7 +286,7 @@ fn draw_grid(painter: &egui::Painter, rect: Rect, origin: Pos2) {
         y += step;
     }
     // Origin crosshair.
-    let cross = Stroke::new(1.0, Color32::from_gray(80));
+    let cross = Stroke::new(1.0_f32, Color32::from_gray(80));
     painter.line_segment(
         [
             Pos2::new(rect.left(), origin.y),
@@ -306,7 +306,7 @@ fn draw_grid(painter: &egui::Painter, rect: Rect, origin: Pos2) {
 fn draw_link_edge(painter: &egui::Painter, a: &Rect, b: &Rect, side: Side) {
     // The edge of `a` that links into `b`. Render a thicker stroke segment
     // over the overlap range so the user can see linked edges.
-    let stroke = Stroke::new(3.0, Color32::from_rgb(120, 200, 255));
+    let stroke = Stroke::new(3.0_f32, Color32::from_rgb(120, 200, 255));
     match side {
         Side::Right => {
             let y0 = a.top().max(b.top());
