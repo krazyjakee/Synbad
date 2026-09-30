@@ -10,6 +10,8 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-09-30
+
 ### Changed
 - Sharing now starts automatically when the daemon launches, instead of
   sitting at "stopped" until Start is clicked. An explicit **Stop** is
