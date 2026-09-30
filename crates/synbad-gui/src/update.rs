@@ -271,7 +271,12 @@ pub fn draw_modal(
                 }
                 Some(UpdateState::Ready(res)) => {
                     ui.label(format!("Latest version: {}", res.info.version));
-                    if let Some(url) = (!res.info.html_url.is_empty()).then_some(&res.info.html_url)
+                    // Only ever hand the browser launcher a GitHub https URL —
+                    // this string comes off the network, and egui's pinned
+                    // `webbrowser` splices URLs into `$BROWSER` unsafely
+                    // (RUSTSEC-2026-0257; see .cargo/audit.toml).
+                    let url = &res.info.html_url;
+                    if url.starts_with("https://github.com/") && !url.contains(char::is_whitespace)
                     {
                         ui.hyperlink_to("Release notes", url);
                     }

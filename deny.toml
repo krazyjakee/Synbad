@@ -43,6 +43,12 @@ ignore = [
     # never on remote input. No in-range upgrade — both parents pin <0.41.
     "RUSTSEC-2026-0194", # quick-xml
     "RUSTSEC-2026-0195", # quick-xml
+    # webbrowser $BROWSER argument injection; pinned at 0.8 by egui-winit 0.27
+    # (fixed in 1.2.2). Exploitation needs a non-http(s) URL with whitespace.
+    # synbad opens only a static https link and the GitHub release URL, which
+    # the GUI gates to `https://github.com/…` with no whitespace. Goes away
+    # with the next eframe bump.
+    "RUSTSEC-2026-0257", # webbrowser
 ]
 
 [licenses]

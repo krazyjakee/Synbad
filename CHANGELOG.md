@@ -12,6 +12,16 @@ All notable changes to Synbad land here. Format follows
 
 ## [0.1.9] - 2026-09-30
 
+### Security
+- `rustls` 0.23.40 → 0.23.45 (RUSTSEC-2026-0285, TLS 1.3 handshake messages
+  accepted across encryption levels). (#86)
+- Dropped the unused `ringbuf` dependency from `synbad-audio`
+  (RUSTSEC-2026-0293). (#85)
+- RUSTSEC-2026-0257 (`webbrowser`, pinned by egui-winit 0.27) acknowledged in
+  the audit ignore lists; the GUI now only opens release-notes links shaped
+  `https://github.com/…`, so the vulnerable path is unreachable. (#82)
+- Moved off yanked `chacha20` 0.10.1.
+
 ### Changed
 - Sharing now starts automatically when the daemon launches, instead of
   sitting at "stopped" until Start is clicked. An explicit **Stop** is

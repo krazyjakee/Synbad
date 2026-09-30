@@ -28,10 +28,6 @@ cpal = "0.17"
 # Pure-Rust resampler used when a device's native sample rate isn't 48 kHz.
 rubato = "2"
 
-# Lock-free SPSC ring buffer for moving PCM frames between the cpal callback
-# thread (real-time, must not block) and the tokio task that feeds RTP.
-ringbuf = "0.4"
-
 # WebRTC stack — sans-I/O str0m. We previously used webrtc-rs 0.17
 # but hit an unresolvable DTLS-SRTP key-derivation bug that surfaced
 # as `failed to verify rtp auth tag` on every inbound packet. str0m's

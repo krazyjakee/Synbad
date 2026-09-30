@@ -38,4 +38,10 @@ ignore = [
                          #               local X protocol data — not untrusted XML.
     "RUSTSEC-2026-0195", # quick-xml     unbounded NsReader alloc; same trusted,
                          #               non-remote reach as 0194.
+    # --- GUI link opening ---
+    "RUSTSEC-2026-0257", # webbrowser    $BROWSER arg injection. Pinned at 0.8 by
+                         #               egui-winit 0.27. Needs a non-http(s) URL
+                         #               containing whitespace; synbad only opens
+                         #               a static https link and a GitHub https
+                         #               release URL gated on exactly that shape.
 ]
