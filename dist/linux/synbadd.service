@@ -11,8 +11,9 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 # `synbadd` is a long-running supervisor; restart on crash but back off so a
-# tight crash loop doesn't pin a CPU.
-ExecStart=%h/.local/bin/synbadd
+# tight crash loop doesn't pin a CPU. The path matches the .deb, which ships
+# this unit; `install.sh` rewrites it to wherever it installed the binary.
+ExecStart=/usr/bin/synbadd
 Restart=on-failure
 RestartSec=5s
 # `synbadd` writes logs to stderr; capture them into the journal so

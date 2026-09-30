@@ -81,14 +81,20 @@ Core process is restarted in place.
 
 ## Start sharing input
 
+Sharing starts automatically whenever `synbadd` launches — you only pick
+each machine's role.
+
 1. On the machine you want to use as the **server** (the source of the
-   keyboard/mouse), set its role to *Server* in the GUI and click
-   **Start**.
-2. On every other paired machine, set the role to *Client*, enter the
-   server's hostname (or pick it from the discovered list), and click
-   **Start**.
+   keyboard/mouse), set its role to *Server* in the GUI.
+2. On every other paired machine, set the role to *Client* and enter the
+   server's hostname (or pick it from the discovered list).
 3. The status chip in the GUI flips to *Running* on both sides, and the
    log tail shows the Core's connect messages.
+
+A client that can't reach its server shows *Reconnecting* and keeps
+retrying (every 10 s at most) until the server comes back — no restart
+needed. **Stop** turns sharing off and is remembered across restarts until
+you click **Start** again.
 
 ## Troubleshooting
 

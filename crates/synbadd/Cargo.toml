@@ -37,6 +37,10 @@ ruzstd = "0.7"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 sevenz-rust2 = { version = "0.18", optional = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# prctl(PR_SET_PDEATHSIG) so the Deskflow child dies with the daemon.
+libc = "0.2"
+
 [features]
 default = []
 # Pure-Rust 7z extraction adds ~1MB of code; gate behind a feature so Linux

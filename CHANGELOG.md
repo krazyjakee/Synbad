@@ -10,6 +10,58 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+### Changed
+- Sharing now starts automatically when the daemon launches, instead of
+  sitting at "stopped" until Start is clicked. An explicit **Stop** is
+  remembered (a per-machine `user-stopped` marker in the state dir, never
+  synced) and honoured across restarts until the next Start.
+- Client reconnect backoff is capped at 10 s (was 30 s) so a client picks the
+  server back up within seconds of it returning. It still retries forever.
+- The audio bridge now follows the run state: it comes up with Start (or the
+  launch auto-start) and goes down with Stop, and toggling audio on or off
+  takes effect live instead of asking for a daemon restart.
+
+### Fixed
+- ~100 ms whole-desktop frame hitch every 5 s on X11: the GUI's periodic
+  monitor enumeration issued `RRGetScreenResources`, which makes Xorg re-probe
+  every output while blocking all clients. It now uses `RRGetMonitors`, which
+  reads the server's cached layout (~0.3 ms). (#65) Side effect: the
+  `Xft.dpi` scale is read more tolerantly (whitespace, long resource
+  databases) and virtual monitors without an output are no longer dropped, so
+  a few setups may see corrected monitor sizes in the layout editor.
+- A Core restart no longer fails when GitHub is unreachable (offline, network
+  not up yet at boot, rate-limited) once the release-check cache expired —
+  the pinned Deskflow build is used straight from the local cache. Failed
+  Core resolution is now retried with backoff instead of stranding the daemon
+  in "crashed".
+- The daemon no longer blocks its event loop while waiting out a restart
+  backoff (up to 30 s), so Stop/Restart and other GUI requests respond
+  immediately while the client is reconnecting.
+- Stopping `synbadd` with SIGTERM (systemd stop, logout, `kill`) or SIGHUP no
+  longer orphans the Deskflow Core — it's now shut down cleanly, and on Linux
+  the kernel also terminates it if the daemon dies hard (SIGKILL, OOM). An
+  orphaned server kept the Core port, so the next daemon's server failed to
+  bind and gave up.
+- A Core that took longer than 2 s to exit during a stop/restart had its late
+  exit applied to its replacement, flipping state to reconnecting and losing
+  the handle needed to stop it. Exits are now matched by pid.
+- Restarts triggered by a config change (e.g. a new server address) start
+  with a fresh retry budget instead of inheriting a backed-off delay.
+- A restart requested while the first-run Core download was in flight was
+  dropped (and the GUI showed "stopped"); the Core then launched with the
+  pre-edit layout. The generated Core config is now written right before
+  spawning, from the live config.
+- Failing to spawn the Core or write its generated config now retries with
+  backoff instead of leaving sharing off with nothing pending.
+- A crash mid-extraction of the Deskflow download no longer leaves a
+  truncated binary that is reused forever; extraction is staged and moved
+  into place only once complete.
+- Ctrl-C arriving while the daemon was busy (e.g. stopping the Core) could be
+  lost; the signal handlers are now installed once for the daemon's lifetime.
+- The systemd user unit shipped in the `.deb` pointed at `~/.local/bin/synbadd`;
+  it now targets `/usr/bin/synbadd`, and `install.sh` rewrites it for its own
+  install location.
+
 ## [0.1.8] - 2026-07-18
 
 ### Changed

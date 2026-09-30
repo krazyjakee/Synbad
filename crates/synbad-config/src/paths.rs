@@ -46,6 +46,14 @@ pub fn generated_settings() -> PathBuf {
     state_dir().join("deskflow.ini")
 }
 
+/// Marker file whose presence means the user explicitly pressed Stop.
+/// The daemon starts sharing on launch unless this exists, so a Stop
+/// survives a daemon/GUI restart. Per-machine runtime state — deliberately
+/// kept out of `config.toml`, which is synced to peers.
+pub fn user_stopped_marker() -> PathBuf {
+    state_dir().join("user-stopped")
+}
+
 /// The local IPC endpoint the daemon listens on. Per-user.
 ///
 /// On Unix this is a filesystem path under [`state_dir`]. On Windows this is

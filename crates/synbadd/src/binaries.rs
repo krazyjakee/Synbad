@@ -21,27 +21,26 @@
 //! Cache layout (rooted at `cache_root`, e.g. `~/.local/share/synbad/bin`):
 //!
 //! ```text
-//! release-cache.json              # last GitHub API check timestamp + tag
 //! <tag>/deskflow-core             # unified layout, chmod 755 on Unix
 //! <tag>/deskflow-server           # split-legacy layout
 //! <tag>/deskflow-client           # split-legacy layout
 //! ```
 //!
 //! Per-release directories survive across upgrades; once a `<tag>`'s files
-//! all exist, we never re-download for that tag. The state cache trims API
-//! calls to at most one per 24 h, so an offline launch with a populated
-//! cache works fine.
+//! all exist, we never re-download for that tag. Because the tag is pinned,
+//! a populated cache never touches the network, so an offline launch (or
+//! one racing the network coming up at boot) works fine.
 //!
 //! User overrides live in `config.toml#binaries.core` and short-circuit this
 //! module entirely (the supervisor checks first). An override is always
 //! treated as a unified core binary.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 /// Pinned Deskflow release.
@@ -60,8 +59,6 @@ use sha2::{Digest, Sha256};
 /// Replace this with distro-aware asset selection once we want to support
 /// systems with newer Qt out of the box.
 const DESKFLOW_TAG: &str = "v1.17.0";
-const STATE_CACHE_NAME: &str = "release-cache.json";
-const STATE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayoutKind {
@@ -118,12 +115,6 @@ struct ReleaseAsset {
     browser_download_url: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct StateCache {
-    latest_tag: String,
-    checked_unix: u64,
-}
-
 #[derive(Clone)]
 pub struct Resolver {
     cache_root: PathBuf,
@@ -166,18 +157,14 @@ impl Resolver {
         &self,
         progress: tokio::sync::mpsc::Sender<Event>,
     ) -> Result<ResolvedCore> {
-        // Fast path: state cache matches the pinned tag, was checked
-        // recently, and every binary the layout needs is on disk. The tag
-        // check is important — without it, bumping `DESKFLOW_TAG` would
-        // still hand back the previously-cached (and now wrong) binary
-        // until the TTL expired.
-        if let Some(state) = self.read_state_cache().await {
-            let age = unix_now().saturating_sub(state.checked_unix);
-            if state.latest_tag == DESKFLOW_TAG && age < STATE_TTL.as_secs() {
-                if let Some(resolved) = self.try_cached(&state.latest_tag) {
-                    return Ok(resolved);
-                }
-            }
+        // Fast path: every binary the pinned tag needs is already on disk.
+        // The tag is pinned, so there's nothing the API could tell us that
+        // would change the answer. Skipping the query is what keeps a Core
+        // (re)start from failing when GitHub is unreachable — offline, the
+        // network not up yet at boot, or rate-limited — which used to
+        // strand the supervisor in `Crashed` once a cache TTL lapsed.
+        if let Some(resolved) = self.try_cached(DESKFLOW_TAG) {
+            return Ok(resolved);
         }
 
         // Query the pinned tag.
@@ -199,7 +186,6 @@ impl Resolver {
             .context("parsing release JSON")?;
 
         if let Some(resolved) = self.try_cached(&release.tag_name) {
-            self.write_state_cache(&release.tag_name).await;
             return Ok(resolved);
         }
 
@@ -225,9 +211,17 @@ impl Resolver {
 
         let kind = layout_kind_for(&release.tag_name);
         let dest_dir = self.cache_root.join(&release.tag_name);
-        tokio::fs::create_dir_all(&dest_dir)
+        // Extract into a staging dir and rename it into place only once
+        // every file is written. `try_cached` trusts whatever sits under
+        // `<tag>/`, so extracting there directly meant a crash mid-extract
+        // left a truncated binary that was reused forever.
+        let staging = self
+            .cache_root
+            .join(format!("{}.partial", release.tag_name));
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        tokio::fs::create_dir_all(&staging)
             .await
-            .with_context(|| format!("creating cache dir {:?}", dest_dir))?;
+            .with_context(|| format!("creating cache dir {:?}", staging))?;
 
         let _ = progress
             .send(Event::Extracting {
@@ -237,12 +231,19 @@ impl Resolver {
             .await;
 
         let asset_name = asset.name.clone();
-        let dest_for_task = dest_dir.clone();
+        let staging_for_task = staging.clone();
         tokio::task::spawn_blocking(move || {
-            extract_core_binaries(&asset_bytes, &asset_name, &dest_for_task, kind)
+            extract_core_binaries(&asset_bytes, &asset_name, &staging_for_task, kind)
         })
         .await
         .context("extraction task panicked")??;
+
+        // Anything already at `<tag>/` failed `try_cached` above, so it's an
+        // incomplete leftover — safe to replace.
+        let _ = tokio::fs::remove_dir_all(&dest_dir).await;
+        tokio::fs::rename(&staging, &dest_dir)
+            .await
+            .with_context(|| format!("moving {:?} into place at {:?}", staging, dest_dir))?;
 
         let resolved = self.try_cached(&release.tag_name).ok_or_else(|| {
             anyhow!(
@@ -250,8 +251,6 @@ impl Resolver {
                 dest_dir
             )
         })?;
-
-        self.write_state_cache(&release.tag_name).await;
 
         let _ = progress
             .send(Event::Ready {
@@ -288,23 +287,6 @@ impl Resolver {
                     None
                 }
             }
-        }
-    }
-
-    async fn read_state_cache(&self) -> Option<StateCache> {
-        let path = self.cache_root.join(STATE_CACHE_NAME);
-        let bytes = tokio::fs::read(&path).await.ok()?;
-        serde_json::from_slice(&bytes).ok()
-    }
-
-    async fn write_state_cache(&self, tag: &str) {
-        let _ = tokio::fs::create_dir_all(&self.cache_root).await;
-        let state = StateCache {
-            latest_tag: tag.to_string(),
-            checked_unix: unix_now(),
-        };
-        if let Ok(s) = serde_json::to_vec_pretty(&state) {
-            let _ = tokio::fs::write(self.cache_root.join(STATE_CACHE_NAME), s).await;
         }
     }
 
@@ -747,13 +729,6 @@ fn find_named(root: &Path, name: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

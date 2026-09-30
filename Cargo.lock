@@ -4628,6 +4628,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "xcb",
 ]
 
 [[package]]
@@ -4688,6 +4689,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hex",
+ "libc",
  "notify",
  "rand_core 0.6.4",
  "reqwest",

@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -23,7 +23,8 @@ use synbad_ipc::{DaemonState, Event};
 use crate::binaries::{CoreLayout, ResolvedCore, Resolver};
 
 use super::{
-    CoreResolveOutcome, Supervisor, FAST_FAIL_WINDOW, MAX_BACKOFF, MAX_FAST_FAILS, MIN_BACKOFF,
+    CoreResolveOutcome, Supervisor, CLIENT_MAX_BACKOFF, FAST_FAIL_WINDOW, MAX_BACKOFF,
+    MAX_FAST_FAILS, MIN_BACKOFF,
 };
 
 impl Supervisor {
@@ -38,27 +39,23 @@ impl Supervisor {
     /// `select!` loop also services IPC, pairing, discovery and sync.
     /// Awaiting the download here used to block all of them — pairing in
     /// particular looked like "clicking Pair does nothing".
-    pub(super) async fn start_core(&mut self) -> Result<()> {
-        if matches!(self.state, DaemonState::Running { .. })
-            || self.child_kill.is_some()
-            || self.core_resolving
-        {
-            return Ok(());
+    ///
+    /// Infallible by design: every failure past this point (resolution,
+    /// writing the generated config, spawning) is handled in
+    /// [`Self::on_core_resolved`], which schedules a retry, so no caller can
+    /// strand the supervisor in `Starting` with nothing pending.
+    pub(super) async fn start_core(&mut self) {
+        // Whoever is starting us now supersedes any pending auto-restart.
+        self.restart_at = None;
+        if matches!(self.state, DaemonState::Running { .. }) || self.child_kill.is_some() {
+            return;
         }
         self.set_state(DaemonState::Starting);
-
-        let conf_path = paths::generated_conf();
-        let settings_path = paths::generated_settings();
-        if let Some(parent) = conf_path.parent() {
-            std::fs::create_dir_all(parent).ok();
+        if self.core_resolving {
+            // A resolution (possibly a first-run download) is already in
+            // flight; it spawns from the live config when it lands.
+            return;
         }
-        std::fs::write(&conf_path, self.config.generate_synergy_conf())
-            .with_context(|| format!("writing {:?}", conf_path))?;
-        std::fs::write(
-            &settings_path,
-            self.config.generate_deskflow_settings(&conf_path),
-        )
-        .with_context(|| format!("writing {:?}", settings_path))?;
 
         self.core_resolving = true;
         let resolver = self.resolver.clone();
@@ -71,7 +68,36 @@ impl Supervisor {
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(outcome).await;
         });
+    }
+
+    /// Write the generated screen layout + Deskflow settings the Core reads.
+    /// Done right before spawning (not when the start was requested) so a
+    /// config change that landed during a slow download is honoured.
+    fn write_core_artefacts(&self) -> Result<()> {
+        let conf_path = paths::generated_conf();
+        let settings_path = paths::generated_settings();
+        if let Some(parent) = conf_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&conf_path, self.config.generate_synergy_conf())
+            .with_context(|| format!("writing {:?}", conf_path))?;
+        std::fs::write(
+            &settings_path,
+            self.config.generate_deskflow_settings(&conf_path),
+        )
+        .with_context(|| format!("writing {:?}", settings_path))?;
         Ok(())
+    }
+
+    /// A start attempt failed before a child was running. Surface it and
+    /// arm a retry: these failures (network, a transient spawn error, a
+    /// briefly unwritable state dir) usually clear on their own.
+    fn start_failed(&mut self, what: String) {
+        let delay = self.schedule_restart();
+        let msg = format!("[synbad] {what}; retrying in {delay:?}");
+        tracing::error!("{}", msg);
+        self.record_log(msg);
+        self.set_state(DaemonState::Crashed { exit_code: None });
     }
 
     /// Spawn the Core child from a resolved binary, wiring up log readers,
@@ -85,6 +111,23 @@ impl Supervisor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Backstop for the cases our shutdown path never runs (SIGKILL, OOM
+        // kill, abort): have the kernel SIGTERM the Core when we die, so an
+        // orphaned deskflow-server can't keep holding the Core port and make
+        // the next daemon's server fast-fail on bind. The signal fires when
+        // the forking *thread* exits; tokio worker threads live as long as
+        // the runtime, i.e. as long as the daemon.
+        #[cfg(target_os = "linux")]
+        // SAFETY: the closure runs in the forked child before exec and only
+        // makes an async-signal-safe syscall.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
         let mut child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!(
@@ -115,9 +158,10 @@ impl Supervisor {
                     child.wait().await.unwrap_or_default()
                 }
             };
-            let _ = exit_tx.send(status).await;
+            let _ = exit_tx.send((pid, status)).await;
         });
 
+        self.child_pid = Some(pid);
         self.set_state(DaemonState::Running { pid });
         // NB: backoff is intentionally *not* reset here. Spawning is not proof
         // the link came up — a client dialing an unreachable server spawns,
@@ -130,9 +174,10 @@ impl Supervisor {
     }
 
     /// Handle the result of an off-loop Core resolution. Spawns the child
-    /// if we still want one; otherwise surfaces the failure as a log line
-    /// and `Crashed` state without retrying (matching the old inline
-    /// behaviour where a failed Start didn't auto-retry).
+    /// if we still want one. A failed resolution (usually GitHub being
+    /// unreachable on a first-run download) is retried with backoff —
+    /// it's transient, and giving up would leave sharing off until the
+    /// user noticed and clicked Start.
     pub(super) async fn on_core_resolved(&mut self, outcome: CoreResolveOutcome) {
         self.core_resolving = false;
 
@@ -149,13 +194,15 @@ impl Supervisor {
         let resolved = match outcome {
             Ok(r) => r,
             Err(reason) => {
-                let msg = format!("[synbad] could not obtain Deskflow Core: {reason}");
-                tracing::error!("{}", msg);
-                self.record_log(msg);
-                self.set_state(DaemonState::Crashed { exit_code: None });
+                self.start_failed(format!("could not obtain Deskflow Core: {reason}"));
                 return;
             }
         };
+
+        if let Err(e) = self.write_core_artefacts() {
+            self.start_failed(format!("{e:#}"));
+            return;
+        }
 
         // Rebuild argv from the *current* config so a role/address change
         // that landed while the download ran is honoured.
@@ -165,6 +212,9 @@ impl Supervisor {
             match build_command(&resolved, &self.config, &conf_path, &settings_path) {
                 Ok(pa) => pa,
                 Err(e) => {
+                    // A config problem (e.g. client with no server address):
+                    // retrying can't fix it, and the config edit that does
+                    // will restart the Core itself.
                     let msg = format!("[synbad] bad Core command line: {e:#}");
                     tracing::error!("{}", msg);
                     self.record_log(msg);
@@ -174,26 +224,55 @@ impl Supervisor {
             };
 
         if let Err(e) = self.spawn_child(program, args) {
-            let msg = format!("[synbad] {e:#}");
-            tracing::error!("{}", msg);
-            self.record_log(msg);
-            self.set_state(DaemonState::Crashed { exit_code: None });
+            self.start_failed(format!("{e:#}"));
         }
     }
 
+    /// Bounce the Core with a fresh retry budget. Used for explicit
+    /// Restarts and whenever the Core's inputs change (server address,
+    /// role, layout): new settings deserve an immediate attempt rather than
+    /// inheriting a reconnect loop's backed-off delay.
+    pub(super) async fn restart_core(&mut self) {
+        self.fast_fail_count = 0;
+        self.backoff = MIN_BACKOFF;
+        self.stop_core().await;
+        self.start_core().await;
+    }
+
     pub(super) async fn stop_core(&mut self) {
+        self.restart_at = None;
+        // Whatever child we had is being retired; if its exit lands after
+        // the timeout below, `handle_child_exit` must ignore it.
+        let pid = self.child_pid.take();
         if let Some(tx) = self.child_kill.take() {
             let _ = tx.send(());
-            // Wait for the exit event so state reflects reality before we return.
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_secs(2), self.exit_rx.recv()).await;
+            // Wait for *this* child's exit so state reflects reality before
+            // we return (and a server's replacement doesn't race it for the
+            // port). Skip stale exits from children an earlier stop gave up
+            // on — returning on one of those would be returning early.
+            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                while let Some((exited, _)) = self.exit_rx.recv().await {
+                    if Some(exited) == pid {
+                        break;
+                    }
+                }
+            })
+            .await;
         }
         self.set_state(DaemonState::Stopped);
     }
 
-    pub(super) async fn handle_child_exit(&mut self, status: std::process::ExitStatus) {
+    pub(super) async fn handle_child_exit(&mut self, pid: u32, status: std::process::ExitStatus) {
         let code = status.code();
+        if self.child_pid != Some(pid) {
+            // A child we already stopped, exiting after `stop_core` gave up
+            // waiting on it. Acting on it would clobber the state of (and
+            // drop the kill handle for) the child that replaced it.
+            tracing::debug!(pid, ?code, "ignoring exit of superseded core");
+            return;
+        }
         tracing::info!(?code, "core exited");
+        self.child_pid = None;
         self.child_kill = None;
 
         // Classify: did the child run long enough to be considered "alive"?
@@ -250,8 +329,7 @@ impl Supervisor {
             return;
         }
 
-        let delay = self.backoff;
-        self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+        let delay = self.schedule_restart();
         if is_client {
             // Level-triggered reconnect: surface a non-terminal `Reconnecting`
             // status (not `Crashed`) so the UI shows we're still trying, and
@@ -275,13 +353,30 @@ impl Supervisor {
             attempt = self.fast_fail_count,
             "core exited, will restart"
         );
-        tokio::time::sleep(delay).await;
-        if self.desired_running {
-            if let Err(e) = self.start_core().await {
-                tracing::error!(?e, "restart failed");
-            }
-        }
     }
+
+    /// Arm the restart timer the `select!` loop waits on, using the
+    /// current backoff, and double the backoff for next time. Returns the
+    /// delay armed. Never sleeps inline — blocking the loop here used to
+    /// freeze IPC (including Stop) for up to [`MAX_BACKOFF`] per retry.
+    fn schedule_restart(&mut self) -> Duration {
+        let (delay, next) = restart_backoff(self.backoff, self.config.role);
+        self.backoff = next;
+        self.restart_at = Some(tokio::time::Instant::now() + delay);
+        delay
+    }
+}
+
+/// `(delay to use now, backoff for next time)` given the current backoff:
+/// capped exponential, with a tighter cap for clients so they notice a
+/// returning server quickly.
+fn restart_backoff(backoff: Duration, role: NodeRole) -> (Duration, Duration) {
+    let cap = match role {
+        NodeRole::Client => CLIENT_MAX_BACKOFF,
+        NodeRole::Server => MAX_BACKOFF,
+    };
+    let delay = backoff.min(cap);
+    (delay, (delay * 2).min(cap))
 }
 
 /// Resolve the Deskflow Core binary, fetching from upstream on first use.
@@ -504,6 +599,42 @@ mod tests {
             server_address: matches!(role, NodeRole::Client).then(|| "peer.local".into()),
             ..Config::default()
         }
+    }
+
+    fn backoff_sequence(role: NodeRole, n: usize) -> Vec<u64> {
+        let mut b = MIN_BACKOFF;
+        (0..n)
+            .map(|_| {
+                let (delay, next) = restart_backoff(b, role);
+                b = next;
+                delay.as_millis() as u64
+            })
+            .collect()
+    }
+
+    #[test]
+    fn client_backoff_caps_low_and_never_stops() {
+        assert_eq!(
+            backoff_sequence(NodeRole::Client, 9),
+            vec![500, 1000, 2000, 4000, 8000, 10_000, 10_000, 10_000, 10_000]
+        );
+    }
+
+    #[test]
+    fn server_backoff_caps_at_max() {
+        assert_eq!(
+            backoff_sequence(NodeRole::Server, 8),
+            vec![500, 1000, 2000, 4000, 8000, 16_000, 30_000, 30_000]
+        );
+    }
+
+    #[test]
+    fn role_switch_clamps_a_larger_server_backoff() {
+        // A server that backed off to 30 s then flipped to client must not
+        // wait longer than the client cap.
+        let (delay, next) = restart_backoff(MAX_BACKOFF, NodeRole::Client);
+        assert_eq!(delay, CLIENT_MAX_BACKOFF);
+        assert_eq!(next, CLIENT_MAX_BACKOFF);
     }
 
     #[test]

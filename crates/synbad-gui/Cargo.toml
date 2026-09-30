@@ -35,6 +35,11 @@ display-info = "0.5"
 # on a dedicated thread, since eframe uses winit and never runs gtk::main()
 # itself.
 gtk = { version = "0.18", optional = true }
+# Direct RandR access for monitor enumeration on X11. display-info's X11
+# path sends RRGetScreenResources, which forces Xorg to re-probe every
+# output and stalls the whole server for ~100 ms (#65). We only need
+# RRGetMonitors. Same version display-info already pulls in.
+xcb = { version = "1.7", features = ["randr"] }
 
 [features]
 default = []

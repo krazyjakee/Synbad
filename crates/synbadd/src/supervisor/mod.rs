@@ -50,6 +50,11 @@ pub(super) type CoreResolveOutcome = Result<ResolvedCore, String>;
 pub(super) const LOG_TAIL: usize = 500;
 pub(super) const MIN_BACKOFF: Duration = Duration::from_millis(500);
 pub(super) const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Retry cap for the **client** role. A client that can't reach its
+/// server keeps retrying forever; a tighter cap than the server's
+/// [`MAX_BACKOFF`] means it notices the server coming back within
+/// seconds rather than half a minute, while still ticking gently.
+pub(super) const CLIENT_MAX_BACKOFF: Duration = Duration::from_secs(10);
 /// A child that exits within this window of being spawned is treated as an
 /// "instant fail" — usually a missing shared library, bad CLI, or refused
 /// permission. We count consecutive instant-fails; in the **server** role we
@@ -118,8 +123,9 @@ pub struct Supervisor {
     pub(super) state: DaemonState,
     pub(super) log_tail: VecDeque<String>,
     pub(super) events: broadcast::Sender<Event>,
-    /// `true` after a Start (or after a SetConfig while already running).
-    /// Drives auto-restart when the Core exits unexpectedly, and gates
+    /// `true` after a Start, and at launch unless the user explicitly
+    /// stopped (see [`paths::user_stopped_marker`]). Drives auto-restart
+    /// when the Core exits unexpectedly, and gates
     /// the audio subsystem: audio is online only while this is true *and*
     /// `config.audio.enabled` (see [`Supervisor::reconcile_audio_subsystem`])
     /// so input sharing and audio go up and down together.
@@ -127,10 +133,19 @@ pub struct Supervisor {
     /// Send `()` to terminate the supervised child. `None` when not running.
     pub(super) child_kill: Option<oneshot::Sender<()>>,
     pub(super) backoff: Duration,
+    /// When the next automatic Core restart is due. Set by the crash /
+    /// reconnect path instead of sleeping inline, so the `select!` loop
+    /// keeps serving IPC (a Stop lands immediately) while we wait. Cleared
+    /// by any explicit stop or start.
+    pub(super) restart_at: Option<tokio::time::Instant>,
     pub(super) log_rx: mpsc::Receiver<String>,
     pub(super) log_tx: mpsc::Sender<String>,
-    pub(super) exit_rx: mpsc::Receiver<std::process::ExitStatus>,
-    pub(super) exit_tx: mpsc::Sender<std::process::ExitStatus>,
+    /// Core exits, tagged with the pid that exited so a late exit from a
+    /// superseded child can't be mistaken for the current one's.
+    pub(super) exit_rx: mpsc::Receiver<(u32, std::process::ExitStatus)>,
+    pub(super) exit_tx: mpsc::Sender<(u32, std::process::ExitStatus)>,
+    /// Pid of the Core child this supervisor currently owns, if any.
+    pub(super) child_pid: Option<u32>,
     pub(super) fs_rx: mpsc::Receiver<()>,
     pub(super) _fs_watcher: RecommendedWatcher,
     pub(super) resolver: Resolver,
@@ -246,7 +261,7 @@ impl Supervisor {
         let config = Config::load(&config_path)?.unwrap_or_default();
         let versions_path = paths::config_versions_file();
 
-        let (exit_tx, exit_rx) = mpsc::channel::<std::process::ExitStatus>(16);
+        let (exit_tx, exit_rx) = mpsc::channel::<(u32, std::process::ExitStatus)>(16);
         let (fs_tx, fs_rx) = mpsc::channel::<()>(16);
 
         // notify invokes the callback off-tokio; bridge via try_send.
@@ -393,10 +408,12 @@ impl Supervisor {
             desired_running: false,
             child_kill: None,
             backoff: MIN_BACKOFF,
+            restart_at: None,
             log_rx,
             log_tx,
             exit_rx,
             exit_tx,
+            child_pid: None,
             fs_rx,
             _fs_watcher: watcher,
             resolver,
@@ -444,17 +461,24 @@ impl Supervisor {
             },
         };
 
-        // Audio is coupled to the run state: it comes up only once
-        // Synbad is started. At construction `desired_running` is false
-        // (the Core hasn't been told to start yet), so this is a no-op —
-        // the Start handler brings audio up alongside the Core. Routing
-        // through the same reconcile keeps startup and runtime coherent.
+        // Sharing is on by default: bring the Core up at launch unless the
+        // user explicitly pressed Stop last time. A client with no server
+        // yet simply enters its reconnect loop.
+        if !paths::user_stopped_marker().exists() {
+            supervisor.desired_running = true;
+            supervisor.start_core().await;
+        }
+
+        // Audio is coupled to the run state: it comes up only while
+        // Synbad is started. Routing through the same reconcile the
+        // Start/Stop handlers use keeps startup and runtime coherent.
         let _ = supervisor.reconcile_audio_subsystem().await;
 
         Ok(supervisor)
     }
 
     pub async fn run(&mut self, mut listener: Listener) -> Result<()> {
+        let mut shutdown_signals = ShutdownSignals::new();
         loop {
             // `discovery_rx` and `incoming_pairings` may be absent if the
             // corresponding subsystem failed to start. We pin a fresh
@@ -478,8 +502,21 @@ impl Supervisor {
                     None => std::future::pending::<Option<synbad_audio::AudioEvent>>().await,
                 }
             };
+            let restart_at = self.restart_at;
+            let restart_due = async move {
+                match restart_at {
+                    Some(t) => tokio::time::sleep_until(t).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
 
             tokio::select! {
+                _ = restart_due => {
+                    self.restart_at = None;
+                    if self.desired_running {
+                        self.start_core().await;
+                    }
+                }
                 _ = self.audio_reconcile.tick() => {
                     // Periodic safety net: re-attempt any audio session that
                     // *should* be live but isn't. Cheap no-op when the
@@ -507,8 +544,8 @@ impl Supervisor {
                 Some(line) = self.log_rx.recv() => {
                     self.record_log(line);
                 }
-                Some(status) = self.exit_rx.recv() => {
-                    self.handle_child_exit(status).await;
+                Some((pid, status)) = self.exit_rx.recv() => {
+                    self.handle_child_exit(pid, status).await;
                 }
                 Some(()) = self.fs_rx.recv() => {
                     self.handle_config_changed().await;
@@ -525,8 +562,8 @@ impl Supervisor {
                 Some(ev) = audio_event => {
                     self.handle_audio_event(ev);
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("ctrl-c, shutting down");
+                signal = shutdown_signals.recv() => {
+                    tracing::info!("{signal}, shutting down");
                     self.stop_core().await;
                     return Ok(());
                 }
@@ -975,6 +1012,75 @@ impl Supervisor {
             tracing::debug!(?new_state, "state change");
             self.state = new_state.clone();
             let _ = self.events.send(Event::State { state: new_state });
+        }
+    }
+}
+
+/// The signals that should shut the daemon down cleanly: Ctrl-C everywhere,
+/// plus SIGTERM (systemd stop, logout, plain `kill`) and SIGHUP (controlling
+/// terminal closed) on Unix. Handling them — rather than letting the default
+/// action kill us — is what makes `stop_core` run, so the Deskflow child
+/// isn't orphaned still holding the Core port.
+///
+/// The Unix handlers are installed once and live for the whole loop, so a
+/// signal that arrives while another `select!` arm is running is queued,
+/// not lost (a per-iteration `ctrl_c()` future has that gap).
+struct ShutdownSignals {
+    #[cfg(unix)]
+    int: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    term: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    hup: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownSignals {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let install = |kind: SignalKind, name: &str| match signal(kind) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!(?e, "could not install {name} handler");
+                    None
+                }
+            };
+            Self {
+                int: install(SignalKind::interrupt(), "SIGINT"),
+                term: install(SignalKind::terminate(), "SIGTERM"),
+                hup: install(SignalKind::hangup(), "SIGHUP"),
+            }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    /// Resolves with the signal's name once one arrives. A handler that
+    /// failed to install simply never fires.
+    async fn recv(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            async fn next(sig: &mut Option<tokio::signal::unix::Signal>) {
+                match sig {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            }
+            tokio::select! {
+                _ = next(&mut self.int) => "ctrl-c",
+                _ = next(&mut self.term) => "SIGTERM",
+                _ = next(&mut self.hup) => "SIGHUP",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if tokio::signal::ctrl_c().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+            "ctrl-c"
         }
     }
 }

@@ -6,6 +6,7 @@
 //! a thin call into a sibling module, so this stays a routing table.
 
 use synbad_audio::{bridge::DeviceListReply, peer_audio_active, AudioBridge, AudioCommand};
+use synbad_config::paths;
 use synbad_ipc::server::IncomingRequest;
 use synbad_ipc::{Event, Request, Response};
 use tokio::sync::oneshot;
@@ -33,27 +34,26 @@ impl Supervisor {
             },
             Request::Start => {
                 self.desired_running = true;
+                persist_user_stopped(false);
                 // Explicit user action resets the give-up state from a
                 // prior instant-fail loop — they may have fixed the
                 // missing-deps issue and want us to try again. Reset the
                 // reconnect backoff too so the retry starts fast.
                 self.fast_fail_count = 0;
                 self.backoff = MIN_BACKOFF;
-                let started = self.start_core().await;
+                self.start_core().await;
                 // Audio rides with input: bring the bridge up alongside
                 // the Core so a started Synbad always asserts its (enabled)
                 // audio session. Best-effort — a failed bring-up surfaces
                 // its own AudioError and never blocks the Core starting.
                 let _ = self.reconcile_audio_subsystem().await;
-                match started {
-                    Ok(()) => Response::Ok,
-                    Err(e) => Response::Error {
-                        message: e.to_string(),
-                    },
-                }
+                Response::Ok
             }
             Request::Stop => {
                 self.desired_running = false;
+                // Only an explicit Stop keeps sharing off across a daemon
+                // restart; every other launch starts it automatically.
+                persist_user_stopped(true);
                 self.fast_fail_count = 0;
                 self.stop_core().await;
                 // Input and audio deactivate together: tear the bridge
@@ -63,19 +63,12 @@ impl Supervisor {
             }
             Request::Restart => {
                 self.desired_running = true;
-                self.fast_fail_count = 0;
-                self.backoff = MIN_BACKOFF;
-                self.stop_core().await;
-                let started = self.start_core().await;
+                persist_user_stopped(false);
+                self.restart_core().await;
                 // `desired_running` stays true across a restart, so this
                 // just re-asserts audio (no-op if the session survived).
                 let _ = self.reconcile_audio_subsystem().await;
-                match started {
-                    Ok(()) => Response::Ok,
-                    Err(e) => Response::Error {
-                        message: e.to_string(),
-                    },
-                }
+                Response::Ok
             }
             Request::Subscribe => Response::Ok,
             Request::ListPeers => Response::Peers {
@@ -281,5 +274,26 @@ impl Supervisor {
         self.pairing_tasks.push(handle._task);
         self.gc_pairing_tasks();
         Ok(())
+    }
+}
+
+/// Record (or clear) the user's explicit Stop so the next daemon launch
+/// honours it. Best-effort: failing to persist only means the next launch
+/// falls back to the default of starting.
+fn persist_user_stopped(stopped: bool) {
+    let marker = paths::user_stopped_marker();
+    let res = if stopped {
+        if let Some(parent) = marker.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&marker, b"")
+    } else {
+        match std::fs::remove_file(&marker) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    };
+    if let Err(e) = res {
+        tracing::warn!(?e, ?marker, "could not persist stop state");
     }
 }

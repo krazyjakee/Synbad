@@ -22,7 +22,10 @@ install -m 755 target/release/synbad-gui "${BIN_DIR}/synbad-gui"
 
 echo "[synbad] installing systemd user unit"
 mkdir -p "${SYSTEMD_USER_DIR}"
-install -m 644 "${REPO_ROOT}/dist/linux/synbadd.service" "${SYSTEMD_USER_DIR}/synbadd.service"
+# The shipped unit points at the .deb's /usr/bin; retarget it at our copy.
+sed "s#^ExecStart=.*#ExecStart=${BIN_DIR}/synbadd#" \
+    "${REPO_ROOT}/dist/linux/synbadd.service" >"${SYSTEMD_USER_DIR}/synbadd.service"
+chmod 644 "${SYSTEMD_USER_DIR}/synbadd.service"
 
 # `daemon-reload` so systemd picks up the new unit; `enable --now` makes it
 # autostart at login *and* starts it immediately.

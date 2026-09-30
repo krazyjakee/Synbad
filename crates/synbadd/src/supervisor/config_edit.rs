@@ -80,10 +80,7 @@ impl Supervisor {
         let _ = self.events.send(Event::ConfigChanged);
         if restart_if_running && self.desired_running {
             if core_inputs_differ {
-                self.stop_core().await;
-                if let Err(e) = self.start_core().await {
-                    tracing::warn!(?e, "restart after config change failed");
-                }
+                self.restart_core().await;
             } else {
                 tracing::info!("config changed but Core inputs unchanged; applied without restart");
             }
@@ -189,10 +186,7 @@ impl Supervisor {
                     // peer pushing a daemon-only change (e.g. a sync
                     // port) shouldn't bounce our active input sharing.
                     if self.desired_running && core_inputs_differ {
-                        self.stop_core().await;
-                        if let Err(e) = self.start_core().await {
-                            tracing::warn!(?e, "restart after sync merge failed");
-                        }
+                        self.restart_core().await;
                     } else if self.desired_running {
                         tracing::info!("merged config left Core inputs unchanged; no restart");
                     }
