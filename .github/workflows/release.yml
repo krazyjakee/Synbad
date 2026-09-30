@@ -78,6 +78,28 @@ jobs:
           packages: libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libasound2-dev librsvg2-bin file desktop-file-utils mold
           version: release-v1
 
+      # cache-apt-pkgs-action reports success even when apt fails to fetch
+      # (e.g. the runner's mirror 404ing mid-sync, which broke the first
+      # v0.1.9 build). That only surfaces minutes later as a glib-sys build
+      # error, so check the deps actually landed and, if not, install them
+      # plainly against a freshly updated index.
+      - name: Verify Linux deps
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -uo pipefail
+          if pkg-config --exists gtk+-3.0 glib-2.0 alsa ayatana-appindicator3-0.1 \
+             && test -f /usr/include/xdo.h \
+             && command -v mold rsvg-convert desktop-file-validate file >/dev/null; then
+            echo "Linux deps present"
+            exit 0
+          fi
+          echo "::warning::cached apt install incomplete; reinstalling directly"
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev \
+            libasound2-dev librsvg2-bin file desktop-file-utils mold
+
       - name: Cache Homebrew downloads
         if: runner.os == 'macOS'
         uses: actions/cache@v4
