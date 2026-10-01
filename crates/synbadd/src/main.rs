@@ -19,6 +19,7 @@ mod log_sink;
 mod pairing;
 mod supervisor;
 mod sync;
+mod transport;
 
 use supervisor::Supervisor;
 

@@ -53,6 +53,19 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(20);
 // `AudioSession` layer, not at the codec or transport.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn loopback_audio_flows_bidirectionally() {
+    run_audio_loopback(false).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ipv4_over_dual_stack_signaling_keeps_media_reachable() {
+    if TcpListener::bind(("::1", 0)).await.is_err() {
+        return;
+    }
+    run_audio_loopback(true).await;
+}
+
+async fn run_audio_loopback(dual_stack: bool) {
     // Subscriber so a failure prints the webrtc-rs logs (including the
     // suspected SRTP `aead::Error`). Quiet by default; turn up with
     // `RUST_LOG=synbad_audio=debug,webrtc=info`.
@@ -68,10 +81,10 @@ async fn loopback_audio_flows_bidirectionally() {
     //    `synbad_crypto::initiate` / `accept` only accept a
     //    `tokio::net::TcpStream`, so a real socket on 127.0.0.1 is the
     //    least-invasive way to stand them up.
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = TcpListener::bind(if dual_stack { "[::]:0" } else { "127.0.0.1:0" })
         .await
         .expect("bind loopback listener");
-    let addr = listener.local_addr().unwrap();
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
 
     let server_accept = async {
         let (stream, _) = listener.accept().await.expect("accept");
@@ -183,6 +196,17 @@ async fn loopback_audio_flows_bidirectionally() {
     // Best-effort cleanup. Drop tears down the WebRTC PCs via the
     // session's `Drop` impl too, but `close().await` flushes properly.
     session_a.close(Some("test done".into())).await;
+    // Both capture channels have closed. Their select arms must not spin
+    // and starve the signaling EOF/Close that terminates the other peer.
+    timeout(Duration::from_secs(2), async {
+        while !session_b.is_finished() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("remote close must end the surviving audio driver");
+    assert!(!session_b.status().sending_to_peer);
+    assert!(!session_b.status().receiving_from_peer);
     session_b.close(Some("test done".into())).await;
 }
 
@@ -214,4 +238,39 @@ fn drain_events(rx: &mut mpsc::Receiver<AudioEvent>) -> Vec<AudioEvent> {
         out.push(ev);
     }
     out
+}
+
+#[tokio::test(start_paused = true)]
+async fn silent_signaling_peer_cannot_stall_negotiation_forever() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (a, b) = tokio::join!(
+        TcpStream::connect(listener.local_addr().unwrap()),
+        listener.accept()
+    );
+    let (a, b) = tokio::join!(
+        initiate(a.unwrap(), HandshakeMode::Anonymous, None),
+        accept(b.unwrap().0, HandshakeMode::Anonymous, |_| None),
+    );
+    let (_silent_peer, _) = a.unwrap();
+    let (signal, _) = b.unwrap();
+    let (events, mut rx) = mpsc::channel(16);
+    let session = AudioSession::start_for_test(
+        "silent-peer".into(),
+        signal,
+        SessionRole::Answerer,
+        events,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(15), async {
+        while !session.is_finished() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("SDP has a deadline");
+    assert!(session.status().last_error.unwrap().contains("timed out"));
+    assert!(matches!(rx.recv().await, Some(AudioEvent::Error { .. })));
 }

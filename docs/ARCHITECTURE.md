@@ -100,3 +100,36 @@ docs/
 Boundaries to respect: the **config model is the single source of truth**;
 discovery feeds peers into it, sync replicates it, and the Core `.conf` is a
 *generated artifact* — never hand-edited at runtime.
+
+## Connection recovery
+
+The daemon retains the user's Start/Stop intent across temporary failures.
+Recovery is automatic while sharing is started; an explicit Stop cancels
+Core restarts and tears down audio. The last persisted config and trust
+store remain available during an outage.
+
+| Connection | Failure detection and recovery |
+|------------|--------------------------------|
+| GUI → daemon IPC | Connect attempts are bounded to 1 s; request reads/writes to 5 s each. Reconnect uses 500 ms–10 s exponential backoff. Subscription acknowledgements precede events; lost broadcast events close the stream so the GUI fetches fresh config, peer, audio, and Core status snapshots. Mutating commands are not replayed after an ambiguous response failure. |
+| Core process | Unexpected exits and reported client disconnects trigger restart. Both roles retry indefinitely: clients cap backoff at 10 s, servers at 30 s. Five rapid server failures produce a diagnostic rather than permanently stopping recovery. |
+| Discovery and LAN listeners | A 5 s reconcile retries failed pairing, sync, and audio binds, detects ended listener tasks, applies port changes, and refreshes mDNS endpoints/config heads. TCP listeners prefer IPv4/IPv6 dual stack with IPv4 fallback; outbound dials race up to 16 discovered addresses under one connect deadline. |
+| Config sync | One outbound session per peer; failed sessions retry with capped 1–60 s backoff on the 5 s reconcile tick. Success is tied to the local head at dial time so edits made during a session receive another push. Sessions have a 10 s budget after connecting. |
+| Pairing | Connect, transport handshake, and Hello exchange have 10 s limits; writes have a 5 s limit. The session has a 120 s budget after connect for both users' confirmations. Disconnects and peer declines fail the pending session. Pairing requires a fresh user action after failure. |
+| Audio | Connect/authentication have 3 s/5 s budgets; SDP negotiation has a 10 s deadline. Initial media setup has a 15 s budget; disconnected ICE receives a 5 s grace window. Ended drivers are reaped every 250 ms and the designated dialing peer reconnects with capped backoff. Routing/device edits rebuild affected sessions; gains update live. |
+
+IPC frames are limited to 1 MiB. Encrypted frames allow 256 KiB of plaintext
+plus the 16-byte authentication tag. Partial frame reads retain their
+progress when an audio timer or media packet interrupts them. Each IPC,
+sync, and audio accept loop owns at most 64 connection tasks, and aborting
+its owner closes the associated streams. Pairing accepts are also bounded
+to 64 active inbound sessions. Accept errors back off rather than spinning.
+
+Tests exercise fragmented/cancelled reads, oversized and truncated frames,
+subscription ordering and lag, stalled IPC, duplicate and stale socket
+binding and concurrent daemon startup, unavailable addresses, dual-stack audio,
+remote close, negotiation
+timeouts, and real daemon recovery after startup port contention and
+repeated Core failures. Real daemon tests use isolated XDG directories and
+a fake Core on Linux. Cross-platform socket behavior and actual two-machine
+Wi-Fi loss, suspend/resume, and native audio-device failures still need
+platform testing; recovery cannot prevent the interruption itself.

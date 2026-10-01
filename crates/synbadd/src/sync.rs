@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use rand_core::RngCore;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use synbad_crypto::{
@@ -74,29 +74,36 @@ pub enum SyncOp {
 }
 
 /// Bind the sync TCP listener. Returns the JoinHandle so the supervisor
-/// can keep the task alive — dropping it kills the listener.
+/// can keep the task alive — aborting it kills the listener.
 pub async fn spawn_listener(
     bind_port: u16,
     deps: Arc<SyncDeps>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let listener = TcpListener::bind(("0.0.0.0", bind_port))
+    let listener = crate::transport::bind_listener(bind_port)
         .await
         .with_context(|| format!("binding sync listener on :{}", bind_port))?;
     tracing::info!(port = bind_port, "sync listener up");
 
     let handle = tokio::spawn(async move {
+        let mut sessions = tokio::task::JoinSet::new();
         loop {
-            match listener.accept().await {
-                Ok((stream, addr)) => {
-                    let deps = deps.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = run_session_with_timeout(stream, addr, deps).await {
-                            tracing::debug!(%addr, ?e, "sync session ended with error");
+            tokio::select! {
+                Some(_) = sessions.join_next(), if !sessions.is_empty() => {},
+                accepted = listener.accept(), if sessions.len() < 64 => {
+                    match accepted {
+                        Ok((stream, addr)) => {
+                            let deps = deps.clone();
+                            sessions.spawn(async move {
+                                if let Err(e) = run_session_with_timeout(stream, addr, deps).await {
+                                    tracing::debug!(%addr, ?e, "sync session failed");
+                                }
+                            });
                         }
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(?e, "sync accept failed");
+                        Err(e) => {
+                            tracing::warn!(?e, "sync accept failed");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
                 }
             }
         }
@@ -105,7 +112,7 @@ pub async fn spawn_listener(
 }
 
 /// Dial a peer and run an outbound sync session in a background task.
-pub fn spawn_outbound(peer: DiscoveredPeer, deps: Arc<SyncDeps>) -> tokio::task::JoinHandle<()> {
+pub fn spawn_outbound(peer: DiscoveredPeer, deps: Arc<SyncDeps>) -> tokio::task::JoinHandle<bool> {
     tokio::spawn(async move {
         if let Err(e) = run_outbound(peer.clone(), deps.clone()).await {
             tracing::debug!(
@@ -118,6 +125,9 @@ pub fn spawn_outbound(peer: DiscoveredPeer, deps: Arc<SyncDeps>) -> tokio::task:
                 direction: SyncDirection::Outbound,
                 reason: e.to_string(),
             });
+            false
+        } else {
+            true
         }
     })
 }
@@ -136,10 +146,10 @@ async fn run_outbound(peer: DiscoveredPeer, deps: Arc<SyncDeps>) -> Result<()> {
     let trusted =
         trusted.ok_or_else(|| anyhow!("peer {} is not in the trust store", peer.machine_id))?;
 
-    let addr = format!("{}:{}", peer.host, peer.sync_port);
-    let stream = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr))
+    let addr = (peer.host.as_str(), peer.sync_port);
+    let stream = crate::transport::connect_peer(&peer, peer.sync_port, Duration::from_secs(3))
         .await
-        .map_err(|_| anyhow!("connect to {} timed out", addr))??;
+        .with_context(|| format!("connect to {addr:?}"))?;
 
     let _ = deps.events.send(Event::SyncStarted {
         peer_machine_id: peer.machine_id.clone(),
@@ -241,9 +251,10 @@ async fn run_session_with_timeout(
     addr: SocketAddr,
     deps: Arc<SyncDeps>,
 ) -> Result<()> {
+    let mut peer_id = String::new();
     let result = tokio::time::timeout(
         SESSION_TIMEOUT,
-        run_inbound_inner(stream, addr, deps.clone()),
+        run_inbound_inner(stream, addr, deps.clone(), &mut peer_id),
     )
     .await;
     match result {
@@ -258,7 +269,7 @@ async fn run_session_with_timeout(
         }
         Ok(Err(e)) => {
             let _ = deps.events.send(Event::SyncFailed {
-                peer_machine_id: String::new(),
+                peer_machine_id: peer_id,
                 direction: SyncDirection::Inbound,
                 reason: e.to_string(),
             });
@@ -266,7 +277,7 @@ async fn run_session_with_timeout(
         }
         Err(_) => {
             let _ = deps.events.send(Event::SyncFailed {
-                peer_machine_id: String::new(),
+                peer_machine_id: peer_id,
                 direction: SyncDirection::Inbound,
                 reason: "session timed out".into(),
             });
@@ -285,6 +296,7 @@ async fn run_inbound_inner(
     stream: TcpStream,
     addr: SocketAddr,
     deps: Arc<SyncDeps>,
+    peer_id: &mut String,
 ) -> Result<InboundResult> {
     // Snapshot the trust store as (machine_id -> [u8;32] pubkey). The
     // transport handshake's resolver callback is sync, so we can't hold
@@ -327,6 +339,8 @@ async fn run_inbound_inner(
         }
     };
 
+    *peer_id = peer_machine_id.clone();
+
     // Reload the trust entry now that we know who the peer is — we
     // need its display fields for the event payloads. The transport
     // already verified the pubkey, so this lookup is just for metadata.
@@ -361,6 +375,7 @@ async fn run_inbound_inner(
     // before the reply means the peer's State frame contains our final
     // converged view, including anything they sent us — both sides end
     // up byte-identical.
+    let pre_head = snapshot(&deps).await?.head_hash();
     let merged = merge(&deps, trusted.machine_id.clone(), peer_frame.state.clone()).await?;
     let new_head = merged.head_hash();
 
@@ -374,27 +389,12 @@ async fn run_inbound_inner(
         .map_err(|e| anyhow!("sign inbound reply: {}", e))?;
     send_frame(&mut chan, &reply).await?;
 
-    // "Updated" here means the merge produced a different head from the
-    // state we held before the session. The supervisor sends us the
-    // post-merge state but not the pre-merge state, so we approximate
-    // with "did the peer's state differ from ours?" — strictly correct
-    // for an LWW merge: a no-op merge leaves the head untouched.
-    let updated =
-        peer_frame.state.head_hash() != new_head || head_of_our_pre_state(&deps).await? != new_head;
+    let updated = pre_head != new_head;
     Ok(InboundResult {
         peer_machine_id: trusted.machine_id,
         updated,
         new_head,
     })
-}
-
-/// Best-effort post-merge sanity check: read the supervisor's current
-/// state again and compare to `new_head`. If it differs, a concurrent
-/// local edit landed during our merge — that's fine, the next outgoing
-/// push (triggered by that edit) will propagate it.
-async fn head_of_our_pre_state(deps: &SyncDeps) -> Result<String> {
-    let s = snapshot(deps).await?;
-    Ok(s.head_hash())
 }
 
 async fn snapshot(deps: &SyncDeps) -> Result<VersionedConfig> {

@@ -319,6 +319,12 @@ impl SynbadApp {
                 }
                 Update::Disconnected(msg) => {
                     self.connected = false;
+                    self.connected_peers.clear();
+                    self.active_screen = None;
+                    self.active_syncs.clear();
+                    self.pending_pairings.clear();
+                    self.discovered_peers.clear();
+                    self.audio_peer_status.clear();
                     self.last_error = Some(msg);
                     self.launching_status = None;
                 }
@@ -330,8 +336,15 @@ impl SynbadApp {
                     self.launching_status = Some(msg);
                     self.last_error = None;
                 }
-                Update::Status { state, recent_log } => {
+                Update::Status {
+                    state,
+                    recent_log,
+                    connected_peers,
+                    active_screen,
+                } => {
                     self.state = state;
+                    self.connected_peers = connected_peers.into_iter().collect();
+                    self.active_screen = active_screen;
                     self.log.clear();
                     for l in recent_log {
                         self.push_log(l);
@@ -506,7 +519,12 @@ impl SynbadApp {
     /// Core actually dials the new address — without this the user would
     /// still have to bounce down to the bottom bar.
     pub(super) fn connect_as_client_to(&mut self, peer: &DiscoveredPeer) {
-        let addr = format!("{}:{}", peer.host, peer.core_port);
+        let port = if peer.core_port == 0 {
+            self.config.port
+        } else {
+            peer.core_port
+        };
+        let addr = synbad_config::host_port(&peer.host, port);
         let mut new_cfg = self.config.clone();
         new_cfg.role = NodeRole::Client;
         new_cfg.server_address = Some(addr);

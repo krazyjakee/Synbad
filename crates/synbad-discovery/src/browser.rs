@@ -117,17 +117,14 @@ fn peer_from(info: &mdns_sd::ServiceInfo) -> Option<DiscoveredPeer> {
         .unwrap_or("")
         .to_string();
 
-    // Prefer the first resolved IPv4 address as the host. Fall back to the
-    // hostname mDNS associates with the record so cross-platform name
-    // resolution still works.
-    let host = info
-        .get_addresses()
-        .iter()
-        .find_map(|addr| match addr {
-            std::net::IpAddr::V4(v4) => Some(v4.to_string()),
-            _ => None,
-        })
-        .or_else(|| info.get_addresses().iter().next().map(|a| a.to_string()))
+    // Stable ordering prevents interface enumeration churn. Retain every
+    // candidate so dialers can recover from an unreachable NIC/VPN address.
+    let mut addresses: Vec<_> = info.get_addresses().iter().copied().collect();
+    addresses.sort_by_key(|ip| (ip.is_loopback(), ip.is_ipv6(), *ip));
+    let addresses: Vec<String> = addresses.into_iter().map(|ip| ip.to_string()).collect();
+    let host = addresses
+        .first()
+        .cloned()
         .unwrap_or_else(|| info.get_hostname().to_string());
 
     // SRV port = the Synbad daemon's pairing port (what we connect to for
@@ -161,6 +158,7 @@ fn peer_from(info: &mdns_sd::ServiceInfo) -> Option<DiscoveredPeer> {
         machine_id,
         display_name,
         host,
+        addresses,
         service_port: info.get_port(),
         core_port,
         sync_port,

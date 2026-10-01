@@ -5,6 +5,7 @@
 //! a `Response` — anything non-trivial (config edits, core lifecycle) is
 //! a thin call into a sibling module, so this stays a routing table.
 
+use std::time::Duration;
 use synbad_audio::{bridge::DeviceListReply, peer_audio_active, AudioBridge, AudioCommand};
 use synbad_config::paths;
 use synbad_ipc::server::IncomingRequest;
@@ -22,6 +23,8 @@ impl Supervisor {
             Request::GetStatus => Response::Status {
                 state: self.state.clone(),
                 recent_log: self.log_tail.iter().cloned().collect(),
+                connected_peers: self.connected_peers.iter().cloned().collect(),
+                active_screen: self.active_screen.clone(),
             },
             Request::GetConfig => Response::Config {
                 config: Box::new(self.config.clone()),
@@ -35,10 +38,7 @@ impl Supervisor {
             Request::Start => {
                 self.desired_running = true;
                 persist_user_stopped(false);
-                // Explicit user action resets the give-up state from a
-                // prior instant-fail loop — they may have fixed the
-                // missing-deps issue and want us to try again. Reset the
-                // reconnect backoff too so the retry starts fast.
+                // Explicit Start resets retry backoff for an immediate attempt.
                 self.fast_fail_count = 0;
                 self.backoff = MIN_BACKOFF;
                 self.start_core().await;
@@ -119,12 +119,9 @@ impl Supervisor {
                         // peer must not keep streaming. Best-effort: if
                         // the bridge is disabled or has died we skip it.
                         if let Some(handle) = &self.audio {
-                            let _ = handle
-                                .commands_tx
-                                .send(AudioCommand::ClosePeer {
-                                    peer_machine_id: machine_id.clone(),
-                                })
-                                .await;
+                            let _ = handle.commands_tx.try_send(AudioCommand::ClosePeer {
+                                peer_machine_id: machine_id.clone(),
+                            });
                         }
                         Response::Ok
                     }
@@ -158,18 +155,28 @@ impl Supervisor {
                 let (tx, rx) = oneshot::channel();
                 if handle
                     .commands_tx
-                    .send(AudioCommand::ListDevices { reply: tx })
-                    .await
+                    .try_send(AudioCommand::ListDevices { reply: tx })
                     .is_err()
                 {
                     return Response::Error {
                         message: "audio bridge is not responding".into(),
                     };
                 }
-                rx.await
-                    .map_err(|_| "audio bridge dropped reply channel".to_string())
+                tokio::time::timeout(Duration::from_secs(2), rx)
+                    .await
+                    .map_err(|_| "audio bridge response timed out".to_string())
+                    .and_then(|reply| {
+                        reply.map_err(|_| "audio bridge dropped reply channel".to_string())
+                    })
             }
-            None => AudioBridge::list_devices_blocking().map_err(|e| e.to_string()),
+            None => tokio::time::timeout(
+                Duration::from_secs(2),
+                tokio::task::spawn_blocking(AudioBridge::list_devices_blocking),
+            )
+            .await
+            .map_err(|_| "audio device enumeration timed out".to_string())
+            .and_then(|reply| reply.map_err(|e| e.to_string()))
+            .and_then(|reply| reply.map_err(|e| e.to_string())),
         };
         match reply {
             Ok(list) => Response::AudioDevices {
@@ -212,8 +219,7 @@ impl Supervisor {
         if let Some(handle) = &self.audio {
             let _ = handle
                 .commands_tx
-                .send(AudioCommand::Reconfigure(audio.clone()))
-                .await;
+                .try_send(AudioCommand::Reconfigure(audio.clone()));
         }
         // Pick up "newly enabled" peers (master toggle was already on
         // and a per_peer entry just turned on, or globals turned on).
@@ -246,23 +252,27 @@ impl Supervisor {
         let (tx, rx) = oneshot::channel();
         if handle
             .commands_tx
-            .send(AudioCommand::QueryStatus { reply: tx })
-            .await
+            .try_send(AudioCommand::QueryStatus { reply: tx })
             .is_err()
         {
             return Response::Error {
                 message: "audio bridge is not responding".into(),
             };
         }
-        match rx.await {
-            Ok(peers) => Response::AudioStatus { peers },
-            Err(_) => Response::Error {
-                message: "audio bridge dropped reply channel".into(),
+        match tokio::time::timeout(Duration::from_secs(2), rx).await {
+            Ok(Ok(peers)) => Response::AudioStatus { peers },
+            _ => Response::Error {
+                message: "audio bridge did not reply within two seconds".into(),
             },
         }
     }
 
     fn start_pairing(&mut self, machine_id: &str) -> anyhow::Result<()> {
+        self.gc_pairing_tasks();
+        anyhow::ensure!(
+            self.pairing_tasks.len() < 64,
+            "too many pairing sessions; retry shortly"
+        );
         let peer = self
             .peers
             .get(machine_id)

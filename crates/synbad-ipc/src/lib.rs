@@ -24,6 +24,10 @@ pub struct DiscoveredPeer {
     pub display_name: String,
     /// Reachable host (resolved IP, or `hostname.local`).
     pub host: String,
+    /// All mDNS-resolved addresses, used when the preferred interface is
+    /// unavailable. Older daemons omit this and retain hostname fallback.
+    #[serde(default)]
+    pub addresses: Vec<String>,
     /// Port of the Synbad daemon on the peer — used for pairing handshake
     /// and (eventually) config sync.
     pub service_port: u16,
@@ -54,6 +58,9 @@ pub struct DiscoveredPeer {
     #[serde(default)]
     pub config_head: String,
 }
+
+/// Maximum newline-delimited IPC message size, including the newline.
+pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 
 pub mod client;
 pub mod log_parse;
@@ -135,6 +142,10 @@ pub enum Response {
     Status {
         state: DaemonState,
         recent_log: Vec<String>,
+        #[serde(default)]
+        connected_peers: Vec<String>,
+        #[serde(default)]
+        active_screen: Option<String>,
     },
     Config {
         // Boxed so this variant doesn't inflate the size of every
@@ -336,6 +347,8 @@ pub enum DaemonState {
         attempt: u32,
         next_retry_secs: u64,
     },
+    /// A startup/child failure with an automatic restart pending.
+    /// Explicit Stop changes this to Stopped and cancels the retry.
     Crashed {
         exit_code: Option<i32>,
     },
@@ -347,10 +360,14 @@ impl DaemonState {
     }
 
     /// `true` while the supervisor still intends to bring the link up —
-    /// either it's up/coming-up, or it's a client retrying a reachable
-    /// server. Distinct from a terminal `Crashed`/`Stopped`.
+    /// whether starting, reconnecting, or retrying a startup failure.
+    /// Explicit Stopped is the terminal state.
     pub fn is_active(&self) -> bool {
-        self.is_running() || matches!(self, DaemonState::Reconnecting { .. })
+        self.is_running()
+            || matches!(
+                self,
+                DaemonState::Reconnecting { .. } | DaemonState::Crashed { .. }
+            )
     }
 }
 
@@ -362,7 +379,7 @@ mod tests {
     fn reconnecting_is_active_but_not_running() {
         // The Core is gone while reconnecting, so the GUI must treat it as
         // not-running (peers can't survive a dead Core) — but it is still
-        // "active" (the supervisor keeps trying), not terminal like Crashed.
+        // "active" because the supervisor keeps trying.
         let s = DaemonState::Reconnecting {
             attempt: 2,
             next_retry_secs: 4,
@@ -372,14 +389,12 @@ mod tests {
     }
 
     #[test]
-    fn crashed_and_stopped_are_neither_running_nor_active() {
-        for s in [
-            DaemonState::Crashed { exit_code: Some(1) },
-            DaemonState::Stopped,
-        ] {
-            assert!(!s.is_running());
-            assert!(!s.is_active());
-        }
+    fn failure_retry_is_active_and_explicit_stop_is_terminal() {
+        let failed = DaemonState::Crashed { exit_code: Some(1) };
+        assert!(!failed.is_running());
+        assert!(failed.is_active());
+        assert!(!DaemonState::Stopped.is_running());
+        assert!(!DaemonState::Stopped.is_active());
     }
 
     #[test]

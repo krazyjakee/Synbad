@@ -149,7 +149,7 @@ impl SynbadApp {
                 ),
                 DaemonState::Crashed { exit_code } => (
                     egui::Color32::LIGHT_RED,
-                    format!("Core crashed (exit {exit_code:?})"),
+                    format!("Core unavailable; retrying (exit {exit_code:?})"),
                 ),
             };
             ui.horizontal(|ui| {
@@ -343,9 +343,9 @@ impl SynbadApp {
             return HealthSummary {
                 icon: "●",
                 colour: egui::Color32::LIGHT_RED,
-                headline: "Core crashed",
+                headline: "Core unavailable; retrying",
                 detail: Some(format!(
-                    "Last exit code: {:?}. See the log in advanced mode for details.",
+                    "Last exit code: {:?}. Recovery is automatic; see the log for details or click Stop to cancel.",
                     exit_code
                 )),
             };
@@ -1181,7 +1181,7 @@ pub(super) fn state_chip(s: &DaemonState, connected: bool) -> (egui::Color32, St
         ),
         DaemonState::Crashed { exit_code } => (
             egui::Color32::LIGHT_RED,
-            format!("crashed (exit {:?})", exit_code),
+            format!("retrying (exit {:?})", exit_code),
         ),
     }
 }

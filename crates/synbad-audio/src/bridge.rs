@@ -138,14 +138,34 @@ impl AudioBridge {
             enabled = self.config.enabled,
             "audio bridge run loop starting"
         );
-        while let Some(cmd) = commands.recv().await {
+        let mut reap = tokio::time::interval(std::time::Duration::from_millis(250));
+        loop {
+            let cmd = tokio::select! {
+                cmd = commands.recv() => match cmd { Some(cmd) => cmd, None => break },
+                _ = reap.tick() => {
+                    let trust = self._trust.lock().await;
+                    let ended: Vec<String> = self.sessions.iter()
+                        .filter(|(peer, session)| session.is_finished() || !trust.contains(peer))
+                        .map(|(peer, _)| peer.clone()).collect();
+                    drop(trust);
+                    for peer in ended {
+                        self.sessions.remove(&peer);
+                        if events.send(AudioEvent::SessionClosed { peer }).await.is_err() { return; }
+                    }
+                    continue;
+                }
+            };
             match cmd {
                 AudioCommand::IncomingSignal {
                     peer_machine_id,
                     stream,
                     role,
                 } => {
-                    if !self.config.enabled {
+                    if !self._trust.lock().await.contains(&peer_machine_id) {
+                        warn!(peer = %peer_machine_id, "dropping audio signal from revoked peer");
+                        continue;
+                    }
+                    if !peer_audio_active(&self.config, &peer_machine_id) {
                         // Politely drop the stream by letting it go out of scope.
                         warn!(peer = %peer_machine_id, "incoming audio signal while disabled");
                         continue;
@@ -175,7 +195,9 @@ impl AudioBridge {
                     .await
                     {
                         Ok(session) => {
+                            let snapshot = session.status();
                             self.sessions.insert(peer_machine_id, session);
+                            let _ = events.send(AudioEvent::PeerStatus(snapshot)).await;
                         }
                         Err(e) => {
                             let _ = events
@@ -213,8 +235,11 @@ impl AudioBridge {
                         .keys()
                         .filter(|peer| {
                             device_changed
-                                || (peer_audio_active(&old_cfg, peer)
-                                    && !peer_audio_active(new_cfg, peer))
+                                || old_cfg.enabled != new_cfg.enabled
+                                || crate::session::peer_wants_send(&old_cfg, peer)
+                                    != crate::session::peer_wants_send(new_cfg, peer)
+                                || crate::session::peer_wants_recv(&old_cfg, peer)
+                                    != crate::session::peer_wants_recv(new_cfg, peer)
                         })
                         .cloned()
                         .collect();

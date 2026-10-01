@@ -90,11 +90,12 @@ pub fn acquire(
                 // we reclaim it.
                 match UnixStream::connect(&socket_path) {
                     Ok(mut s) => {
+                        let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(1)));
                         let _ = s.write_all(b"SHOW\n");
                         let _ = s.flush();
                         return AcquireResult::Forwarded;
                     }
-                    Err(_) if attempt == 0 => {
+                    Err(e) if attempt == 0 && e.kind() == std::io::ErrorKind::ConnectionRefused => {
                         tracing::info!(?socket_path, "removing stale single-instance socket");
                         let _ = std::fs::remove_file(&socket_path);
                         continue;
@@ -122,10 +123,17 @@ fn listen(
 ) {
     use std::io::Read;
     for stream in listener.incoming() {
-        let Ok(mut s) = stream else { continue };
-        let mut buf = [0u8; 16];
-        let n = s.read(&mut buf).unwrap_or(0);
-        if n >= 4 && &buf[..4] == b"SHOW" {
+        let Ok(mut s) = stream else {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
+        };
+        if s.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .is_err()
+        {
+            continue;
+        }
+        let mut buf = [0u8; 4];
+        if s.read_exact(&mut buf).is_ok() && &buf == b"SHOW" {
             let _ = show_tx.send(());
             repaint();
         }

@@ -72,6 +72,8 @@ pub enum Update {
     Status {
         state: DaemonState,
         recent_log: Vec<String>,
+        connected_peers: Vec<String>,
+        active_screen: Option<String>,
     },
     Config(Config),
     Log(String),
@@ -268,48 +270,35 @@ fn event_loop(
     // when a spawn succeeds or a connect succeeds.
     let mut last_spawn_error: Option<String> = None;
 
-    // Kick off the daemon BEFORE the first connect attempt when the user
-    // wants one running. Without this we'd flash "could not connect to
-    // synbadd" on every cold start with autostart on — the connect
-    // races ahead of the spawn we were about to do anyway.
-    if daemon_wanted.load(Ordering::Relaxed) {
-        last_spawn_error = try_spawn(&update_tx, &repaint).err();
-        last_spawn = Some(Instant::now());
-        if last_spawn_error.is_none() {
-            let _ = update_tx.send(Update::Launching("starting synbadd…".into()));
-            repaint();
-        }
-    }
-
     loop {
         match Connection::connect(&socket_path) {
             Ok(mut conn) => {
                 last_spawn_error = None;
-                backoff = Duration::from_millis(500);
-                let _ = update_tx.send(Update::Connected);
-                repaint();
-
-                if let Err(e) = bootstrap(&mut conn, &update_tx) {
+                let setup = (|| {
+                    match conn
+                        .request(Request::Subscribe)
+                        .map_err(|e| e.to_string())?
+                    {
+                        Response::Ok => {}
+                        other => return Err(format!("unexpected subscribe response: {other:?}")),
+                    }
+                    // Events are buffered while a separate connection fetches
+                    // snapshots, closing the bootstrap/subscribe race.
+                    let mut snapshot =
+                        Connection::connect(&socket_path).map_err(|e| e.to_string())?;
+                    bootstrap(&mut snapshot, &update_tx)?;
+                    conn.make_blocking().map_err(|e| e.to_string())
+                })();
+                if let Err(e) = setup {
                     let _ = update_tx.send(Update::Disconnected(e));
                     repaint();
                     thread::sleep(backoff);
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
                     continue;
                 }
-
-                if let Err(e) = conn.send(Request::Subscribe) {
-                    let _ = update_tx.send(Update::Disconnected(format!("subscribe: {}", e)));
-                    repaint();
-                    continue;
-                }
-                // Drain the Subscribe ack.
-                if let Err(e) = conn.recv() {
-                    let _ = update_tx.send(Update::Disconnected(e.to_string()));
-                    repaint();
-                    continue;
-                }
-                if let Err(e) = conn.make_blocking() {
-                    let _ = update_tx.send(Update::Error(e.to_string()));
-                }
+                let connected_at = Instant::now();
+                let _ = update_tx.send(Update::Connected);
+                repaint();
 
                 // Stream events until the connection breaks.
                 loop {
@@ -389,6 +378,9 @@ fn event_loop(
                         }
                         Ok(_) => {}
                         Err(e) => {
+                            if connected_at.elapsed() >= Duration::from_secs(2) {
+                                backoff = Duration::from_millis(500);
+                            }
                             let _ = update_tx.send(Update::Disconnected(e.to_string()));
                             repaint();
                             break;
@@ -430,6 +422,10 @@ fn event_loop(
                 if should_spawn(daemon_wanted.load(Ordering::Relaxed), last_spawn, now) {
                     last_spawn_error = try_spawn(&update_tx, &repaint).err();
                     last_spawn = Some(Instant::now());
+                    if last_spawn_error.is_none() {
+                        let _ = update_tx.send(Update::Launching("starting synbadd…".into()));
+                        repaint();
+                    }
                 }
             }
         }
@@ -582,8 +578,18 @@ fn command_loop(
                     Cmd::GetAudioStatus => Request::GetAudioStatus,
                 };
                 match conn.request(req) {
-                    Ok(Response::Status { state, recent_log }) => {
-                        let _ = update_tx.send(Update::Status { state, recent_log });
+                    Ok(Response::Status {
+                        state,
+                        recent_log,
+                        connected_peers,
+                        active_screen,
+                    }) => {
+                        let _ = update_tx.send(Update::Status {
+                            state,
+                            recent_log,
+                            connected_peers,
+                            active_screen,
+                        });
                     }
                     Ok(Response::Config { config }) => {
                         let _ = update_tx.send(Update::Config(*config));
@@ -634,15 +640,28 @@ fn bootstrap(conn: &mut Connection, update_tx: &Sender<Update>) -> Result<(), St
     let st = conn
         .request(Request::GetStatus)
         .map_err(|e| e.to_string())?;
-    if let Response::Status { state, recent_log } = st {
-        let _ = update_tx.send(Update::Status { state, recent_log });
+    if let Response::Status {
+        state,
+        recent_log,
+        connected_peers,
+        active_screen,
+    } = st
+    {
+        let _ = update_tx.send(Update::Status {
+            state,
+            recent_log,
+            connected_peers,
+            active_screen,
+        });
     }
     // Identity is small and never changes during the daemon's lifetime;
     // pull it once at connect time.
-    if let Ok(Response::LocalIdentity {
+    if let Response::LocalIdentity {
         machine_id,
         fingerprint,
-    }) = conn.request(Request::GetLocalIdentity)
+    } = conn
+        .request(Request::GetLocalIdentity)
+        .map_err(|e| e.to_string())?
     {
         let _ = update_tx.send(Update::LocalIdentity {
             machine_id,
@@ -650,12 +669,24 @@ fn bootstrap(conn: &mut Connection, update_tx: &Sender<Update>) -> Result<(), St
         });
     }
     // Peers may already be visible if the daemon has been running a while.
-    if let Ok(Response::Peers { peers }) = conn.request(Request::ListPeers) {
+    if let Response::Peers { peers } = conn
+        .request(Request::ListPeers)
+        .map_err(|e| e.to_string())?
+    {
         let _ = update_tx.send(Update::PeerSnapshot(peers));
     }
     // Trusted-peer set: small, pulled once at connect.
-    if let Ok(Response::TrustedPeers { peers }) = conn.request(Request::ListTrustedPeers) {
+    if let Response::TrustedPeers { peers } = conn
+        .request(Request::ListTrustedPeers)
+        .map_err(|e| e.to_string())?
+    {
         let _ = update_tx.send(Update::TrustedSnapshot(peers));
+    }
+    if let Response::AudioStatus { peers } = conn
+        .request(Request::GetAudioStatus)
+        .map_err(|e| e.to_string())?
+    {
+        let _ = update_tx.send(Update::AudioStatusSnapshot(peers));
     }
     Ok(())
 }

@@ -12,7 +12,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut conn = Connection::connect(&socket)?;
     match conn.request(Request::GetStatus)? {
-        Response::Status { state, recent_log } => {
+        Response::Status {
+            state, recent_log, ..
+        } => {
             println!("state: {:?}", state);
             println!("recent log lines: {}", recent_log.len());
         }

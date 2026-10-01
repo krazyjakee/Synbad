@@ -15,7 +15,7 @@ use synbad_config::Config;
 use synbad_ipc::Event;
 use synbad_sync::MergeOutcome;
 
-use crate::sync::{self, SyncOp};
+use crate::sync::SyncOp;
 
 use super::Supervisor;
 
@@ -99,36 +99,13 @@ impl Supervisor {
     /// with a divergent head. Sessions are idempotent (LWW), so a stray
     /// extra push is harmless.
     fn push_to_trusted_peers(&mut self) {
-        // Snapshot trust list so we don't hold the mutex across spawns.
-        // The mutex is async; the snapshot itself is the common case.
-        let trust = match self.trust.try_lock() {
-            Ok(g) => g
-                .list()
-                .iter()
-                .map(|p| p.machine_id.clone())
-                .collect::<Vec<_>>(),
-            Err(_) => {
-                // Trust mutex is contended — schedule a deferred push so
-                // we don't drop the change on the floor.
-                tracing::debug!("trust mutex busy; deferring push");
-                return;
-            }
-        };
+        // Forget prior success so edits made during an in-flight session
+        // are sent again by the periodic reconcile after it finishes.
+        self.sync_confirmed.clear();
+        self.sync_backoff.clear();
         for peer in self.peers.values().cloned().collect::<Vec<_>>() {
-            if !trust.iter().any(|m| m == &peer.machine_id) {
-                continue;
-            }
-            if peer.sync_port == 0 {
-                continue;
-            }
-            let handle = sync::spawn_outbound(peer, self.sync_deps.clone());
-            self.sync_tasks.push(handle);
+            self.maybe_pull_from(peer);
         }
-        self.gc_sync_tasks();
-    }
-
-    pub(super) fn gc_sync_tasks(&mut self) {
-        self.sync_tasks.retain(|t| !t.is_finished());
     }
 
     /// Handle a `SyncOp` request from a sync session task.

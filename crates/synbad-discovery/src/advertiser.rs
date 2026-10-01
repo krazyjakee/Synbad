@@ -20,8 +20,9 @@ pub enum AdvertiseError {
 }
 
 /// Inputs that go into the published TXT record. Stored on the
-/// [`Advertiser`] so live mutations (currently just `audio_port`) can
+/// [`Advertiser`] so live endpoint and head changes can
 /// re-build a `ServiceInfo` with the same identity but a fresh TXT.
+#[derive(Clone, PartialEq, Eq)]
 struct AdvertisedFields {
     machine_id: String,
     fingerprint: String,
@@ -99,34 +100,41 @@ impl Advertiser {
         })
     }
 
-    /// Re-publish the TXT record with a new `audio_port` (use `0` to drop
-    /// the `audio_port` key entirely). Cheap no-op when the value hasn't
-    /// changed.
-    ///
-    /// mdns-sd 0.11 has no in-place TXT update, so we unregister the
-    /// existing record and register a fresh one against the same daemon.
-    /// Peers' browsers see this as a `ServiceRemoved` followed by a fresh
-    /// `ServiceResolved` carrying the new TXT — which is exactly what the
-    /// receiving supervisor needs to refresh its cached `DiscoveredPeer`
-    /// entry and dial us.
-    pub fn set_audio_port(&mut self, audio_port: u16) -> Result<(), AdvertiseError> {
-        if self.fields.audio_port == audio_port {
+    /// Reannounce current endpoints and config head. Registering an
+    /// updated record directly avoids a goodbye/reconnect cycle.
+    pub fn refresh(
+        &mut self,
+        service_port: u16,
+        sync_port: u16,
+        core_port: u16,
+        audio_port: u16,
+        config_head: &str,
+    ) -> Result<(), AdvertiseError> {
+        let mut fields = self.fields.clone();
+        fields.service_port = service_port;
+        fields.sync_port = sync_port;
+        fields.core_port = core_port;
+        fields.audio_port = audio_port;
+        fields.config_head = config_head.to_string();
+        if fields == self.fields {
             return Ok(());
         }
-        self.fields.audio_port = audio_port;
-        // Best-effort unregister — if mdns-sd has already evicted us
-        // (interface flap, etc.) we still want the re-register to land.
-        let _ = self.daemon.unregister(&self.full_name);
-        let service = build_service_info(&self.fields)?;
-        let new_full_name = service.get_fullname().to_string();
+        let service = build_service_info(&fields)?;
         self.daemon.register(service)?;
-        self.full_name = new_full_name;
-        tracing::info!(
-            full_name = %self.full_name,
-            audio_port,
-            "mDNS service re-registered (audio_port updated)"
-        );
+        // Commit only after successful registration so failures can retry.
+        self.fields = fields;
         Ok(())
+    }
+
+    /// Reannounce audio availability (0 means no listener).
+    pub fn set_audio_port(&mut self, audio_port: u16) -> Result<(), AdvertiseError> {
+        self.refresh(
+            self.fields.service_port,
+            self.fields.sync_port,
+            self.fields.core_port,
+            audio_port,
+            &self.fields.config_head.clone(),
+        )
     }
 }
 

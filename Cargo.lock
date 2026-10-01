@@ -4610,6 +4610,7 @@ version = "0.1.9"
 dependencies = [
  "directories",
  "interprocess",
+ "libc",
  "serde",
  "serde_json",
  "synbad-config",
@@ -4671,6 +4672,7 @@ dependencies = [
  "serde_json",
  "sevenz-rust2",
  "sha2",
+ "socket2 0.6.3",
  "synbad-audio",
  "synbad-config",
  "synbad-crypto",

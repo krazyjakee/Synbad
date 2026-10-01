@@ -10,6 +10,19 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+- Connection recovery across IPC, config sync, pairing, and audio: bounded
+  requests/negotiation, automatic retries after listener bind failures,
+  safe subscription recovery after event loss, and cleanup of ended audio
+  sessions and owned connection tasks.
+- Fragmented encrypted signaling reads retain progress when interrupted by
+  media/timer events; maximum-sized encrypted frames include tag overhead.
+- Server Core startup keeps retrying after repeated failures, allowing
+  recovery from temporary port contention without another Start click.
+- LAN dialing tries all discovered interfaces within one deadline and
+  supports IPv4/IPv6 listeners. GUI reconnection restores current peer and
+  audio status instead of retaining stale connection indicators.
+
 ## [0.1.9] - 2026-09-30
 
 ### Security

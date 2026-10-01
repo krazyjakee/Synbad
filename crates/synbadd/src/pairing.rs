@@ -28,7 +28,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::{broadcast, oneshot};
 
 use synbad_crypto::{
@@ -54,45 +54,55 @@ enum PairMessage {
 }
 
 /// Spawn the TCP listener and return its handle. The listener accepts
-/// inbound pairing sessions until it's dropped.
+/// inbound pairing sessions until the handle is aborted.
 pub async fn spawn_listener(
     bind_port: u16,
     deps: Arc<SessionDeps>,
     incoming_tx: tokio::sync::mpsc::Sender<IncomingSession>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let listener = TcpListener::bind(("0.0.0.0", bind_port))
+    let listener = crate::transport::bind_listener(bind_port)
         .await
         .with_context(|| format!("binding pairing listener on :{}", bind_port))?;
     tracing::info!(port = bind_port, "pairing listener up");
 
     let handle = tokio::spawn(async move {
+        let slots = Arc::new(tokio::sync::Semaphore::new(64));
         loop {
+            let Ok(slot) = slots.clone().acquire_owned().await else {
+                break;
+            };
             match listener.accept().await {
                 Ok((stream, addr)) => {
                     let (confirm_tx, confirm_rx) = oneshot::channel::<bool>();
                     let session_id = new_session_id();
                     let deps = deps.clone();
                     let session_id_for_task = session_id.clone();
+                    let (registered_tx, registered_rx) = oneshot::channel();
                     let task = tokio::spawn(async move {
+                        let _slot = slot;
+                        if registered_rx.await.is_err() {
+                            return;
+                        }
                         let _ =
                             run_session(session_id_for_task, stream, addr, deps, confirm_rx, None)
                                 .await;
                     });
-                    if incoming_tx
+                    if let Err(e) = incoming_tx
                         .send(IncomingSession {
                             session_id,
                             confirm_tx,
+                            registered: registered_tx,
                             _task: task,
                         })
                         .await
-                        .is_err()
                     {
-                        // Supervisor gone; stop accepting.
+                        e.0._task.abort();
                         break;
                     }
                 }
                 Err(e) => {
                     tracing::warn!(?e, "pairing accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
         }
@@ -107,39 +117,31 @@ pub fn spawn_outbound(peer: DiscoveredPeer, deps: Arc<SessionDeps>) -> OutboundH
     let (confirm_tx, confirm_rx) = oneshot::channel::<bool>();
     let session_id = new_session_id();
     let session_id_for_task = session_id.clone();
-    let task =
-        tokio::spawn(async move {
-            let addr_str = format!("{}:{}", peer.host, peer.service_port);
-            let stream =
-                match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr_str))
-                    .await
-                {
-                    Ok(Ok(s)) => s,
-                    Ok(Err(e)) => {
-                        let _ = deps.events.send(Event::PairingFailed {
-                            session_id: session_id_for_task,
-                            reason: format!("connect to {}: {}", addr_str, e),
-                        });
-                        return;
-                    }
-                    Err(_) => {
-                        let _ = deps.events.send(Event::PairingFailed {
-                            session_id: session_id_for_task,
-                            reason: format!("connect to {} timed out", addr_str),
-                        });
-                        return;
-                    }
-                };
-            let _ = run_session(
-                session_id_for_task,
-                stream,
-                stream_peer_addr(&peer),
-                deps,
-                confirm_rx,
-                Some(peer.machine_id.clone()),
-            )
-            .await;
-        });
+    let task = tokio::spawn(async move {
+        let addr_str = format!("{}:{}", peer.host, peer.service_port);
+        let stream =
+            match crate::transport::connect_peer(&peer, peer.service_port, Duration::from_secs(10))
+                .await
+            {
+                Ok(stream) => stream,
+                Err(e) => {
+                    let _ = deps.events.send(Event::PairingFailed {
+                        session_id: session_id_for_task,
+                        reason: format!("connect to {}: {}", addr_str, e),
+                    });
+                    return;
+                }
+            };
+        let _ = run_session(
+            session_id_for_task,
+            stream,
+            stream_peer_addr(&peer),
+            deps,
+            confirm_rx,
+            Some(peer.machine_id.clone()),
+        )
+        .await;
+    });
     OutboundHandle {
         session_id,
         confirm_tx,
@@ -151,8 +153,9 @@ fn stream_peer_addr(peer: &DiscoveredPeer) -> SocketAddr {
     // We don't actually need the real peer SocketAddr for the protocol —
     // only for diagnostics. Fall back to a zero placeholder if parsing
     // fails (the host could be a hostname.local).
-    format!("{}:{}", peer.host, peer.service_port)
-        .parse()
+    peer.host
+        .parse::<std::net::IpAddr>()
+        .map(|ip| SocketAddr::new(ip, peer.service_port))
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], peer.service_port)))
 }
 
@@ -174,8 +177,8 @@ pub struct SessionDeps {
 pub struct IncomingSession {
     pub session_id: String,
     pub confirm_tx: oneshot::Sender<bool>,
-    /// Kept alive so the task isn't dropped (which would `kill_on_drop`
-    /// the TCP stream).
+    pub registered: oneshot::Sender<()>,
+    /// The supervisor owns this task and aborts it on shutdown.
     pub _task: tokio::task::JoinHandle<()>,
 }
 
@@ -245,14 +248,22 @@ async fn run_session_inner(
     // active MITM is still detected by the user's SAS comparison.
     let is_initiator = expected_peer_id.is_some();
     let mut chan: CipherStream = if is_initiator {
-        let (chan, _) = crypto_initiate(stream, HandshakeMode::Anonymous, None)
-            .await
-            .with_context(|| format!("anonymous transport handshake to {}", peer_addr))?;
+        let (chan, _) = tokio::time::timeout(
+            Duration::from_secs(10),
+            crypto_initiate(stream, HandshakeMode::Anonymous, None),
+        )
+        .await
+        .map_err(|_| anyhow!("pairing transport handshake timed out"))?
+        .with_context(|| format!("anonymous transport handshake to {}", peer_addr))?;
         chan
     } else {
-        let (chan, _) = crypto_accept(stream, HandshakeMode::Anonymous, |_| None)
-            .await
-            .with_context(|| format!("anonymous transport handshake from {}", peer_addr))?;
+        let (chan, _) = tokio::time::timeout(
+            Duration::from_secs(10),
+            crypto_accept(stream, HandshakeMode::Anonymous, |_| None),
+        )
+        .await
+        .map_err(|_| anyhow!("pairing transport handshake timed out"))?
+        .with_context(|| format!("anonymous transport handshake from {}", peer_addr))?;
         chan
     };
 
@@ -267,7 +278,10 @@ async fn run_session_inner(
     };
     send_msg(&mut chan, &PairMessage::Hello(our_hello.clone())).await?;
 
-    let peer_hello = match recv_msg(&mut chan).await? {
+    let peer_hello = match tokio::time::timeout(Duration::from_secs(10), recv_msg(&mut chan))
+        .await
+        .map_err(|_| anyhow!("pairing Hello timed out"))??
+    {
         PairMessage::Hello(h) => h,
         other => bail!("expected Hello, got {:?}", other),
     };
@@ -307,9 +321,17 @@ async fn run_session_inner(
     // We send our Confirm before reading the peer's — the protocol is
     // symmetric and we don't want to deadlock on each side waiting for
     // the other to commit first.
-    let our_accept = user_confirm_rx
-        .await
-        .map_err(|_| anyhow!("user confirmation channel dropped"))?;
+    let mut user_confirm_rx = user_confirm_rx;
+    let mut early_confirm = None;
+    let our_accept = tokio::select! {
+        verdict = &mut user_confirm_rx => verdict.map_err(|_| anyhow!("user confirmation channel dropped"))?,
+        message = recv_msg(&mut chan) => {
+            let PairMessage::Confirm(confirm) = message? else { bail!("expected peer confirmation"); };
+            if !confirm.accepted { bail!("peer declined the pairing"); }
+            early_confirm = Some(confirm);
+            user_confirm_rx.await.map_err(|_| anyhow!("user confirmation channel dropped"))?
+        }
+    };
     let sig = if our_accept {
         sign_transcript(&deps.identity.signing_key(), &transcript)
     } else {
@@ -329,9 +351,12 @@ async fn run_session_inner(
     }
 
     // ── Step 4: receive peer's Confirm, verify ──────────────────────
-    let peer_confirm = match recv_msg(&mut chan).await? {
-        PairMessage::Confirm(c) => c,
-        other => bail!("expected Confirm, got {:?}", other),
+    let peer_confirm = match early_confirm {
+        Some(confirm) => confirm,
+        None => match recv_msg(&mut chan).await? {
+            PairMessage::Confirm(c) => c,
+            other => bail!("expected Confirm, got {:?}", other),
+        },
     };
     if !peer_confirm.accepted {
         bail!("peer declined the pairing");
@@ -359,8 +384,9 @@ async fn run_session_inner(
 
 async fn send_msg(chan: &mut CipherStream, msg: &PairMessage) -> Result<()> {
     let body = serde_json::to_vec(msg)?;
-    chan.send(&body)
+    tokio::time::timeout(Duration::from_secs(5), chan.send(&body))
         .await
+        .map_err(|_| anyhow!("pairing write timed out"))?
         .map_err(|e| anyhow!("encrypted send: {}", e))
 }
 

@@ -55,16 +55,11 @@ pub(super) const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// [`MAX_BACKOFF`] means it notices the server coming back within
 /// seconds rather than half a minute, while still ticking gently.
 pub(super) const CLIENT_MAX_BACKOFF: Duration = Duration::from_secs(10);
-/// A child that exits within this window of being spawned is treated as an
-/// "instant fail" — usually a missing shared library, bad CLI, or refused
-/// permission. We count consecutive instant-fails; in the **server** role we
-/// stop the restart loop after [`MAX_FAST_FAILS`] of them (a startup problem
-/// retrying won't fix). The **client** role never gives up — an unreachable
-/// server is level-triggered, so it keeps gently retrying with capped
-/// exponential backoff and recovers on its own (see `handle_child_exit`). A
-/// child that clears this window resets the counter and the backoff for both
-/// roles, so a mid-session drop always gets a fresh, fast budget.
+/// Rapid exits retain the run intent and increase capped backoff. A child
+/// that runs beyond this window resets backoff on exit, allowing a fresh
+/// fast recovery after a mid-session drop.
 pub(super) const FAST_FAIL_WINDOW: Duration = Duration::from_secs(2);
+/// Emit an actionable server startup diagnostic after this many failures.
 pub(super) const MAX_FAST_FAILS: u32 = 5;
 /// How often the supervisor sweeps visible+trusted peers looking for
 /// audio sessions that *should* exist but don't, and dials the missing
@@ -99,7 +94,7 @@ impl AudioBackoff {
     }
 
     fn after_failure(prev: Option<&AudioBackoff>) -> Self {
-        let attempts = prev.map(|p| p.attempts + 1).unwrap_or(1);
+        let attempts = prev.map(|p| p.attempts.saturating_add(1)).unwrap_or(1);
         AudioBackoff {
             attempts,
             next_attempt: Instant::now() + Self::delay(attempts),
@@ -121,6 +116,8 @@ pub struct Supervisor {
     /// itself stays in TOML at `config_path`.
     pub(super) versions_path: PathBuf,
     pub(super) state: DaemonState,
+    pub(super) connected_peers: std::collections::BTreeSet<String>,
+    pub(super) active_screen: Option<String>,
     pub(super) log_tail: VecDeque<String>,
     pub(super) events: broadcast::Sender<Event>,
     /// `true` after a Start, and at launch unless the user explicitly
@@ -194,7 +191,7 @@ pub struct Supervisor {
     pub(super) incoming_pairings: Option<mpsc::Receiver<IncomingSession>>,
     /// Dependencies handed to every pairing session task.
     pub(super) pairing_deps: Arc<SessionDeps>,
-    /// Tasks kept alive so spawned pairing sessions aren't dropped.
+    /// Owned pairing tasks; aborted when the supervisor is dropped.
     pub(super) _pairing_listener: Option<tokio::task::JoinHandle<()>>,
     pub(super) pairing_tasks: Vec<tokio::task::JoinHandle<()>>,
 
@@ -207,9 +204,12 @@ pub struct Supervisor {
     /// Receiver for the SyncOp channel — sessions ask us to merge / read
     /// state through this.
     pub(super) sync_ops: mpsc::Receiver<SyncOp>,
-    /// Outbound sync sessions kept alive while running. We GC finished
-    /// handles like we do with pairing tasks.
-    pub(super) sync_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// One outbound sync per peer, tagged with the head at dial time.
+    /// Reconcile consumes results, tracks success, and retries failures.
+    pub(super) sync_tasks: HashMap<String, (String, tokio::task::JoinHandle<bool>)>,
+    pub(super) sync_confirmed: HashMap<String, String>,
+    pub(super) sync_backoff: HashMap<String, AudioBackoff>,
+    listener_ports: (u16, u16, u16),
 
     /// Audio bridge handle (commands + events). `None` whenever the
     /// audio subsystem is offline — i.e. Synbad isn't started or
@@ -397,12 +397,19 @@ impl Supervisor {
         let (audio_dial_done_tx, audio_dial_done_rx) =
             mpsc::channel::<crate::audio::AudioDialOutcome>(16);
 
+        let listener_ports = (
+            config.service_port,
+            config.sync_port,
+            config.audio.signal_port,
+        );
         let mut supervisor = Supervisor {
             config_path,
             config,
             versioned,
             versions_path,
             state: DaemonState::Stopped,
+            connected_peers: Default::default(),
+            active_screen: None,
             log_tail: VecDeque::with_capacity(LOG_TAIL),
             events,
             desired_running: false,
@@ -437,7 +444,10 @@ impl Supervisor {
             sync_deps,
             _sync_listener: sync_listener,
             sync_ops: sync_ops_rx,
-            sync_tasks: Vec::new(),
+            sync_tasks: HashMap::new(),
+            sync_confirmed: HashMap::new(),
+            sync_backoff: HashMap::new(),
+            listener_ports,
             audio: None,
             _audio_task: None,
             _audio_listener: None,
@@ -521,6 +531,10 @@ impl Supervisor {
                     // Periodic safety net: re-attempt any audio session that
                     // *should* be live but isn't. Cheap no-op when the
                     // subsystem is disabled or every peer is already up.
+                    self.reconcile_network_services().await;
+                    self.reconcile_sync_sessions().await;
+                    self.gc_pairing_tasks();
+                    self.gc_audio_tasks();
                     self.reconcile_audio_sessions();
                 }
                 Some(outcome) = self.audio_dial_done_rx.recv() => {
@@ -531,6 +545,7 @@ impl Supervisor {
                     if self.shutdown {
                         tracing::info!("shutdown requested by client, stopping");
                         self.stop_core().await;
+                        self.teardown_audio_subsystem().await;
                         // Give the IPC connection task a beat to flush the
                         // `Response::Ok` we just queued before the process
                         // exits out from under it.
@@ -565,6 +580,7 @@ impl Supervisor {
                 signal = shutdown_signals.recv() => {
                     tracing::info!("{signal}, shutting down");
                     self.stop_core().await;
+                    self.teardown_audio_subsystem().await;
                     return Ok(());
                 }
             }
@@ -576,6 +592,7 @@ impl Supervisor {
         self.pairing_confirm
             .insert(session.session_id.clone(), session.confirm_tx);
         self.pairing_tasks.push(session._task);
+        let _ = session.registered.send(());
         self.gc_pairing_tasks();
     }
 
@@ -600,6 +617,12 @@ impl Supervisor {
                 let _ = self.events.send(Event::AudioPeerStatus { status });
             }
             A::Error { peer, message } => {
+                if let Some(id) = &peer {
+                    self.audio_live.remove(id);
+                    self.audio_inflight.remove(id);
+                    let retry = AudioBackoff::after_failure(self.audio_backoff.get(id));
+                    self.audio_backoff.insert(id.clone(), retry);
+                }
                 let _ = self.events.send(Event::AudioError { peer, message });
             }
             A::DevicesChanged => {
@@ -625,6 +648,7 @@ impl Supervisor {
 
     pub(super) fn gc_pairing_tasks(&mut self) {
         self.pairing_tasks.retain(|t| !t.is_finished());
+        self.pairing_confirm.retain(|_, tx| !tx.is_closed());
     }
 
     fn handle_discovery(&mut self, ev: DiscoveryEvent) {
@@ -647,6 +671,12 @@ impl Supervisor {
                             && p.fingerprint == peer.fingerprint
                             && p.config_head == peer.config_head
                             && p.audio_port == peer.audio_port
+                            && p.host == peer.host
+                            && p.addresses == peer.addresses
+                            && p.service_port == peer.service_port
+                            && p.sync_port == peer.sync_port
+                            && p.core_port == peer.core_port
+                            && p.display_name == peer.display_name
                     })
                     .unwrap_or(false);
                 let was_present = self.peers.contains_key(&peer.machine_id);
@@ -665,6 +695,8 @@ impl Supervisor {
                     // differs from ours, open a pull-sync so we converge
                     // even if we missed their previous push (e.g. we
                     // weren't on the LAN at the time).
+                    self.sync_confirmed.remove(&peer.machine_id);
+                    self.sync_backoff.remove(&peer.machine_id);
                     self.maybe_pull_from(peer);
                     // Independently consider opening an audio session
                     // for any peer that should be live but isn't. Driven
@@ -684,6 +716,18 @@ impl Supervisor {
                     // Drop liveness/backoff so a re-find dials cleanly.
                     self.audio_live.remove(&machine_id);
                     self.audio_backoff.remove(&machine_id);
+                    self.sync_confirmed.remove(&machine_id);
+                    self.sync_backoff.remove(&machine_id);
+                    if let Some((_, task)) = self.sync_tasks.remove(&machine_id) {
+                        task.abort();
+                    }
+                    if let Some(audio) = &self.audio {
+                        let _ = audio
+                            .commands_tx
+                            .try_send(synbad_audio::AudioCommand::ClosePeer {
+                                peer_machine_id: machine_id,
+                            });
+                    }
                 }
             }
         }
@@ -754,17 +798,28 @@ impl Supervisor {
     /// asks the bridge to drain, and drops dial deps so the reconcile
     /// loop becomes a no-op.
     pub(super) async fn teardown_audio_subsystem(&mut self) {
-        if let Some(handle) = &self.audio {
-            let _ = handle
-                .commands_tx
-                .send(synbad_audio::AudioCommand::Shutdown)
-                .await;
+        for task in self.audio_tasks.drain(..) {
+            task.abort();
+            let _ = task.await;
         }
         if let Some(listener) = self._audio_listener.take() {
             listener.abort();
+            let _ = listener.await;
         }
-        self.audio = None;
-        self._audio_task = None;
+        if let Some(handle) = self.audio.take() {
+            let _ = handle
+                .commands_tx
+                .try_send(synbad_audio::AudioCommand::Shutdown);
+        }
+        if let Some(mut task) = self._audio_task.take() {
+            if tokio::time::timeout(Duration::from_millis(500), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
+        }
+        while self.audio_dial_done_rx.try_recv().is_ok() {}
         self.audio_dial_deps = None;
         self.audio_live.clear();
         self.audio_inflight.clear();
@@ -905,9 +960,8 @@ impl Supervisor {
         }
     }
 
-    /// Resolve an outbound dial. On success we leave inflight set — the
-    /// bridge will emit a `PeerStatus` event shortly that flips the peer
-    /// into `audio_live`. On failure we evict inflight and arm backoff.
+    /// Resolve an outbound dial. The bridge publishes an initial status
+    /// for accepted sessions; failure clears inflight and arms backoff.
     pub(super) fn handle_audio_dial_outcome(&mut self, outcome: crate::audio::AudioDialOutcome) {
         use crate::audio::AudioDialOutcome as O;
         match outcome {
@@ -939,18 +993,20 @@ impl Supervisor {
         self.audio_tasks.retain(|t| !t.is_finished());
     }
 
-    /// Open an outbound sync to a freshly-visible peer iff: it's trusted,
-    /// it advertised a `sync_port`, and its `cfg` head looks different
-    /// from ours. The session itself is harmless if heads actually match
-    /// (the merge is a no-op), but skipping the trivial case avoids
-    /// connection churn every time a peer's mDNS record refreshes.
+    /// Sync a trusted visible peer when the current local head has not
+    /// been confirmed, respecting one in-flight task and capped backoff.
     fn maybe_pull_from(&mut self, peer: DiscoveredPeer) {
         if peer.sync_port == 0 {
             return;
         }
-        let head_match =
-            !peer.config_head.is_empty() && peer.config_head == self.versioned.head_hash();
-        if head_match {
+        let head = self.versioned.head_hash();
+        if self.sync_tasks.contains_key(&peer.machine_id)
+            || self.sync_confirmed.get(&peer.machine_id) == Some(&head)
+            || self
+                .sync_backoff
+                .get(&peer.machine_id)
+                .is_some_and(|b| b.next_attempt > Instant::now())
+        {
             return;
         }
         let is_trusted = match self.trust.try_lock() {
@@ -963,9 +1019,162 @@ impl Supervisor {
         if !is_trusted {
             return;
         }
+        let peer_id = peer.machine_id.clone();
         let handle = sync::spawn_outbound(peer, self.sync_deps.clone());
-        self.sync_tasks.push(handle);
-        self.gc_sync_tasks();
+        self.sync_tasks.insert(peer_id, (head, handle));
+    }
+
+    async fn reconcile_sync_sessions(&mut self) {
+        let finished: Vec<String> = self
+            .sync_tasks
+            .iter()
+            .filter(|(_, (_, task))| task.is_finished())
+            .map(|(peer, _)| peer.clone())
+            .collect();
+        for peer in finished {
+            let (head, task) = self.sync_tasks.remove(&peer).expect("finished sync exists");
+            if matches!(task.await, Ok(true)) {
+                self.sync_confirmed.insert(peer.clone(), head);
+                self.sync_backoff.remove(&peer);
+            } else {
+                let retry = AudioBackoff::after_failure(self.sync_backoff.get(&peer));
+                self.sync_backoff.insert(peer, retry);
+            }
+        }
+        for peer in self.peers.values().cloned().collect::<Vec<_>>() {
+            self.maybe_pull_from(peer);
+        }
+    }
+
+    /// Failed startup binds and dead listeners are retried while IPC keeps
+    /// serving. Port edits replace listeners without restarting the daemon.
+    async fn reconcile_network_services(&mut self) {
+        if self.pairing_deps.display_name != self.config.server_name {
+            self.pairing_deps = Arc::new(SessionDeps {
+                identity: self.identity.clone(),
+                trust: self.trust.clone(),
+                events: self.events.clone(),
+                display_name: self.config.server_name.clone(),
+            });
+            if let Some(task) = self._pairing_listener.take() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        if self
+            .discovery_rx
+            .as_ref()
+            .is_some_and(mpsc::Receiver::is_closed)
+        {
+            self.discovery_rx = None;
+            self._browser = None;
+            self.advertiser = None;
+        }
+        if self._browser.is_none() {
+            match core_proc::start_discovery(
+                &self.identity,
+                &self.config,
+                &self.versioned.head_hash(),
+            ) {
+                Ok((a, b, rx)) => {
+                    self.advertiser = Some(a);
+                    self._browser = Some(b);
+                    self.discovery_rx = Some(rx);
+                }
+                Err(e) => tracing::debug!(?e, "discovery retry failed"),
+            }
+        }
+        if self.listener_ports.0 != self.config.service_port
+            || self
+                ._pairing_listener
+                .as_ref()
+                .is_some_and(|t| t.is_finished())
+        {
+            if let Some(task) = self._pairing_listener.take() {
+                task.abort();
+                let _ = task.await;
+            }
+            self.incoming_pairings = None;
+        }
+        if self._pairing_listener.is_none() {
+            let (tx, rx) = mpsc::channel(8);
+            match pairing::spawn_listener(self.config.service_port, self.pairing_deps.clone(), tx)
+                .await
+            {
+                Ok(task) => {
+                    self._pairing_listener = Some(task);
+                    self.incoming_pairings = Some(rx);
+                    self.listener_ports.0 = self.config.service_port;
+                }
+                Err(e) => tracing::debug!(?e, "pairing listener retry failed"),
+            }
+        }
+        if self.listener_ports.1 != self.config.sync_port
+            || self
+                ._sync_listener
+                .as_ref()
+                .is_some_and(|t| t.is_finished())
+        {
+            if let Some(task) = self._sync_listener.take() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        if self._sync_listener.is_none() {
+            match sync::spawn_listener(self.config.sync_port, self.sync_deps.clone()).await {
+                Ok(task) => {
+                    self._sync_listener = Some(task);
+                    self.listener_ports.1 = self.config.sync_port;
+                }
+                Err(e) => tracing::debug!(?e, "sync listener retry failed"),
+            }
+        }
+        if self.listener_ports.2 != self.config.audio.signal_port
+            || self._audio_task.as_ref().is_some_and(|t| t.is_finished())
+        {
+            self.teardown_audio_subsystem().await;
+        }
+        let _ = self.reconcile_audio_subsystem().await;
+        if let Some(audio) = &self.audio {
+            // Retry a live config handoff if a previous edit hit a full queue.
+            let _ = audio
+                .commands_tx
+                .try_send(synbad_audio::AudioCommand::Reconfigure(
+                    self.config.audio.clone(),
+                ));
+        }
+        self.listener_ports.2 = self.config.audio.signal_port;
+        if self
+            ._audio_listener
+            .as_ref()
+            .is_some_and(|t| t.is_finished())
+        {
+            self._audio_listener = None;
+        }
+        if self._audio_listener.is_none() {
+            if let Some(deps) = self.audio_dial_deps.clone() {
+                match crate::audio::spawn_listener(self.config.audio.signal_port, deps).await {
+                    Ok(task) => self._audio_listener = Some(task),
+                    Err(e) => tracing::debug!(?e, "audio listener retry failed"),
+                }
+            }
+        }
+        let audio_port = if self._audio_listener.is_some() {
+            self.config.audio.signal_port
+        } else {
+            0
+        };
+        if let Some(advertiser) = &mut self.advertiser {
+            if let Err(e) = advertiser.refresh(
+                self.config.service_port,
+                self.config.sync_port,
+                self.config.port,
+                audio_port,
+                &self.versioned.head_hash(),
+            ) {
+                tracing::debug!(?e, "advertisement refresh failed");
+            }
+        }
     }
 
     pub(super) fn record_log(&mut self, line: String) {
@@ -977,6 +1186,18 @@ impl Supervisor {
         // connect/disconnect, screen switch). Subscribers that only watch
         // the raw log still see it via `Event::Log` below.
         if let Some(structured) = log_parse::parse(&line) {
+            match &structured {
+                Event::PeerConnected { name } => {
+                    self.connected_peers.insert(name.clone());
+                }
+                Event::PeerDisconnected { name } => {
+                    self.connected_peers.remove(name);
+                }
+                Event::ActiveScreen { name } => {
+                    self.active_screen = Some(name.clone());
+                }
+                _ => {}
+            }
             let _ = self.events.send(structured);
         }
         self.maybe_force_reconnect(&line);
@@ -1009,9 +1230,38 @@ impl Supervisor {
 
     pub(super) fn set_state(&mut self, new_state: DaemonState) {
         if self.state != new_state {
+            if !new_state.is_running() {
+                self.connected_peers.clear();
+                self.active_screen = None;
+            }
             tracing::debug!(?new_state, "state change");
             self.state = new_state.clone();
             let _ = self.events.send(Event::State { state: new_state });
+        }
+    }
+}
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        for task in self
+            .pairing_tasks
+            .drain(..)
+            .chain(self.audio_tasks.drain(..))
+        {
+            task.abort();
+        }
+        for (_, (_, task)) in self.sync_tasks.drain() {
+            task.abort();
+        }
+        for task in [
+            &mut self._pairing_listener,
+            &mut self._sync_listener,
+            &mut self._audio_listener,
+            &mut self._audio_task,
+        ] {
+            if let Some(task) = task.take() {
+                task.abort();
+            }
         }
     }
 }

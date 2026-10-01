@@ -274,7 +274,7 @@ impl AudioSession {
         // Bind a UDP socket on the same interface, ephemeral port.
         // We don't reuse the signaling TCP port — STUN/DTLS-SRTP
         // multiplex on a different transport.
-        let udp = UdpSocket::bind((signal_local.ip(), 0))
+        let udp = UdpSocket::bind((signal_local.ip().to_canonical(), 0))
             .await
             .map_err(|e| AudioError::WebRtc(format!("bind media udp: {e}")))?;
         let media_addr = udp
@@ -332,6 +332,11 @@ impl AudioSession {
         })
     }
 
+    /// True when the driver has ended and this session should be reaped.
+    pub fn is_finished(&self) -> bool {
+        self.tasks.iter().all(JoinHandle::is_finished)
+    }
+
     /// Snapshot of this session's current peer status. Cheap (one
     /// lock + clone) so it's safe to call per `QueryStatus`.
     pub fn status(&self) -> PeerAudioStatus {
@@ -359,7 +364,7 @@ impl AudioSession {
     }
 }
 
-fn peer_wants_send(cfg: &AudioConfig, peer: &str) -> bool {
+pub(crate) fn peer_wants_send(cfg: &AudioConfig, peer: &str) -> bool {
     // No per-peer override = bidirectional default whenever the
     // bridge is enabled. The bridge would never have started this
     // session if `enabled` were false, so we don't double-check it
@@ -370,7 +375,7 @@ fn peer_wants_send(cfg: &AudioConfig, peer: &str) -> bool {
         .unwrap_or(true)
 }
 
-fn peer_wants_recv(cfg: &AudioConfig, peer: &str) -> bool {
+pub(crate) fn peer_wants_recv(cfg: &AudioConfig, peer: &str) -> bool {
     cfg.per_peer
         .get(peer)
         .map(|p| p.enabled && p.receive_from_peer)
@@ -416,7 +421,7 @@ async fn driver_task(
     close_rx: oneshot::Receiver<()>,
 ) {
     let (signal_reader, signal_writer) = signal.split();
-    if let Err(e) = run_driver(
+    let result = run_driver(
         &session_id,
         &peer_machine_id,
         role,
@@ -430,8 +435,20 @@ async fn driver_task(
         &status,
         close_rx,
     )
-    .await
+    .await;
     {
+        let mut status = status.lock().expect("peer status poisoned");
+        status.sending_to_peer = false;
+        status.receiving_from_peer = false;
+        status.last_error = Some(
+            result
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "session closed".into()),
+        );
+    }
+    if let Err(e) = result {
         warn!(
             peer = %peer_machine_id,
             session = %session_id,
@@ -481,48 +498,52 @@ async fn run_driver(
     // SDP exchange. For the offerer, we know the mid up front
     // (returned by `add_media`); for the answerer, str0m will emit
     // it as a `MediaAdded` event after `accept_offer`.
-    let mut mid: Option<Mid> = match role {
-        SessionRole::Offerer => {
-            let mut change = rtc.sdp_api();
-            let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
-            let (offer, pending) = change
-                .apply()
-                .ok_or_else(|| AudioError::WebRtc("sdp_api apply() returned None".into()))?;
-            send_signal(
-                &mut signal_writer,
-                &AudioSignal::Offer {
-                    session_id: session_id.to_string(),
-                    sdp: offer.to_sdp_string(),
-                },
-            )
-            .await?;
-            let answer = wait_for_answer(&mut signal_reader).await?;
-            let parsed = SdpAnswer::from_sdp_string(&answer)
-                .map_err(|e| AudioError::WebRtc(format!("parse answer: {e}")))?;
-            rtc.sdp_api()
-                .accept_answer(pending, parsed)
-                .map_err(|e| AudioError::WebRtc(format!("accept_answer: {e}")))?;
-            Some(mid)
-        }
-        SessionRole::Answerer => {
-            let offer_sdp = wait_for_offer(&mut signal_reader).await?;
-            let offer = SdpOffer::from_sdp_string(&offer_sdp)
-                .map_err(|e| AudioError::WebRtc(format!("parse offer: {e}")))?;
-            let answer = rtc
-                .sdp_api()
-                .accept_offer(offer)
-                .map_err(|e| AudioError::WebRtc(format!("accept_offer: {e}")))?;
-            send_signal(
-                &mut signal_writer,
-                &AudioSignal::Answer {
-                    session_id: session_id.to_string(),
-                    sdp: answer.to_sdp_string(),
-                },
-            )
-            .await?;
-            None
-        }
-    };
+    let mut mid: Option<Mid> = tokio::time::timeout(Duration::from_secs(10), async {
+        Ok::<_, AudioError>(match role {
+            SessionRole::Offerer => {
+                let mut change = rtc.sdp_api();
+                let mid = change.add_media(MediaKind::Audio, Direction::SendRecv, None, None, None);
+                let (offer, pending) = change
+                    .apply()
+                    .ok_or_else(|| AudioError::WebRtc("sdp_api apply() returned None".into()))?;
+                send_signal(
+                    &mut signal_writer,
+                    &AudioSignal::Offer {
+                        session_id: session_id.to_string(),
+                        sdp: offer.to_sdp_string(),
+                    },
+                )
+                .await?;
+                let answer = wait_for_answer(&mut signal_reader).await?;
+                let parsed = SdpAnswer::from_sdp_string(&answer)
+                    .map_err(|e| AudioError::WebRtc(format!("parse answer: {e}")))?;
+                rtc.sdp_api()
+                    .accept_answer(pending, parsed)
+                    .map_err(|e| AudioError::WebRtc(format!("accept_answer: {e}")))?;
+                Some(mid)
+            }
+            SessionRole::Answerer => {
+                let offer_sdp = wait_for_offer(&mut signal_reader).await?;
+                let offer = SdpOffer::from_sdp_string(&offer_sdp)
+                    .map_err(|e| AudioError::WebRtc(format!("parse offer: {e}")))?;
+                let answer = rtc
+                    .sdp_api()
+                    .accept_offer(offer)
+                    .map_err(|e| AudioError::WebRtc(format!("accept_offer: {e}")))?;
+                send_signal(
+                    &mut signal_writer,
+                    &AudioSignal::Answer {
+                        session_id: session_id.to_string(),
+                        sdp: answer.to_sdp_string(),
+                    },
+                )
+                .await?;
+                None
+            }
+        })
+    })
+    .await
+    .map_err(|_| AudioError::Signal("SDP negotiation timed out".into()))??;
 
     info!(
         peer = %peer_machine_id,
@@ -543,8 +564,13 @@ async fn run_driver(
     let mut udp_buf = vec![0u8; UDP_RECV_BUF];
     let mut first_send = true;
     let mut first_recv = true;
+    let mut connection_deadline = Some(Instant::now() + Duration::from_secs(15));
+    let mut connected = false;
 
     loop {
+        if !rtc.is_alive() || connection_deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(AudioError::WebRtc("media connection unavailable".into()));
+        }
         // Drain everything str0m wants to emit right now. Each
         // iteration moves outbound packets to the UDP socket and
         // turns inbound media into PCM on the playback queue. The
@@ -562,6 +588,8 @@ async fn run_driver(
                 }
                 Ok(Output::Event(ev)) => match ev {
                     Event::Connected => {
+                        connected = true;
+                        connection_deadline = None;
                         update_status(status, events, |s| {
                             s.last_error = None;
                         });
@@ -601,11 +629,16 @@ async fn run_driver(
                         use str0m::IceConnectionState as I;
                         match state {
                             I::Disconnected => {
+                                connection_deadline
+                                    .get_or_insert(Instant::now() + Duration::from_secs(5));
                                 update_status(status, events, |s| {
                                     s.last_error = Some("ice disconnected".to_string());
                                 });
                             }
                             I::Connected | I::Completed => {
+                                if connected {
+                                    connection_deadline = None;
+                                }
                                 update_status(status, events, |s| {
                                     s.last_error = None;
                                 });
@@ -630,7 +663,8 @@ async fn run_driver(
         // (which we mostly use to detect a `Close` signal from the
         // peer).
         let now = Instant::now();
-        let sleep = tokio::time::sleep(next_timeout.saturating_duration_since(now));
+        let wake_at = connection_deadline.map_or(next_timeout, |d| next_timeout.min(d));
+        let sleep = tokio::time::sleep(wake_at.saturating_duration_since(now));
         tokio::pin!(sleep);
 
         tokio::select! {
@@ -676,9 +710,9 @@ async fn run_driver(
 
             frame = recv_capture_frame(&mut capture_rx) => {
                 let Some(frame) = frame else {
-                    // Capture closed — keep the session up (we can
-                    // still receive even if we can't send) but stop
-                    // polling this arm.
+                    // Stop polling a closed channel so a biased select
+                    // cannot starve signaling and the RTC timer.
+                    capture_rx = None;
                     continue;
                 };
                 if frame.len() != FRAME_SAMPLES {
@@ -766,9 +800,9 @@ async fn recv_capture_frame(capture_rx: &mut Option<mpsc::Receiver<PcmFrame>>) -
 
 async fn send_signal(writer: &mut CipherWriter, signal: &AudioSignal) -> Result<(), AudioError> {
     let body = serde_json::to_vec(signal)?;
-    writer
-        .send(&body)
+    tokio::time::timeout(Duration::from_secs(5), writer.send(&body))
         .await
+        .map_err(|_| AudioError::Signal("signaling write timed out".into()))?
         .map_err(|_| AudioError::SignalClosed)?;
     Ok(())
 }

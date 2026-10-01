@@ -163,7 +163,7 @@ AEAD tag verification to fail.
 [u32 BE ciphertext_len] [ciphertext + 16 B tag]
 ```
 
-`ciphertext_len ≤ MAX_FRAME_BYTES (256 KiB)` — both sides reject
+`ciphertext_len ≤ MAX_FRAME_BYTES + 16` (256 KiB plaintext plus the AEAD tag) — both sides reject
 oversized frames before allocating, so a hostile peer can't OOM us
 with a 4 GiB length prefix.
 

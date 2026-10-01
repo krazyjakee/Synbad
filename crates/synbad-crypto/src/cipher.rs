@@ -11,7 +11,7 @@
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
@@ -48,6 +48,7 @@ pub struct CipherStream {
     /// we cap to a `u64` overflow check below in case of a runaway).
     send_counter: u64,
     recv_counter: u64,
+    recv_frame: PendingFrame,
     /// The handshake transcript hash. Same on both peers; useful for
     /// higher-layer channel binding. Populated by the handshake code
     /// after constructing the stream — defaults to zero until set.
@@ -71,6 +72,7 @@ impl CipherStream {
             recv_prefix,
             send_counter: 0,
             recv_counter: 0,
+            recv_frame: PendingFrame::default(),
             transcript: [0u8; 32],
         }
     }
@@ -130,17 +132,7 @@ impl CipherStream {
 
     /// Read exactly one frame and decrypt it. Returns the plaintext.
     pub async fn recv(&mut self) -> Result<Vec<u8>, FrameError> {
-        let mut len_be = [0u8; 4];
-        self.stream.read_exact(&mut len_be).await?;
-        let ct_len = u32::from_be_bytes(len_be) as usize;
-        // 16 bytes is the AEAD tag; a valid frame includes it, so the
-        // minimum legal `ct_len` is 16. Smaller values can't be real
-        // ciphertext; reject before reading.
-        if !(16..=MAX_FRAME_BYTES).contains(&ct_len) {
-            return Err(FrameError::Oversize(ct_len));
-        }
-        let mut ct = vec![0u8; ct_len];
-        self.stream.read_exact(&mut ct).await?;
+        let ct = self.recv_frame.read(&mut self.stream).await?;
 
         let nonce = build_nonce(&self.recv_prefix, self.recv_counter);
         let pt = self
@@ -152,6 +144,45 @@ impl CipherStream {
             .checked_add(1)
             .ok_or(FrameError::NonceExhaustion)?;
         Ok(pt)
+    }
+}
+
+/// Keep progress outside the read future: audio races recv against UDP,
+/// capture and timers, so read_exact with a stack-local buffer loses bytes.
+#[derive(Default)]
+struct PendingFrame {
+    header: [u8; 4],
+    header_read: usize,
+    body: Vec<u8>,
+    body_read: usize,
+}
+
+impl PendingFrame {
+    async fn read<R: AsyncRead + Unpin>(&mut self, stream: &mut R) -> Result<Vec<u8>, FrameError> {
+        while self.header_read < 4 {
+            let n = stream.read(&mut self.header[self.header_read..]).await?;
+            if n == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            self.header_read += n;
+        }
+        if self.body.is_empty() {
+            let len = u32::from_be_bytes(self.header) as usize;
+            if !(16..=MAX_FRAME_BYTES + 16).contains(&len) {
+                return Err(FrameError::Oversize(len));
+            }
+            self.body.resize(len, 0);
+        }
+        while self.body_read < self.body.len() {
+            let n = stream.read(&mut self.body[self.body_read..]).await?;
+            if n == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+            }
+            self.body_read += n;
+        }
+        self.header_read = 0;
+        self.body_read = 0;
+        Ok(std::mem::take(&mut self.body))
     }
 }
 
@@ -178,6 +209,7 @@ impl CipherStream {
             cipher: self.recv_cipher,
             prefix: self.recv_prefix,
             counter: self.recv_counter,
+            frame: self.recv_frame,
         };
         let writer = CipherWriter {
             stream: write_half,
@@ -192,23 +224,18 @@ impl CipherStream {
 /// Read half of a split [`CipherStream`].
 pub struct CipherReader {
     stream: OwnedReadHalf,
+    frame: PendingFrame,
     cipher: ChaCha20Poly1305,
     prefix: [u8; 4],
     counter: u64,
 }
 
 impl CipherReader {
+    /// Cancellation-safe: partial frame bytes survive a dropped recv future.
     /// Read and decrypt one frame. Same wire format as
     /// [`CipherStream::recv`].
     pub async fn recv(&mut self) -> Result<Vec<u8>, FrameError> {
-        let mut len_be = [0u8; 4];
-        self.stream.read_exact(&mut len_be).await?;
-        let ct_len = u32::from_be_bytes(len_be) as usize;
-        if !(16..=MAX_FRAME_BYTES).contains(&ct_len) {
-            return Err(FrameError::Oversize(ct_len));
-        }
-        let mut ct = vec![0u8; ct_len];
-        self.stream.read_exact(&mut ct).await?;
+        let ct = self.frame.read(&mut self.stream).await?;
 
         let nonce = build_nonce(&self.prefix, self.counter);
         let pt = self
@@ -258,5 +285,87 @@ impl CipherWriter {
             .checked_add(1)
             .ok_or(FrameError::NonceExhaustion)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
+
+    async fn sockets() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (client, server) = tokio::join!(
+            TcpStream::connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        (client.unwrap(), server.unwrap().0)
+    }
+
+    #[tokio::test]
+    async fn cancelled_reads_preserve_partial_header_and_ciphertext() {
+        let (receiver, mut sender) = sockets().await;
+        let (mut reader, _writer) =
+            CipherStream::new(receiver, [1; 32], [2; 32], [3; 4], [4; 4]).split();
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&[2; 32]));
+        let nonce = build_nonce(&[4; 4], 0);
+        let body = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                b"fragmented signaling".as_slice(),
+            )
+            .unwrap();
+        let header = (body.len() as u32).to_be_bytes();
+        sender.write_all(&header[..2]).await.unwrap();
+        assert!(timeout(Duration::from_millis(20), reader.recv())
+            .await
+            .is_err());
+        sender.write_all(&header[2..]).await.unwrap();
+        sender.write_all(&body[..7]).await.unwrap();
+        assert!(timeout(Duration::from_millis(20), reader.recv())
+            .await
+            .is_err());
+        sender.write_all(&body[7..]).await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), reader.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            b"fragmented signaling"
+        );
+        assert_eq!(reader.counter, 1);
+    }
+
+    #[tokio::test]
+    async fn maximum_payload_roundtrips_with_tag_overhead() {
+        let (a, b) = sockets().await;
+        let mut sender = CipherStream::new(a, [1; 32], [2; 32], [3; 4], [4; 4]);
+        let mut receiver = CipherStream::new(b, [2; 32], [1; 32], [4; 4], [3; 4]);
+        let payload = vec![7; MAX_FRAME_BYTES];
+        let (sent, received) = tokio::join!(sender.send(&payload), receiver.recv());
+        sent.unwrap();
+        assert_eq!(received.unwrap(), payload);
+    }
+
+    #[tokio::test]
+    async fn truncated_and_oversized_frames_fail_promptly() {
+        let (a, mut b) = sockets().await;
+        let mut receiver = CipherStream::new(a, [1; 32], [2; 32], [3; 4], [4; 4]);
+        b.write_all(&32u32.to_be_bytes()).await.unwrap();
+        b.write_all(&[0; 3]).await.unwrap();
+        drop(b);
+        assert!(
+            matches!(receiver.recv().await, Err(FrameError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof)
+        );
+        let (a, mut b) = sockets().await;
+        let (mut receiver, _) = CipherStream::new(a, [1; 32], [2; 32], [3; 4], [4; 4]).split();
+        b.write_all(&u32::MAX.to_be_bytes()).await.unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Err(FrameError::Oversize(_))
+        ));
+        assert!(receiver.frame.body.is_empty());
     }
 }

@@ -16,9 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use synbad_audio::{AudioCommand, SessionRole};
 use synbad_crypto::{accept as crypto_accept, initiate as crypto_initiate, HandshakeMode};
@@ -58,29 +57,36 @@ pub enum AudioDialOutcome {
 }
 
 /// Bind the audio signaling listener on `bind_port`. Returns a JoinHandle
-/// for the accept loop — drop it to stop accepting connections.
+/// for the accept loop — abort it to stop accepting connections.
 pub async fn spawn_listener(
     bind_port: u16,
     deps: Arc<AudioListenerDeps>,
 ) -> Result<tokio::task::JoinHandle<()>> {
-    let listener = TcpListener::bind(("0.0.0.0", bind_port))
+    let listener = crate::transport::bind_listener(bind_port)
         .await
         .with_context(|| format!("binding audio signal listener on :{}", bind_port))?;
     info!(port = bind_port, "audio signal listener up");
 
     let handle = tokio::spawn(async move {
+        let mut sessions = tokio::task::JoinSet::new();
         loop {
-            match listener.accept().await {
-                Ok((stream, addr)) => {
-                    let deps = deps.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handshake_and_handoff(stream, addr, deps).await {
-                            debug!(%addr, ?e, "audio signal handshake failed");
+            tokio::select! {
+                Some(_) = sessions.join_next(), if !sessions.is_empty() => {},
+                accepted = listener.accept(), if sessions.len() < 64 => {
+                    match accepted {
+                        Ok((stream, addr)) => {
+                            let deps = deps.clone();
+                            sessions.spawn(async move {
+                                if let Err(e) = handshake_and_handoff(stream, addr, deps).await {
+                                    tracing::debug!(%addr, ?e, "audio signal session failed");
+                                }
+                            });
                         }
-                    });
-                }
-                Err(e) => {
-                    warn!(?e, "audio signal accept failed");
+                        Err(e) => {
+                            tracing::warn!(?e, "audio signal accept failed");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
                 }
             }
         }
@@ -145,10 +151,10 @@ async fn run_outbound(peer: DiscoveredPeer, deps: Arc<AudioListenerDeps>) -> Res
         .try_into()
         .map_err(|_| anyhow!("trust store pubkey not 32 bytes"))?;
 
-    let addr = format!("{}:{}", peer.host, peer.audio_port);
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
+    let addr = (peer.host.as_str(), peer.audio_port);
+    let stream = crate::transport::connect_peer(&peer, peer.audio_port, CONNECT_TIMEOUT)
         .await
-        .map_err(|_| anyhow!("audio connect to {} timed out", addr))??;
+        .with_context(|| format!("connect to {addr:?}"))?;
 
     let our_machine_id = deps.identity.machine_id.to_string();
     let signing_key = deps.identity.signing_key();
@@ -168,16 +174,19 @@ async fn run_outbound(peer: DiscoveredPeer, deps: Arc<AudioListenerDeps>) -> Res
     .map_err(|_| anyhow!("audio handshake to {} timed out", trusted.machine_id))?
     .with_context(|| format!("audio handshake with {}", trusted.machine_id))?;
 
-    info!(peer = %trusted.machine_id, %addr, "audio session dial complete");
+    info!(peer = %trusted.machine_id, ?addr, "audio session dial complete");
 
-    deps.bridge_commands
-        .send(AudioCommand::IncomingSignal {
+    tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        deps.bridge_commands.send(AudioCommand::IncomingSignal {
             peer_machine_id: trusted.machine_id,
             stream: cipher,
             role: SessionRole::Offerer,
-        })
-        .await
-        .map_err(|_| anyhow!("audio bridge dropped its command channel"))?;
+        }),
+    )
+    .await
+    .map_err(|_| anyhow!("audio bridge handoff timed out"))?
+    .map_err(|_| anyhow!("audio bridge dropped its command channel"))?;
     Ok(())
 }
 
@@ -227,15 +236,22 @@ async fn handshake_and_handoff(
         }
     };
 
+    anyhow::ensure!(
+        deps.trust.lock().await.contains(&peer_machine_id),
+        "audio peer trust revoked during handshake"
+    );
     info!(peer = %peer_machine_id, %addr, "audio session handshake complete");
 
-    deps.bridge_commands
-        .send(AudioCommand::IncomingSignal {
+    tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        deps.bridge_commands.send(AudioCommand::IncomingSignal {
             peer_machine_id,
             stream: cipher,
             role: SessionRole::Answerer,
-        })
-        .await
-        .map_err(|_| anyhow!("audio bridge dropped its command channel"))?;
+        }),
+    )
+    .await
+    .map_err(|_| anyhow!("audio bridge handoff timed out"))?
+    .map_err(|_| anyhow!("audio bridge dropped its command channel"))?;
     Ok(())
 }

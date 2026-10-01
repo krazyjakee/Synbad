@@ -281,7 +281,7 @@ impl Supervisor {
         let ran_for = self.started_at.take().map(|t| t.elapsed());
         let instant_fail = ran_for.map(|d| d < FAST_FAIL_WINDOW).unwrap_or(false);
         if instant_fail {
-            self.fast_fail_count += 1;
+            self.fast_fail_count = self.fast_fail_count.saturating_add(1);
         } else {
             // The child proved it could stay up past the fast-fail window —
             // this is a mid-session drop, not a startup/reachability failure.
@@ -296,37 +296,17 @@ impl Supervisor {
             return;
         }
 
-        // The two roles fail for different reasons and so are handled
-        // differently. Server-role instant-fails usually mean a startup
-        // problem (port in use, missing libs) that retrying won't fix, so we
-        // give up after MAX_FAST_FAILS. Client-role means the server is
-        // unreachable — a paired, enabled link is level-triggered, so we keep
-        // gently retrying with capped exponential backoff and recover on our
-        // own once the server comes back (reboot, network blip, or a server
-        // that simply started after us). The shared reset path (a child that
-        // clears FAST_FAIL_WINDOW) gives a mid-session drop a fresh, fast
-        // budget for either role.
+        // Both roles retain the user's run intent: port contention and
+        // network outages can clear without another Start. The server cap
+        // is gentler; clients check for a returning server more frequently.
         let is_client = matches!(self.config.role, NodeRole::Client);
 
-        if !is_client && self.fast_fail_count >= MAX_FAST_FAILS {
-            // Server role gives up. The exit code stays on the chip so the GUI
-            // surfaces what happened, plus a log line explaining the stop.
-            self.desired_running = false;
-            let msg = format!(
-                "[synbad] core exited within {:?} on {} consecutive attempts (exit {:?}); \
-                 giving up. Check that Deskflow's runtime deps (Qt6) are installed, \
-                 then click Start.",
-                FAST_FAIL_WINDOW, self.fast_fail_count, code
-            );
-            tracing::error!("{}", msg);
-            self.record_log(msg);
-            self.set_state(DaemonState::Crashed { exit_code: code });
-            // Giving up clears the run state, so audio must follow it down —
-            // keep the "audio online iff started" invariant that the Start/Stop
-            // handlers uphold, rather than leaving a bridge up under a stopped
-            // Synbad. No-op if audio was never online.
-            let _ = self.reconcile_audio_subsystem().await;
-            return;
+        if !is_client && self.fast_fail_count == MAX_FAST_FAILS {
+            self.record_log(format!(
+                "[synbad] core failed {} consecutive times (exit {:?}); \
+                 check runtime dependencies and whether the server port is in use. Retrying with capped backoff.",
+                self.fast_fail_count, code
+            ));
         }
 
         let delay = self.schedule_restart();
@@ -488,15 +468,9 @@ fn build_command(
         // `ok_or_else` here is defensive — surfaces a clear error rather
         // than spawning a child that immediately exits with a usage error.
         (CoreLayout::SplitLegacy { client, .. }, NodeRole::Client) => {
-            let host = config
-                .server_address
-                .as_deref()
+            let addr = config
+                .remote_address()
                 .ok_or_else(|| anyhow::anyhow!("client role requires server_address"))?;
-            let addr = if host.contains(':') {
-                host.to_string()
-            } else {
-                format!("{}:{}", host, config.port)
-            };
             Ok((
                 client.clone(),
                 vec![
@@ -532,10 +506,8 @@ where
 /// `config_head` is the current short hash of the local
 /// [`synbad_sync::VersionedConfig`]. We advertise it under the `cfg` TXT
 /// key so peers detect divergence at discovery time. The advertisement is
-/// a startup snapshot — updates require restarting the advertiser, which
-/// mdns-sd doesn't make cheap. In practice the push-on-edit path keeps
-/// trusted peers in sync without depending on the TXT freshness; the TXT
-/// is useful for the discovery-driven pull on first contact.
+/// refreshed head and listener ports are reannounced by the periodic
+/// network reconcile, without a daemon restart.
 pub(super) fn start_discovery(
     identity: &Identity,
     config: &Config,
@@ -546,11 +518,8 @@ pub(super) fn start_discovery(
     // into the audio bridge — a peer that sees an `audio_port` of zero
     // would attempt to dial and fail. Keeping the key absent matches
     // the "no audio here" reading on the consumer side.
-    let advertised_audio_port = if config.audio.enabled {
-        config.audio.signal_port
-    } else {
-        0
-    };
+    // Audio becomes advertised only after its listener is bound.
+    let advertised_audio_port = 0;
     let advertiser = Advertiser::start(
         identity,
         &display,
@@ -726,6 +695,22 @@ mod tests {
         assert_eq!(prog, PathBuf::from("/cache/v1.17.0/deskflow-client"));
         // Port appended when bare host given.
         assert_eq!(args, vec!["-f", "-1", "-n", "alpha", "peer.local:24800"]);
+    }
+
+    #[test]
+    fn legacy_client_brackets_ipv6_and_uses_configured_port() {
+        let resolved = ResolvedCore {
+            layout: CoreLayout::SplitLegacy {
+                server: "server".into(),
+                client: "client".into(),
+            },
+        };
+        let mut cfg = base_config(NodeRole::Client);
+        cfg.server_address = Some("2001:db8::1".into());
+        cfg.port = 25000;
+        let (_, args) =
+            build_command(&resolved, &cfg, Path::new("conf"), Path::new("settings")).unwrap();
+        assert_eq!(args.last().unwrap(), "[2001:db8::1]:25000");
     }
 
     #[test]

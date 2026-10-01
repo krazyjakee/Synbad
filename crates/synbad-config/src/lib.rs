@@ -348,7 +348,30 @@ pub enum Error {
     Invalid(String),
 }
 
+/// Format a host and port without making IPv6 literals ambiguous.
+pub fn host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 impl Config {
+    /// Resolve a configured Core target, honoring explicit ports and
+    /// applying our configured port to bare IPv4/IPv6/hostname targets.
+    pub fn remote_address(&self) -> Option<String> {
+        let address = self.server_address.as_deref()?;
+        if address.parse::<std::net::IpAddr>().is_ok()
+            || !address.contains(':')
+            || (address.starts_with('[') && address.ends_with(']'))
+        {
+            Some(host_port(address, self.port))
+        } else {
+            Some(address.to_string())
+        }
+    }
+
     /// Load config from a TOML file. If the file doesn't exist, returns
     /// `Ok(None)` so the caller can decide whether to seed a default.
     pub fn load(path: &Path) -> Result<Option<Self>, Error> {
@@ -551,12 +574,7 @@ impl Config {
         match self.role {
             NodeRole::Client => {
                 let _ = writeln!(out, "[client]");
-                if let Some(addr) = &self.server_address {
-                    let addr = if addr.contains(':') {
-                        addr.clone()
-                    } else {
-                        format!("{}:{}", addr, self.port)
-                    };
+                if let Some(addr) = self.remote_address() {
                     let _ = writeln!(out, "remoteHost={}", addr);
                 }
             }
@@ -627,6 +645,27 @@ mod tests {
             autostart: true,
             binaries: BinaryPaths::default(),
             audio: AudioConfig::default(),
+        }
+    }
+
+    #[test]
+    fn client_settings_preserve_ipv6_and_explicit_ports() {
+        for (address, expected) in [
+            ("2001:db8::1", "[2001:db8::1]:25000"),
+            ("[2001:db8::1]", "[2001:db8::1]:25000"),
+            ("[2001:db8::1]:26000", "[2001:db8::1]:26000"),
+            ("peer.local", "peer.local:25000"),
+            ("peer.local:26000", "peer.local:26000"),
+        ] {
+            let cfg = Config {
+                role: NodeRole::Client,
+                server_address: Some(address.into()),
+                port: 25000,
+                ..Config::default()
+            };
+            assert!(cfg
+                .generate_deskflow_settings(Path::new("unused.conf"))
+                .contains(&format!("remoteHost={expected}\n")));
         }
     }
 

@@ -19,3 +19,6 @@ synbad-config = { path = "../synbad-config" }
 interprocess = { workspace = true }
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
