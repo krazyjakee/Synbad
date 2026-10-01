@@ -10,7 +10,11 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-10-01
+
 ### Fixed
+- Windows IPC commands wait for replies instead of treating an empty
+  nonblocking named-pipe read as a disconnect.
 - Connection recovery across IPC, config sync, pairing, and audio: bounded
   requests/negotiation, automatic retries after listener bind failures,
   safe subscription recovery after event loss, and cleanup of ended audio

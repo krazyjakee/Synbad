@@ -325,6 +325,7 @@ mod tests {
                 conn.recv().unwrap(),
                 Message::Response(Response::Ok)
             ));
+            conn.make_blocking().unwrap();
             // Lag closes the transport; it must not remain silently idle.
             assert!(conn.recv().is_err());
         });
@@ -374,6 +375,7 @@ mod tests {
                 conn.recv().unwrap(),
                 Message::Response(Response::Ok)
             ));
+            conn.make_blocking().unwrap();
             ready_tx.send(()).unwrap();
             assert!(conn.recv().is_err());
         });

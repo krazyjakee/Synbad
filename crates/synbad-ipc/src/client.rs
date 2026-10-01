@@ -105,6 +105,12 @@ impl Connection {
                 return Err(io::Error::from(io::ErrorKind::TimedOut).into());
             }
             match self.reader.fill_buf() {
+                // Windows nonblocking named pipes can return an empty read
+                // while the server is still connected but has no data yet.
+                // Command connections have a deadline; idle subscriptions
+                // switch to blocking mode, where an empty read means EOF.
+                #[cfg(windows)]
+                Ok([]) if self.timeout.is_some() => self.wait(deadline)?,
                 Ok([]) => return Err(Error::Closed),
                 Ok(bytes) => {
                     let end = bytes.iter().position(|b| *b == b'\n');
