@@ -27,6 +27,16 @@ impl Daemon {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&root).unwrap();
+        let previous_name = config.server_name.clone();
+        config.server_name = format!(
+            "synbad-test-{}",
+            root.file_name().unwrap().to_string_lossy()
+        );
+        for screen in &mut config.screens {
+            if screen.name == previous_name {
+                screen.name = config.server_name.clone();
+            }
+        }
         let core = root.join("core");
         fs::write(
             &core,
@@ -35,6 +45,8 @@ count=$(cat "$SYNBAD_TEST_ROOT/attempts" 2>/dev/null || echo 0)
 count=$((count + 1))
 echo "$count" > "$SYNBAD_TEST_ROOT/attempts"
 if [ -f "$SYNBAD_TEST_ROOT/unavailable" ]; then exit 1; fi
+if [ -f "$SYNBAD_TEST_ROOT/connected" ]; then echo 'NOTE: connected to server'; fi
+if [ "$1" = server ]; then echo 'NOTE: started server, waiting for clients'; fi
 exec sleep 600
 "##,
         )
@@ -189,7 +201,7 @@ fn server_recovers_after_five_fast_failures_and_stop_cancels_retries() {
             )
     });
     fs::remove_file(daemon.root.join("unavailable")).unwrap();
-    daemon.wait_until(Duration::from_secs(20), |d| {
+    daemon.wait_until(Duration::from_secs(75), |d| {
         let recovered = fs::read_to_string(d.root.join("attempts"))
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
@@ -226,6 +238,51 @@ fn server_recovers_after_five_fast_failures_and_stop_cancels_retries() {
         daemon.request(Request::GetStatus),
         Some(Response::Status {
             state: DaemonState::Stopped,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn silent_client_is_restarted_but_a_connected_client_survives_the_watchdog() {
+    let pairing = reserve_port();
+    let sync = reserve_port();
+    let config = Config {
+        role: synbad_config::NodeRole::Client,
+        server_address: Some("127.0.0.1:9".into()),
+        service_port: pairing.local_addr().unwrap().port(),
+        sync_port: sync.local_addr().unwrap().port(),
+        ..Config::default()
+    };
+    drop((pairing, sync));
+    let mut daemon = Daemon::launch(config, false);
+    daemon.wait_until(Duration::from_secs(35), |d| {
+        fs::read_to_string(d.root.join("attempts"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .is_some_and(|n| n >= 2)
+    });
+    let log = fs::read_to_string(daemon.root.join("data/synbad/daemon.log")).unwrap();
+    assert!(log.contains("no input-sharing connection within 30s"));
+    fs::write(daemon.root.join("connected"), "").unwrap();
+    assert!(matches!(
+        daemon.request(Request::Restart),
+        Some(Response::Ok)
+    ));
+    daemon.wait_until(Duration::from_secs(3), |d| {
+        fs::read_to_string(d.root.join("data/synbad/core.log"))
+            .is_ok_and(|s| s.contains("connected to server"))
+    });
+    let attempts = fs::read_to_string(daemon.root.join("attempts")).unwrap();
+    std::thread::sleep(Duration::from_secs(32));
+    assert_eq!(
+        fs::read_to_string(daemon.root.join("attempts")).unwrap(),
+        attempts
+    );
+    assert!(matches!(
+        daemon.request(Request::GetStatus),
+        Some(Response::Status {
+            state: DaemonState::Running { .. },
             ..
         })
     ));

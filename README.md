@@ -74,9 +74,11 @@ No extra system packages are needed for the default (no-tray) build.
 
 ### Runtime dependencies (Deskflow Core)
 
-Synbad does **not** redistribute the Deskflow Core. On first run, `synbadd`
-downloads a pinned upstream release into `~/.local/share/synbad/bin/<tag>/`
-and supervises it as a child process. Synbad currently pins
+macOS releases bundle a patched, native arm64 or Intel Deskflow Core, its
+license and exception, with the complete patched source supplied as a release
+asset. On Linux and Windows, `synbadd` downloads a pinned upstream release
+into `~/.local/share/synbad/bin/<tag>/`. The Core runs as a child process.
+Synbad currently pins
 **[Deskflow v1.17.0](https://github.com/deskflow/deskflow/releases/tag/v1.17.0)**
 because it's the last upstream release that ships a Linux build compatible
 with Ubuntu 24.04's Qt 6.4 — Deskflow 1.19+ target Qt 6.7 / 6.8.
@@ -174,8 +176,9 @@ not public issues.
 
 ## License
 
-Synbad's own source is **MIT** (see [LICENSE](LICENSE)). The Synergy Core is
-GPLv2 and is fetched at runtime on the user's machine — Synbad does not
-redistribute Core binaries. See [docs/LICENSING.md](docs/LICENSING.md) for
-the rationale and the trademark constraints (the "Synergy" name is a Symless
+Synbad's own source is **MIT** (see [LICENSE](LICENSE)). Deskflow Core is
+GPL-2.0-or-later with an OpenSSL linking exception. macOS releases bundle
+patched native Core binaries and supply their corresponding source; other
+platforms fetch the Core at runtime. See [docs/LICENSING.md](docs/LICENSING.md)
+for attribution and the trademark constraints (the "Synergy" name is a Symless
 trademark and Synbad does not use it for branding).

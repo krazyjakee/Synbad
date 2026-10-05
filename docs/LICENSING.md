@@ -9,47 +9,42 @@
 
 ## The Core
 
-The upstream Synergy Core (this is what Synbad orchestrates) is licensed
-**GPLv2**. GPLv2 grants the right to build, modify, and distribute derivative
-and combined works, provided downstream stays GPL-compatible and complete
-corresponding source is offered.
+Synbad orchestrates Deskflow Core v1.17.0 at commit
+`44bd69fdc8df726909f35b7efeeebc554bfde1c5`. Its source headers specify
+**GPL-2.0-or-later**, and upstream's `LICENSE_EXCEPTION` supplies an OpenSSL
+linking exception. The modifications Synbad ships are recorded in
+[`dist/deskflow/teardown.patch`](../dist/deskflow/teardown.patch).
 
 ## What this means for Synbad
 
 - Synbad uses **process orchestration**, not linking (see ARCHITECTURE.md):
-  Synbad spawns the unmodified Core binaries as child processes and talks to
+  Synbad spawns the Core binaries as child processes and talks to
   them over IPC. Separate processes at arm's length is arguably **mere
   aggregation**, which would *not* force Synbad's own code under the GPL.
 - Regardless, Synbad is intended to be **fully open source and
   GPLv2-compatible**, so this distinction is a safety margin, not a loophole
   we depend on.
 
-### Decision: MIT, with runtime fetch of the Core
+### Distribution
 
-Synbad's own source is **MIT** (see `LICENSE` at the repo root). This works
-under our distribution model because **Synbad does not redistribute the
-Core**: at runtime, `synbadd` queries
-`github.com/deskflow/deskflow/releases/latest`, downloads the platform-
-appropriate release asset, verifies it against the upstream `sums.txt`,
-and extracts `deskflow-core` into a per-user cache. The implementation is
-in `crates/synbadd/src/binaries.rs`. The combined work only exists on the
-end user's system, which is the textbook "mere aggregation" scenario the
-GPL FAQ permits.
+Synbad's own source is **MIT** (see `LICENSE` at the repo root). The
+separate Deskflow Core retains its upstream license and copyright notices.
 
-| Option | When it applies | Note |
-|--------|-----------------|------|
-| GPLv2 | If we ever ship Core bytes in our release artifacts | Safest if we bundle |
-| GPLv2-or-later | If we want future GPL flexibility | Check Core headers say "or later" |
-| **MIT** (chosen) | Synbad source only; Core fetched at runtime | Keeps GPL combination off our distribution path |
+macOS app and Core archives include the patched native executables,
+`DESKFLOW-LICENSE`, and `DESKFLOW-LICENSE-EXCEPTION`. The same release
+publishes `deskflow-source-1.17.0-synbad-{arch}.tar.gz`, containing the exact
+patched source used for that build. This archive is produced after CMake
+configuration and excludes only Git metadata. Core packaging is described
+in [`dist/deskflow/README.md`](../dist/deskflow/README.md).
 
-If we later decide to bundle Core binaries in our installers (instead of
-fetching them at runtime), we must revisit this — bundling pulls the
-release artifact into GPL territory.
+Linux and Windows retain runtime fetching of pinned upstream binaries.
+The resolver verifies downloaded assets using the release checksum or
+the pinned known checksum before extracting them into a per-user cache.
 
 ### Conditions we must meet if we distribute Core binaries
 
 - Provide or offer the **complete corresponding source** of the Core (and any
-  modifications — we plan none in Phase 1).
+  modifications).
 - Preserve copyright and license notices; mark any modifications.
 - Add no further restrictions.
 - **TLS/OpenSSL caveat:** GPLv2 + OpenSSL has a historical incompatibility;
@@ -73,10 +68,10 @@ release artifact into GPL territory.
 
 ## Action items
 
-- [ ] Pull the Core's actual `LICENSE` + sample per-file headers; record exact
-      GPL version and any OpenSSL exception here.
+- [x] Record the pinned Core's license headers and OpenSSL exception.
 - [x] Commit the chosen `LICENSE` file (Phase 0) — MIT.
-- [ ] Add a `NOTICE`/attribution file crediting the Core and Deskflow upstream.
+- [x] Preserve upstream Core license and exception notices, and document
+      the patched source and attribution in `dist/deskflow/README.md`.
 - [ ] Legal review before first public release — confirm the runtime-fetch
       model holds for our chosen upstream (Deskflow's GitHub releases) and
-      that we don't ship Core bytes in any Synbad release artifact.
+      the macOS bundled-Core distribution and corresponding source artifacts.

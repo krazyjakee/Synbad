@@ -39,6 +39,8 @@ pub struct Advertiser {
     daemon: ServiceDaemon,
     full_name: String,
     fields: AdvertisedFields,
+    interfaces: crate::interfaces::InterfacePolicy,
+    reannounce: bool,
 }
 
 impl Advertiser {
@@ -67,6 +69,8 @@ impl Advertiser {
         }
 
         let daemon = ServiceDaemon::new()?;
+        let mut interfaces = crate::interfaces::InterfacePolicy::default();
+        interfaces.refresh(&daemon)?;
 
         // Use the machine hostname for the mDNS host record so peers can
         // resolve it via the same daemon's A records. Append `.local.` if
@@ -88,7 +92,7 @@ impl Advertiser {
             config_head: config_head.to_string(),
         };
 
-        let service = build_service_info(&fields)?;
+        let service = build_service_info(&fields, &interfaces.advertised_addresses())?;
         let full_name = service.get_fullname().to_string();
         daemon.register(service)?;
         tracing::info!(%full_name, "mDNS service registered");
@@ -97,6 +101,8 @@ impl Advertiser {
             daemon,
             full_name,
             fields,
+            interfaces,
+            reannounce: false,
         })
     }
 
@@ -116,13 +122,15 @@ impl Advertiser {
         fields.core_port = core_port;
         fields.audio_port = audio_port;
         fields.config_head = config_head.to_string();
-        if fields == self.fields {
+        self.reannounce |= self.interfaces.refresh(&self.daemon)?;
+        if fields == self.fields && !self.reannounce {
             return Ok(());
         }
-        let service = build_service_info(&fields)?;
+        let service = build_service_info(&fields, &self.interfaces.advertised_addresses())?;
         self.daemon.register(service)?;
         // Commit only after successful registration so failures can retry.
         self.fields = fields;
+        self.reannounce = false;
         Ok(())
     }
 
@@ -142,12 +150,19 @@ impl Drop for Advertiser {
     fn drop(&mut self) {
         // Best-effort: unregister so peers see the goodbye immediately and
         // don't wait for TTL expiry.
-        let _ = self.daemon.unregister(&self.full_name);
-        let _ = self.daemon.shutdown();
+        if let Ok(rx) = self.daemon.unregister(&self.full_name) {
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
+        }
+        if let Ok(rx) = self.daemon.shutdown() {
+            let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
+        }
     }
 }
 
-fn build_service_info(f: &AdvertisedFields) -> Result<ServiceInfo, AdvertiseError> {
+fn build_service_info(
+    f: &AdvertisedFields,
+    addresses: &[std::net::IpAddr],
+) -> Result<ServiceInfo, AdvertiseError> {
     let mut props: HashMap<String, String> = HashMap::new();
     props.insert("v".into(), PROTOCOL_VERSION.to_string());
     props.insert("id".into(), f.machine_id.clone());
@@ -174,14 +189,13 @@ fn build_service_info(f: &AdvertisedFields) -> Result<ServiceInfo, AdvertiseErro
         SERVICE_TYPE,
         &f.display_name,
         &f.host_name,
-        "",
+        addresses,
         f.service_port,
         props,
-    )?
-    // Let mdns-sd auto-pick addresses on the local interfaces, so we
-    // don't have to enumerate them ourselves. Required when we pass
-    // an empty `ip` string above.
-    .enable_addr_auto())
+    )?)
+    // Do not enable addr_auto: mdns-sd enumerates every interface in
+    // register(), regardless of its disabled socket selections. That
+    // would leak utun/AWDL addresses into an otherwise LAN-only record.
 }
 
 fn hostname() -> std::io::Result<String> {
@@ -225,4 +239,31 @@ fn sanitize(s: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_does_not_autofill_excluded_interface_addresses() {
+        let fields = AdvertisedFields {
+            machine_id: "id".into(),
+            fingerprint: "fp".into(),
+            display_name: "alpha".into(),
+            host_name: "alpha.local.".into(),
+            service_port: 24850,
+            sync_port: 24851,
+            core_port: 24800,
+            audio_port: 0,
+            config_head: String::new(),
+        };
+        let allowed = ["192.168.0.37".parse().unwrap()];
+        let service = build_service_info(&fields, &allowed).unwrap();
+        assert!(!service.is_addr_auto());
+        assert_eq!(
+            service.get_addresses().iter().copied().collect::<Vec<_>>(),
+            allowed
+        );
+    }
 }

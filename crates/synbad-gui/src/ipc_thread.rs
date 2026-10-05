@@ -489,15 +489,38 @@ fn spawn_daemon() -> (PathBuf, std::io::Result<std::process::Child>) {
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let (out, err) = (log_stdio(&log_path), log_stdio(&log_path));
-
     let mut cmd = Command::new(&binary);
-    cmd.stdin(Stdio::null()).stdout(out).stderr(err);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     #[cfg(unix)]
     {
         cmd.process_group(0);
     }
-    (binary, cmd.spawn())
+    let result = cmd.spawn().map(|mut child| {
+        let log = synbad_config::logging::RotatingLog::open(&log_path).ok();
+        if let Some(mut stdout) = child.stdout.take() {
+            let log = log.clone();
+            thread::spawn(move || {
+                let mut log: Box<dyn std::io::Write + Send> = match log {
+                    Some(log) => Box::new(log),
+                    None => Box::new(std::io::sink()),
+                };
+                let _ = std::io::copy(&mut stdout, &mut log);
+            });
+        }
+        if let Some(mut stderr) = child.stderr.take() {
+            thread::spawn(move || {
+                let mut log: Box<dyn std::io::Write + Send> = match log {
+                    Some(log) => Box::new(log),
+                    None => Box::new(std::io::sink()),
+                };
+                let _ = std::io::copy(&mut stderr, &mut log);
+            });
+        }
+        child
+    });
+    (binary, result)
 }
 
 /// One-shot wrapper around `spawn_daemon` that also surfaces failures to
@@ -523,15 +546,6 @@ fn try_spawn(
             Err(msg)
         }
     }
-}
-
-fn log_stdio(path: &Path) -> Stdio {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map(Stdio::from)
-        .unwrap_or_else(|_| Stdio::null())
 }
 
 fn command_loop(

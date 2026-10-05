@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -23,8 +23,8 @@ use synbad_ipc::{DaemonState, Event};
 use crate::binaries::{CoreLayout, ResolvedCore, Resolver};
 
 use super::{
-    CoreResolveOutcome, Supervisor, CLIENT_MAX_BACKOFF, FAST_FAIL_WINDOW, MAX_BACKOFF,
-    MAX_FAST_FAILS, MIN_BACKOFF,
+    CoreResolveOutcome, Supervisor, CIRCUIT_BREAKER_MAX, CLIENT_MAX_BACKOFF, CORE_CONNECT_TIMEOUT,
+    CORE_HEALTHY_WINDOW, MAX_BACKOFF, MAX_FAST_FAILS, MIN_BACKOFF,
 };
 
 impl Supervisor {
@@ -93,6 +93,7 @@ impl Supervisor {
     /// arm a retry: these failures (network, a transient spawn error, a
     /// briefly unwritable state dir) usually clear on their own.
     fn start_failed(&mut self, what: String) {
+        self.fast_fail_count = self.fast_fail_count.saturating_add(1);
         let delay = self.schedule_restart();
         let msg = format!("[synbad] {what}; retrying in {delay:?}");
         tracing::error!("{}", msg);
@@ -138,12 +139,18 @@ impl Supervisor {
         })?;
 
         let pid = child.id().unwrap_or(0);
+        if self.core_disk_log.is_none() {
+            self.core_disk_log = Some(synbad_config::logging::RotatingLog::open(
+                &paths::state_dir().join("core.log"),
+            )?);
+        }
+        let disk_log = self.core_disk_log.as_ref().unwrap().clone();
 
         if let Some(stdout) = child.stdout.take() {
-            spawn_log_reader(stdout, self.log_tx.clone());
+            spawn_log_reader(stdout, self.core_log_tx.clone(), pid, disk_log.clone());
         }
         if let Some(stderr) = child.stderr.take() {
-            spawn_log_reader(stderr, self.log_tx.clone());
+            spawn_log_reader(stderr, self.core_log_tx.clone(), pid, disk_log);
         }
 
         let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
@@ -167,9 +174,10 @@ impl Supervisor {
         // the link came up — a client dialing an unreachable server spawns,
         // instantly fails, and respawns. Resetting on spawn would pin the
         // backoff at MIN and hammer the server every ~500ms. It's reset only
-        // once a child clears FAST_FAIL_WINDOW (see `handle_child_exit`) or on
+        // after a minute of actual readiness (see `handle_child_exit`) or on
         // an explicit user Start/Restart.
-        self.started_at = Some(Instant::now());
+        self.core_ready_at = None;
+        self.core_connect_deadline = Some(tokio::time::Instant::now() + CORE_CONNECT_TIMEOUT);
         Ok(())
     }
 
@@ -241,6 +249,8 @@ impl Supervisor {
 
     pub(super) async fn stop_core(&mut self) {
         self.restart_at = None;
+        self.core_connect_deadline = None;
+        self.core_ready_at = None;
         // Whatever child we had is being retired; if its exit lands after
         // the timeout below, `handle_child_exit` must ignore it.
         let pid = self.child_pid.take();
@@ -271,20 +281,22 @@ impl Supervisor {
             tracing::debug!(pid, ?code, "ignoring exit of superseded core");
             return;
         }
-        tracing::info!(?code, "core exited");
+        tracing::warn!(pid, %status, "core exited");
+        self.record_log(format!(
+            "[synbad] Core {pid} exited: {status}; diagnostics in core.log"
+        ));
         self.child_pid = None;
         self.child_kill = None;
+        self.core_connect_deadline = None;
 
-        // Classify: did the child run long enough to be considered "alive"?
-        // A sub-second exit usually means missing libs (exit 127), bad CLI,
-        // or permission denial — restarting won't help.
-        let ran_for = self.started_at.take().map(|t| t.elapsed());
-        let instant_fail = ran_for.map(|d| d < FAST_FAIL_WINDOW).unwrap_or(false);
-        if instant_fail {
+        // Reset retries only after a minute of actual readiness, never
+        // just because a disconnected child managed to stay alive.
+        let healthy_for = self.core_ready_at.take().map(|t| t.elapsed());
+        if !healthy_for.is_some_and(|d| d >= CORE_HEALTHY_WINDOW) {
             self.fast_fail_count = self.fast_fail_count.saturating_add(1);
         } else {
-            // The child proved it could stay up past the fast-fail window —
-            // this is a mid-session drop, not a startup/reachability failure.
+            // A minute of actual readiness proves this was a session drop,
+            // rather than another startup/reachability failure.
             // Reset both the fast-fail budget and the reconnect backoff so
             // recovery starts fast again.
             self.fast_fail_count = 0;
@@ -340,11 +352,20 @@ impl Supervisor {
     /// delay armed. Never sleeps inline — blocking the loop here used to
     /// freeze IPC (including Stop) for up to [`MAX_BACKOFF`] per retry.
     fn schedule_restart(&mut self) -> Duration {
-        let (delay, next) = restart_backoff(self.backoff, self.config.role);
+        let (mut delay, next) = restart_backoff(self.backoff, self.config.role);
+        if self.fast_fail_count >= MAX_FAST_FAILS {
+            delay = circuit_breaker_delay(self.fast_fail_count);
+        }
         self.backoff = next;
         self.restart_at = Some(tokio::time::Instant::now() + delay);
         delay
     }
+}
+
+fn circuit_breaker_delay(failures: u32) -> Duration {
+    Duration::from_secs(60)
+        .saturating_mul(1 << failures.saturating_sub(MAX_FAST_FAILS).min(3))
+        .min(CIRCUIT_BREAKER_MAX)
 }
 
 /// `(delay to use now, backoff for next time)` given the current backoff:
@@ -485,14 +506,47 @@ fn build_command(
     }
 }
 
-fn spawn_log_reader<R>(reader: R, sink: mpsc::Sender<String>)
-where
+fn spawn_log_reader<R>(
+    reader: R,
+    sink: mpsc::Sender<super::CoreLogLine>,
+    pid: u32,
+    mut disk: synbad_config::logging::RotatingLog,
+) where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if sink.send(line).await.is_err() {
+        use std::io::Write;
+        let mut reader = BufReader::new(reader);
+        let mut bytes = Vec::new();
+        let mut truncated = false;
+        loop {
+            let chunk = match reader.fill_buf().await {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let _ = writeln!(disk, "[core {pid}] log read failed: {error}");
+                    break;
+                }
+            };
+            let eof = chunk.is_empty();
+            let end = chunk.iter().position(|b| *b == b'\n');
+            let n = end.map_or(chunk.len(), |i| i + 1);
+            let keep = n.min((16 * 1024usize).saturating_sub(bytes.len()));
+            bytes.extend_from_slice(&chunk[..keep]);
+            truncated |= keep < n;
+            reader.consume(n);
+            if end.is_some() || (eof && !bytes.is_empty()) {
+                let mut line = String::from_utf8_lossy(&bytes).trim_end().to_string();
+                if truncated {
+                    line.push_str(" [truncated]");
+                }
+                let _ = writeln!(disk, "[core {pid}] {line}");
+                if sink.send(super::CoreLogLine { pid, line }).await.is_err() {
+                    break;
+                }
+                bytes.clear();
+                truncated = false;
+            }
+            if eof {
                 break;
             }
         }
@@ -554,6 +608,41 @@ mod tests {
     use super::*;
     use synbad_config::{Config, NodeRole, Screen};
 
+    #[tokio::test]
+    async fn core_pipes_cap_long_lines_and_preserve_final_crash_diagnostics() {
+        use tokio::io::AsyncWriteExt;
+        let path = std::env::temp_dir().join(format!(
+            "synbad-core-log-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let disk = synbad_config::logging::RotatingLog::open(&path).unwrap();
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::channel(2);
+        spawn_log_reader(reader, tx, 42, disk);
+        tokio::spawn(async move {
+            writer.write_all(&vec![b'x'; 128 * 1024]).await.unwrap();
+            writer
+                .write_all(b"\nrefused socket: \xff no route to host")
+                .await
+                .unwrap();
+        });
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.pid, 42);
+        assert!(first.line.len() < 17 * 1024);
+        assert!(first.line.ends_with("[truncated]"));
+        let last = rx.recv().await.unwrap();
+        assert!(last.line.contains("no route to host"));
+        assert!(rx.recv().await.is_none());
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("no route to host"));
+        std::fs::remove_file(path).unwrap();
+    }
+
     fn base_config(role: NodeRole) -> Config {
         Config {
             role,
@@ -604,6 +693,15 @@ mod tests {
         let (delay, next) = restart_backoff(MAX_BACKOFF, NodeRole::Client);
         assert_eq!(delay, CLIENT_MAX_BACKOFF);
         assert_eq!(next, CLIENT_MAX_BACKOFF);
+    }
+
+    #[test]
+    fn repeated_failures_open_a_capped_circuit_breaker() {
+        assert_eq!(circuit_breaker_delay(5), Duration::from_secs(60));
+        assert_eq!(circuit_breaker_delay(6), Duration::from_secs(120));
+        assert_eq!(circuit_breaker_delay(7), Duration::from_secs(240));
+        assert_eq!(circuit_breaker_delay(8), CIRCUIT_BREAKER_MAX);
+        assert_eq!(circuit_breaker_delay(u32::MAX), CIRCUIT_BREAKER_MAX);
     }
 
     #[test]

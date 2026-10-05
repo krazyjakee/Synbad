@@ -17,7 +17,8 @@ design feedback, packaging fixes, and small focused PRs.
   before implementation — these surfaces are stability-sensitive.
 - **Synergy / Symless trademarks.** Synbad uses only the open-source Synergy
   Core under GPLv2 and ships its own branding. PRs that introduce "Synergy"
-  branding, or that bundle/redistribute Core binaries, will be declined. See
+  branding will be declined. macOS Core packaging must preserve upstream
+  notices and ship its complete patched source alongside release assets. See
   [`docs/LICENSING.md`](docs/LICENSING.md).
 
 ## Development setup

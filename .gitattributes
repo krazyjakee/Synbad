@@ -1,0 +1,2 @@
+# Blank context lines in unified patches contain a leading space.
+dist/deskflow/*.patch -whitespace

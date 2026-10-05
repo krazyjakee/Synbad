@@ -40,6 +40,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 mod archive;
+#[cfg(any(target_os = "macos", test))]
+mod bundle;
 mod elevate;
 mod restart;
 
@@ -268,6 +270,51 @@ pub fn download_and_apply(
     let new_self = find_binary(&extract_dir, self_basename)
         .ok_or_else(|| anyhow!("release archive did not contain `{}`", self_basename))?;
 
+    #[cfg(target_os = "macos")]
+    if let Some(dest) = bundle::app_root(&current_exe) {
+        let source = bundle::app_root(&new_self)
+            .context("release must contain a complete signed Synbad.app")?;
+        let verified = std::process::Command::new("/usr/bin/codesign")
+            .args(["--verify", "--deep", "--strict"])
+            .arg(source)
+            .output()?;
+        if !verified.status.success() {
+            bail!("downloaded app signature failed verification");
+        }
+        let elevated = check_dir_writable(dest.parent().context("app parent missing")?).is_err();
+        if elevated {
+            let plan = Plan {
+                tag: info.tag.clone(),
+                moves: vec![PlanMove {
+                    src: source.into(),
+                    dst: dest.into(),
+                }],
+            };
+            let path = tmp_dir.join("plan.json");
+            fs::write(&path, serde_json::to_vec(&plan)?)?;
+            elevate::apply_with_elevation(&elevate::helper_path_for(&current_exe), &path)?;
+        } else {
+            bundle::replace(source, dest)?;
+        }
+        return Ok(Applied {
+            replaced_sibling: Some(install_dir.join(sibling_basename(&current_exe))),
+            replaced_self: current_exe,
+            tag: info.tag.clone(),
+            elevated,
+        });
+    }
+
+    let mut extra_moves: Vec<PlanMove> = Vec::new();
+    #[cfg(target_os = "macos")]
+    for name in ["deskflow-client", "deskflow-server"] {
+        let src = find_binary(&extract_dir, name)
+            .with_context(|| format!("release missing patched {name}"))?;
+        extra_moves.push(PlanMove {
+            src,
+            dst: install_dir.join(name),
+        });
+    }
+
     // Sibling: if we are `synbad-gui`, look for `synbadd` next to us; vice
     // versa. The daemon and GUI ship together so updating one without the
     // other leaves the install in a half-upgraded state.
@@ -282,6 +329,9 @@ pub fn download_and_apply(
 
     if install_writable {
         on_progress(Progress::Stage("installing".into()));
+        for item in &extra_moves {
+            replace_sibling(&item.src, &item.dst)?;
+        }
         return install_inline(
             &current_exe,
             &new_self,
@@ -298,7 +348,8 @@ pub fn download_and_apply(
     // binaries, and re-launch the sibling Synbad binary under the platform's
     // auth dialog.
     on_progress(Progress::Stage("waiting for authorisation".into()));
-    let mut moves = Vec::with_capacity(2);
+    let mut moves = Vec::with_capacity(2 + extra_moves.len());
+    moves.append(&mut extra_moves);
     if let (true, Some(sib_src)) = (sibling_present, new_sibling.as_ref()) {
         moves.push(PlanMove {
             src: sib_src.clone(),
@@ -401,6 +452,13 @@ fn download_to(
 /// the binaries one or two directories deep depending on packaging, so a
 /// shallow recursive scan keeps us robust to layout changes.
 fn find_binary(root: &Path, name: &str) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    if let Some(app) = bundle::find(root) {
+        let candidate = app.join("Contents/MacOS").join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
     fn walk(dir: &Path, name: &str, out: &mut Option<PathBuf>) -> io::Result<()> {
         if out.is_some() {
             return Ok(());
@@ -509,6 +567,10 @@ pub fn apply_plan(plan_path: &Path) -> Result<Plan> {
 /// renames (temp on a different fs to install) and on Windows of the
 /// destination being held open by another process.
 fn external_replace(source: &Path, dest: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if source.is_dir() {
+        return bundle::replace(source, dest);
+    }
     #[cfg(windows)]
     {
         // The destination is almost always currently-running synbadd.exe or
@@ -589,10 +651,12 @@ fn host_target() -> Result<&'static str> {
     return Ok("x86_64-unknown-linux-gnu");
     #[cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"))]
     return Ok("aarch64-unknown-linux-gnu");
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    return Ok("x86_64-apple-darwin");
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    return Ok("aarch64-apple-darwin");
+    #[cfg(target_os = "macos")]
+    return Ok(if synbad_config::platform::native_arch() == "aarch64" {
+        "aarch64-apple-darwin"
+    } else {
+        "x86_64-apple-darwin"
+    });
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     return Ok("x86_64-pc-windows-msvc");
     #[allow(unreachable_code)]

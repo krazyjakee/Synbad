@@ -8,14 +8,14 @@ fn dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("dev", "synbad", "synbad")
 }
 
-/// `~/.config/synbad/` (Linux) / `~/Library/Application Support/synbad/synbad/` (macOS).
+/// `~/.config/synbad/` (Linux) / `~/Library/Application Support/dev.synbad.synbad/` (macOS).
 pub fn config_dir() -> PathBuf {
     dirs()
         .map(|d| d.config_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from("./synbad-config"))
 }
 
-/// `~/.local/state/synbad/` — runtime artifacts (generated `.conf`, sockets).
+/// `~/.local/share/synbad/` on Linux — runtime artifacts (generated `.conf`, sockets, logs).
 pub fn state_dir() -> PathBuf {
     dirs()
         .map(|d| d.data_local_dir().to_path_buf())

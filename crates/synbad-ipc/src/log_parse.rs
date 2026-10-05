@@ -35,6 +35,16 @@ pub fn is_client_server_disconnect(line: &str) -> bool {
     strip_log_prefix(line).starts_with("disconnected from server")
 }
 
+/// A running Core becomes healthy after a connection or a ready listener.
+pub fn is_core_ready(line: &str) -> bool {
+    let body = strip_log_prefix(line);
+    body.starts_with("connected to server") || body.starts_with("started server")
+}
+
+pub fn is_client_connected(line: &str) -> bool {
+    strip_log_prefix(line).starts_with("connected to server")
+}
+
 /// Try to extract a structured event from a single line of Core stderr.
 /// Returns `None` for lines that don't carry a recognized signal — those
 /// still flow through as raw `Event::Log`.
@@ -189,5 +199,17 @@ mod tests {
         assert!(parse("DEBUG1: heartbeat sent").is_none());
         assert!(parse("").is_none());
         assert!(parse(r#"NOTE: client "x" did something else"#).is_none());
+    }
+
+    #[test]
+    fn readiness_requires_a_successful_connection_or_listener() {
+        assert!(is_client_connected(
+            "[2026-10-05T09:00:00] NOTE: connected to server"
+        ));
+        assert!(is_core_ready("NOTE: started server, waiting for clients"));
+        assert!(!is_core_ready(
+            "WARNING: failed to connect to server: no route to host"
+        ));
+        assert!(!is_client_connected("NOTE: disconnected from server"));
     }
 }

@@ -161,12 +161,10 @@ extern "C" {
 mod tests {
     use super::*;
 
-    /// `restart_daemon` is allowed to fail on a CI runner that doesn't
-    /// have a user-session supervisor — we just want it to not panic and
-    /// to produce a sensible error type. Skipped when the supervisor
-    /// command is actually missing from PATH because then `Command::status`
-    /// can return Err for "no such file" which we already treat as failure.
+    /// This invokes the real supervisor, so it must never run as part of
+    /// the default suite on a developer's installed Synbad session.
     #[test]
+    #[ignore = "restarts the installed daemon; manual supervisor integration check"]
     fn restart_daemon_does_not_panic() {
         let _ = restart_daemon();
     }

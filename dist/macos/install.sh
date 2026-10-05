@@ -6,19 +6,48 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/../.. && pwd)"
 PLIST_SRC="${REPO_ROOT}/dist/macos/dev.synbad.synbadd.plist"
 PLIST_DST="${HOME}/Library/LaunchAgents/dev.synbad.synbadd.plist"
-BIN_DST="/usr/local/bin/synbadd"
-GUI_DST="/usr/local/bin/synbad-gui"
+APP_DST="/Applications/Synbad.app"
+BIN_DST="${APP_DST}/Contents/MacOS/synbadd"
+GUI_DST="${APP_DST}/Contents/MacOS/synbad-gui"
 
-echo "[synbad] building release binaries"
+echo "[synbad] building native release binaries and patched Core"
 cd "${REPO_ROOT}"
-cargo build --release -p synbadd -p synbad-gui
-
-# /usr/local/bin needs sudo on most macOS installs. We could put binaries
-# under ~/.local/bin instead and patch the plist, but /usr/local/bin keeps
-# the plist constant across users.
-echo "[synbad] installing binaries to /usr/local/bin (sudo)"
-sudo install -m 755 target/release/synbadd "${BIN_DST}"
-sudo install -m 755 target/release/synbad-gui "${GUI_DST}"
+core_arch=x86_64
+rust_target=x86_64-apple-darwin
+if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ]; then
+  core_arch=arm64
+  rust_target=aarch64-apple-darwin
+fi
+rustup target add "$rust_target"
+stage="$(mktemp -d)"
+trap 'rm -rf "$stage"' EXIT
+cargo build --release --target-dir "$stage/target" --target "$rust_target" -p synbadd -p synbad-gui
+bash dist/macos/build-core.sh "$stage/core" "$core_arch"
+app="$stage/Synbad.app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp "$stage/target/$rust_target/release/synbadd" "$stage/target/$rust_target/release/synbad-gui" "$app/Contents/MacOS/"
+cp "$stage/core/deskflow-client" "$stage/core/deskflow-server" "$app/Contents/MacOS/"
+cp "$stage/core/DESKFLOW-LICENSE" "$app/Contents/Resources/"
+cp "$stage/core/DESKFLOW-LICENSE-EXCEPTION" "$app/Contents/Resources/"
+version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+sed "s/@VERSION@/$version/g" dist/macos/Info.plist > "$app/Contents/Info.plist"
+bash assets/scripts/generate-icons.sh
+cp assets/synbad.icns "$app/Contents/Resources/"
+bash dist/macos/sign.sh "$app"
+echo "[synbad] installing signed app to $APP_DST (sudo)"
+new_app="/Applications/.synbad-install-$$.app"
+old_app="/Applications/.synbad-previous-$$.app"
+sudo ditto "$app" "$new_app"
+codesign --verify --deep --strict "$new_app"
+if [ -e "$APP_DST" ]; then sudo mv "$APP_DST" "$old_app"; fi
+if ! sudo mv "$new_app" "$APP_DST"; then
+  if [ -e "$old_app" ]; then sudo mv "$old_app" "$APP_DST"; fi
+  exit 1
+fi
+if [ -e "$old_app" ]; then sudo rm -rf "$old_app"; fi
+sudo mkdir -p /usr/local/bin
+sudo ln -sf "$BIN_DST" /usr/local/bin/synbadd
+sudo ln -sf "$GUI_DST" /usr/local/bin/synbad-gui
 
 echo "[synbad] installing launchd plist"
 mkdir -p "$(dirname "${PLIST_DST}")"
@@ -37,4 +66,4 @@ echo
 echo "[synbad] installed. Useful commands:"
 echo "  launchctl print gui/${UID_NUM}/dev.synbad.synbadd"
 echo "  launchctl kickstart -k gui/${UID_NUM}/dev.synbad.synbadd  # restart"
-echo "  tail -f /tmp/synbadd.err.log"
+echo "  open /Applications/Synbad.app"

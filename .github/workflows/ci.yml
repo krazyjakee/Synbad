@@ -24,6 +24,25 @@ env:
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
+  macos-core:
+    name: patched Core (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install cmake ninja qt openssl@3 googletest
+      - name: Build native Core and run teardown regressions
+        env:
+          SYNBAD_CORE_TESTS: "ON"
+        run: bash dist/macos/build-core.sh core-test '${{ matrix.arch }}'
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest

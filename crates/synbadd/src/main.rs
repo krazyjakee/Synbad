@@ -68,10 +68,18 @@ async fn run_daemon() -> Result<()> {
     // distinguishable.
     let (log_tx, log_rx) = mpsc::channel::<String>(LOG_CHANNEL_CAP);
 
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,mdns_sd=warn"));
+    let disk_log =
+        synbad_config::logging::RotatingLog::open(&paths::state_dir().join("daemon.log"))?;
     tracing_subscriber::registry()
         .with(env_filter)
         .with(fmt::layer().with_writer(std::io::stderr))
+        .with(
+            fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || disk_log.clone()),
+        )
         .with(
             fmt::layer()
                 .with_ansi(false)
@@ -98,7 +106,6 @@ async fn run_daemon() -> Result<()> {
         .with_context(|| format!("binding ipc socket at {:?}", socket_path))?;
     tracing::info!(?socket_path, "ipc listening");
 
-    let mut supervisor =
-        Supervisor::new(config_path.clone(), event_tx.clone(), log_tx, log_rx).await?;
+    let mut supervisor = Supervisor::new(config_path.clone(), event_tx.clone(), log_rx).await?;
     supervisor.run(listener).await
 }

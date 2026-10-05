@@ -11,6 +11,7 @@
 
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -79,31 +80,36 @@ impl TrustedPeerStore {
 
     /// Insert or update (matching on `machine_id`) and persist to disk.
     pub fn upsert(&mut self, peer: TrustedPeer) -> Result<(), TrustError> {
-        if let Some(slot) = self
-            .peers
-            .iter_mut()
-            .find(|p| p.machine_id == peer.machine_id)
-        {
+        let mut peers = self.peers.clone();
+        if let Some(slot) = peers.iter_mut().find(|p| p.machine_id == peer.machine_id) {
             *slot = peer;
         } else {
-            self.peers.push(peer);
+            peers.push(peer);
         }
-        self.save()
+        self.save(&peers)?;
+        self.peers = peers;
+        Ok(())
     }
 
     /// Remove a peer (e.g. user revokes trust). Returns true if removed.
     pub fn remove(&mut self, machine_id: &str) -> Result<bool, TrustError> {
         let before = self.peers.len();
-        self.peers.retain(|p| p.machine_id != machine_id);
-        if self.peers.len() != before {
-            self.save()?;
+        let peers: Vec<_> = self
+            .peers
+            .iter()
+            .filter(|p| p.machine_id != machine_id)
+            .cloned()
+            .collect();
+        if peers.len() != before {
+            self.save(&peers)?;
+            self.peers = peers;
             Ok(true)
         } else {
             Ok(false)
         }
     }
 
-    fn save(&self) -> Result<(), TrustError> {
+    fn save(&self, peers: &[TrustedPeer]) -> Result<(), TrustError> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|source| TrustError::Io {
                 path: parent.into(),
@@ -111,14 +117,32 @@ impl TrustedPeerStore {
             })?;
         }
         let body = serde_json::to_vec_pretty(&TrustFile {
-            peers: self.peers.clone(),
+            peers: peers.to_vec(),
         })?;
-        let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, body).map_err(|source| TrustError::Io {
-            path: tmp.clone(),
-            source,
-        })?;
-        fs::rename(&tmp, &self.path).map_err(|source| TrustError::Io {
+        let tmp = self
+            .path
+            .with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| -> io::Result<()> {
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&tmp)?;
+            file.write_all(&body)?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&tmp, &self.path)?;
+            #[cfg(unix)]
+            if let Some(parent) = self.path.parent() {
+                fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        })();
+        let _ = fs::remove_file(&tmp);
+        result.map_err(|source| TrustError::Io {
             path: self.path.clone(),
             source,
         })?;
@@ -182,5 +206,19 @@ mod tests {
         store.upsert(sample("xx")).unwrap();
         assert!(store.remove("xx").unwrap());
         assert!(!store.remove("xx").unwrap());
+    }
+
+    #[test]
+    fn failed_persistence_does_not_establish_or_revoke_memory_trust() {
+        let path = tempfile("failure");
+        let mut store = TrustedPeerStore::load(&path).unwrap();
+        store.upsert(sample("existing")).unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap(); // rename onto a directory must fail
+        assert!(store.upsert(sample("new")).is_err());
+        assert!(!store.contains("new"));
+        assert!(store.remove("existing").is_err());
+        assert!(store.contains("existing"));
+        fs::remove_dir(path).unwrap();
     }
 }

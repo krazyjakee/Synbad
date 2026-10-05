@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub mod logging;
 pub mod paths;
+pub mod platform;
 
 /// Top-level configuration model.
 ///

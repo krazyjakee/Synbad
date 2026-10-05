@@ -22,7 +22,7 @@
   <key>CFBundleIconFile</key>
   <string>synbad.icns</string>
   <key>LSMinimumSystemVersion</key>
-  <string>10.13</string>
+  <string>11.0</string>
   <key>LSApplicationCategoryType</key>
   <string>public.app-category.utilities</string>
   <key>NSHighResolutionCapable</key>
@@ -36,5 +36,9 @@
        TCC prompt the first time the audio bridge is enabled. -->
   <key>NSMicrophoneUsageDescription</key>
   <string>Synbad bridges audio between paired peers on your LAN.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Synbad discovers and connects to paired computers on your local network.</string>
+  <key>NSBonjourServices</key>
+  <array><string>_synbad._tcp</string></array>
 </dict>
 </plist>

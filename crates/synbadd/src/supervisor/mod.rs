@@ -55,12 +55,16 @@ pub(super) const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// [`MAX_BACKOFF`] means it notices the server coming back within
 /// seconds rather than half a minute, while still ticking gently.
 pub(super) const CLIENT_MAX_BACKOFF: Duration = Duration::from_secs(10);
-/// Rapid exits retain the run intent and increase capped backoff. A child
-/// that runs beyond this window resets backoff on exit, allowing a fresh
-/// fast recovery after a mid-session drop.
-pub(super) const FAST_FAIL_WINDOW: Duration = Duration::from_secs(2);
 /// Emit an actionable server startup diagnostic after this many failures.
 pub(super) const MAX_FAST_FAILS: u32 = 5;
+pub(super) const CORE_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const CORE_HEALTHY_WINDOW: Duration = Duration::from_secs(60);
+pub(super) const CIRCUIT_BREAKER_MAX: Duration = Duration::from_secs(300);
+
+pub(super) struct CoreLogLine {
+    pid: u32,
+    line: String,
+}
 /// How often the supervisor sweeps visible+trusted peers looking for
 /// audio sessions that *should* exist but don't, and dials the missing
 /// ones. The handshake/connect path is the only failure-prone step
@@ -136,7 +140,6 @@ pub struct Supervisor {
     /// by any explicit stop or start.
     pub(super) restart_at: Option<tokio::time::Instant>,
     pub(super) log_rx: mpsc::Receiver<String>,
-    pub(super) log_tx: mpsc::Sender<String>,
     /// Core exits, tagged with the pid that exited so a late exit from a
     /// superseded child can't be mistaken for the current one's.
     pub(super) exit_rx: mpsc::Receiver<(u32, std::process::ExitStatus)>,
@@ -160,11 +163,13 @@ pub struct Supervisor {
     /// Set by `Request::Shutdown`; the run loop stops the Core and returns
     /// after the response has been flushed to the client.
     pub(super) shutdown: bool,
-    /// When the currently-spawned child started — used to classify exits
-    /// as "instant fail" vs "ran for a while then died".
-    pub(super) started_at: Option<Instant>,
-    /// Consecutive instant-fails. Reset when the child runs longer than
-    /// [`FAST_FAIL_WINDOW`] or when the user explicitly stops/starts.
+    pub(super) core_ready_at: Option<Instant>,
+    pub(super) core_connect_deadline: Option<tokio::time::Instant>,
+    pub(super) core_log_rx: mpsc::Receiver<CoreLogLine>,
+    pub(super) core_log_tx: mpsc::Sender<CoreLogLine>,
+    pub(super) core_disk_log: Option<synbad_config::logging::RotatingLog>,
+    /// Consecutive failures. Reset only after a healthy session or an
+    /// explicit Start/Restart.
     pub(super) fast_fail_count: u32,
 
     /// Stable per-machine identity (UUID + ed25519 keypair). Persists
@@ -255,7 +260,6 @@ impl Supervisor {
     pub async fn new(
         config_path: PathBuf,
         events: broadcast::Sender<Event>,
-        log_tx: mpsc::Sender<String>,
         log_rx: mpsc::Receiver<String>,
     ) -> Result<Self> {
         let config = Config::load(&config_path)?.unwrap_or_default();
@@ -402,6 +406,7 @@ impl Supervisor {
             config.sync_port,
             config.audio.signal_port,
         );
+        let (core_log_tx, core_log_rx) = mpsc::channel(256);
         let mut supervisor = Supervisor {
             config_path,
             config,
@@ -417,7 +422,6 @@ impl Supervisor {
             backoff: MIN_BACKOFF,
             restart_at: None,
             log_rx,
-            log_tx,
             exit_rx,
             exit_tx,
             child_pid: None,
@@ -428,7 +432,11 @@ impl Supervisor {
             core_resolve_rx,
             core_resolving: false,
             shutdown: false,
-            started_at: None,
+            core_ready_at: None,
+            core_disk_log: None,
+            core_connect_deadline: None,
+            core_log_rx,
+            core_log_tx,
             fast_fail_count: 0,
             identity,
             advertiser,
@@ -513,6 +521,13 @@ impl Supervisor {
                 }
             };
             let restart_at = self.restart_at;
+            let core_connect_deadline = self.core_connect_deadline;
+            let core_stalled = async move {
+                match core_connect_deadline {
+                    Some(t) => tokio::time::sleep_until(t).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
             let restart_due = async move {
                 match restart_at {
                     Some(t) => tokio::time::sleep_until(t).await,
@@ -521,6 +536,18 @@ impl Supervisor {
             };
 
             tokio::select! {
+                _ = core_stalled => {
+                    self.core_connect_deadline = None;
+                    let failure = if matches!(self.config.role, NodeRole::Client) {
+                        "no input-sharing connection"
+                    } else { "no ready input-sharing listener" };
+                    let message = format!("[synbad] Core made {failure} within {}s; terminating stalled Core and retrying with backoff", CORE_CONNECT_TIMEOUT.as_secs());
+                    tracing::warn!("{message}");
+                    self.record_log(message);
+                    if let Some(kill) = self.child_kill.take() {
+                        let _ = kill.send(());
+                    }
+                }
                 _ = restart_due => {
                     self.restart_at = None;
                     if self.desired_running {
@@ -558,6 +585,23 @@ impl Supervisor {
                 }
                 Some(line) = self.log_rx.recv() => {
                     self.record_log(line);
+                }
+                Some(core) = self.core_log_rx.recv() => {
+                    if self.child_pid == Some(core.pid) {
+                        if log_parse::is_core_ready(&core.line) && self.core_ready_at.is_none() {
+                            self.core_ready_at = Some(Instant::now());
+                        }
+                        if log_parse::is_client_connected(&core.line)
+                            || (matches!(self.config.role, NodeRole::Server) && log_parse::is_core_ready(&core.line)) {
+                            self.core_connect_deadline = None;
+                        }
+                        self.maybe_force_reconnect(&core.line);
+                    }
+                    if self.child_pid == Some(core.pid) {
+                        self.record_log(core.line);
+                    } else {
+                        self.record_log(format!("[synbad] retired Core {}: {}", core.pid, core.line));
+                    }
                 }
                 Some((pid, status)) = self.exit_rx.recv() => {
                     self.handle_child_exit(pid, status).await;
@@ -1200,7 +1244,6 @@ impl Supervisor {
             }
             let _ = self.events.send(structured);
         }
-        self.maybe_force_reconnect(&line);
         let _ = self.events.send(Event::Log { line });
     }
 

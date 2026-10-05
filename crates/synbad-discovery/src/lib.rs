@@ -25,6 +25,7 @@
 pub mod advertiser;
 pub mod browser;
 pub mod identity;
+mod interfaces;
 pub mod pairing;
 pub mod trust;
 

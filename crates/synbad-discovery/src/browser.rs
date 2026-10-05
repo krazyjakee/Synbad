@@ -8,6 +8,7 @@
 //! self-loop event on every start.
 
 use std::thread;
+use std::time::{Duration, Instant};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent};
 use serde::{Deserialize, Serialize};
@@ -39,13 +40,17 @@ impl Browser {
         own_machine_id: &str,
     ) -> Result<(Self, mpsc::Receiver<DiscoveryEvent>), BrowseError> {
         let daemon = ServiceDaemon::new()?;
+        let mut interfaces = crate::interfaces::InterfacePolicy::default();
+        interfaces.refresh(&daemon)?;
         let raw_rx = daemon.browse(SERVICE_TYPE)?;
+        let monitor = daemon.monitor()?;
         let (tx, rx) = mpsc::channel::<DiscoveryEvent>(64);
 
         let own_id = own_machine_id.to_string();
+        let worker_daemon = daemon.clone();
         thread::Builder::new()
             .name("synbad-discovery-browser".into())
-            .spawn(move || pump_events(raw_rx, tx, own_id))
+            .spawn(move || pump_events(worker_daemon, raw_rx, monitor, interfaces, tx, own_id))
             .expect("spawn discovery browser thread");
 
         Ok((Browser { daemon }, rx))
@@ -54,12 +59,17 @@ impl Browser {
 
 impl Drop for Browser {
     fn drop(&mut self) {
-        let _ = self.daemon.shutdown();
+        if let Ok(rx) = self.daemon.shutdown() {
+            let _ = rx.recv_timeout(Duration::from_secs(1));
+        }
     }
 }
 
 fn pump_events(
-    raw_rx: mdns_sd::Receiver<ServiceEvent>,
+    daemon: ServiceDaemon,
+    mut raw_rx: mdns_sd::Receiver<ServiceEvent>,
+    monitor: mdns_sd::Receiver<mdns_sd::DaemonEvent>,
+    mut interfaces: crate::interfaces::InterfacePolicy,
     tx: mpsc::Sender<DiscoveryEvent>,
     own_id: String,
 ) {
@@ -67,11 +77,52 @@ fn pump_events(
     // payload — so we have to remember which machine_id each full_name
     // resolved to, in order to emit a `Lost { machine_id }` the supervisor
     // can match.
-    let mut full_to_id: std::collections::HashMap<String, String> =
+    let mut full_to_peer: std::collections::HashMap<String, DiscoveredPeer> =
         std::collections::HashMap::new();
-
-    while let Ok(ev) = raw_rx.recv() {
+    let mut next_query = Instant::now() + Duration::from_secs(30);
+    let mut next_interfaces = Instant::now() + Duration::from_secs(5);
+    let mut restarting = false;
+    loop {
+        if tx.is_closed() {
+            return;
+        }
+        let network_event = monitor.try_iter().any(|ev| {
+            matches!(
+                ev,
+                mdns_sd::DaemonEvent::IpAdd(_) | mdns_sd::DaemonEvent::IpDel(_)
+            )
+        });
+        let now = Instant::now();
+        if network_event || now >= next_interfaces {
+            if interfaces.refresh(&daemon).unwrap_or(false) {
+                next_query = next_query.min(now + Duration::from_secs(1));
+            }
+            next_interfaces = now + Duration::from_secs(5);
+        }
+        // mdns-sd doubles browse intervals up to an hour. Restart just the
+        // query subscription to cap that at 30s, preserving the cache and
+        // debouncing LAN address changes. Never spawn additional browsers.
+        if now >= next_query && !restarting {
+            if daemon.stop_browse(SERVICE_TYPE).is_err() {
+                return;
+            }
+            restarting = true;
+        }
+        let ev = match raw_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(ev) => ev,
+            Err(_) if raw_rx.is_disconnected() => return,
+            Err(_) => continue,
+        };
         let to_send = match ev {
+            ServiceEvent::SearchStopped(_) if restarting => {
+                raw_rx = match daemon.browse(SERVICE_TYPE) {
+                    Ok(rx) => rx,
+                    Err(_) => return,
+                };
+                next_query = Instant::now() + Duration::from_secs(30);
+                restarting = false;
+                None
+            }
             ServiceEvent::ServiceResolved(info) => {
                 let Some(peer) = peer_from(&info) else {
                     continue;
@@ -79,12 +130,22 @@ fn pump_events(
                 if peer.machine_id == own_id {
                     continue;
                 }
-                full_to_id.insert(info.get_fullname().to_string(), peer.machine_id.clone());
+                if full_to_peer.get(info.get_fullname()) == Some(&peer) {
+                    continue;
+                }
+                full_to_peer.insert(info.get_fullname().to_string(), peer.clone());
                 Some(DiscoveryEvent::Found(peer))
             }
-            ServiceEvent::ServiceRemoved(_kind, full_name) => full_to_id
+            ServiceEvent::ServiceRemoved(_kind, full_name) => full_to_peer
                 .remove(&full_name)
-                .map(|machine_id| DiscoveryEvent::Lost { machine_id }),
+                .filter(|peer| {
+                    !full_to_peer
+                        .values()
+                        .any(|other| other.machine_id == peer.machine_id)
+                })
+                .map(|peer| DiscoveryEvent::Lost {
+                    machine_id: peer.machine_id,
+                }),
             ServiceEvent::SearchStarted(_)
             | ServiceEvent::SearchStopped(_)
             | ServiceEvent::ServiceFound(_, _) => None,
@@ -119,7 +180,15 @@ fn peer_from(info: &mdns_sd::ServiceInfo) -> Option<DiscoveredPeer> {
 
     // Stable ordering prevents interface enumeration churn. Retain every
     // candidate so dialers can recover from an unreachable NIC/VPN address.
-    let mut addresses: Vec<_> = info.get_addresses().iter().copied().collect();
+    let mut addresses: Vec<_> = info
+        .get_addresses()
+        .iter()
+        .copied()
+        .filter(|ip| {
+            !ip.is_loopback()
+                && !matches!(ip, std::net::IpAddr::V6(v6) if v6.is_unicast_link_local())
+        })
+        .collect();
     addresses.sort_by_key(|ip| (ip.is_loopback(), ip.is_ipv6(), *ip));
     let addresses: Vec<String> = addresses.into_iter().map(|ip| ip.to_string()).collect();
     let host = addresses

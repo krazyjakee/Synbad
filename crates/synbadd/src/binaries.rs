@@ -157,6 +157,17 @@ impl Resolver {
         &self,
         progress: tokio::sync::mpsc::Sender<Event>,
     ) -> Result<ResolvedCore> {
+        #[cfg(target_os = "macos")]
+        return self.ensure_macos_core(progress).await;
+        #[cfg(not(target_os = "macos"))]
+        self.ensure_upstream_core(progress).await
+    }
+
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    async fn ensure_upstream_core(
+        &self,
+        progress: tokio::sync::mpsc::Sender<Event>,
+    ) -> Result<ResolvedCore> {
         // Fast path: every binary the pinned tag needs is already on disk.
         // The tag is pinned, so there's nothing the API could tell us that
         // would change the answer. Skipping the query is what keeps a Core
@@ -259,6 +270,88 @@ impl Resolver {
             })
             .await;
         Ok(resolved)
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn ensure_macos_core(
+        &self,
+        progress: tokio::sync::mpsc::Sender<Event>,
+    ) -> Result<ResolvedCore> {
+        let arch = synbad_config::platform::native_arch();
+        let macho_arch = if arch == "aarch64" { "arm64" } else { "x86_64" };
+        let resolve = |dir: &Path| -> Option<ResolvedCore> {
+            let server = dir.join(LEGACY_SERVER_BIN);
+            let client = dir.join(LEGACY_CLIENT_BIN);
+            for path in [&server, &client] {
+                if !path.is_file()
+                    || !std::process::Command::new("/usr/bin/lipo")
+                        .arg(path)
+                        .args(["-verify_arch", macho_arch])
+                        .output()
+                        .is_ok_and(|out| out.status.success())
+                {
+                    return None;
+                }
+            }
+            Some(ResolvedCore {
+                layout: CoreLayout::SplitLegacy { server, client },
+            })
+        };
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(core) = exe.parent().and_then(resolve) {
+                return Ok(core);
+            }
+        }
+        // A version+native-architecture cache deliberately ignores the old
+        // v1.17.0 x64 cache. Old updaters replace only the Rust executables;
+        // this asset supplies the patched Core on that first upgraded run.
+        let version = env!("CARGO_PKG_VERSION");
+        let dir = self
+            .cache_root
+            .join(format!("synbad-core-{version}-{arch}"));
+        if let Some(core) = resolve(&dir) {
+            return Ok(core);
+        }
+        let asset = format!("deskflow-core-{version}-{arch}-apple-darwin.tar.gz");
+        let url =
+            format!("https://github.com/krazyjakee/Synbad/releases/download/v{version}/{asset}");
+        let _ = progress
+            .send(Event::Downloading {
+                tag: format!("v{version}"),
+                asset: asset.clone(),
+                url: url.clone(),
+            })
+            .await;
+        let checksum = self
+            .http
+            .get(format!("{url}.sha256"))
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        let sha = checksum
+            .split_whitespace()
+            .next()
+            .context("empty Core checksum")?;
+        let bytes = self.download_with_progress(&url, &asset, &progress).await?;
+        verify_sha(&bytes, sha)?;
+        let staging = dir.with_extension("partial");
+        let _ = tokio::fs::remove_dir_all(&staging).await;
+        tokio::fs::create_dir_all(&staging).await?;
+        let staging_copy = staging.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut archive =
+                tar::Archive::new(flate2::read::GzDecoder::new(std::io::Cursor::new(bytes)));
+            archive.set_preserve_permissions(true);
+            archive.unpack(&staging_copy)?;
+            Ok(())
+        })
+        .await??;
+        resolve(&staging).context("patched Core archive has missing or non-native binaries")?;
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::rename(staging, &dir).await?;
+        resolve(&dir).context("patched Core installation missing")
     }
 
     /// Inspect on-disk state for `tag` and return a [`ResolvedCore`] iff

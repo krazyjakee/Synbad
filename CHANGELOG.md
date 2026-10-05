@@ -10,6 +10,28 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-10-05
+
+### Fixed
+- macOS releases bundle a native, patched Deskflow Core for both arm64 and
+  Intel. Socket callbacks are joined before Carbon event-queue teardown;
+  early events are rejected safely before the queue is initialized.
+- A Core that stays alive without connecting or opening its server listener
+  is restarted after 30 seconds. Five consecutive failures open a cooldown
+  of 60 seconds, doubling to a five-minute cap. Retry budgets reset only
+  after a minute of readiness or an explicit Start/Restart.
+- Core stdout/stderr and daemon diagnostics persist in size-capped logs,
+  including final refusal messages and signal exits. Older oversized logs
+  are trimmed on open.
+- mDNS excludes macOS utun, AWDL, LLW and loopback interfaces, caps browse
+  refresh at 30 seconds, reacts to LAN address changes and deduplicates
+  unchanged peer announcements.
+- Pairing commits and syncs `trusted-peers.json` before reporting success;
+  failed saves no longer change in-memory trust.
+- macOS app and helper signatures use stable identifiers, with Developer ID
+  signing when configured and ad-hoc signing otherwise. Updates replace the
+  complete verified app, including its native Core and signature.
+
 ## [0.1.10] - 2026-10-01
 
 ### Fixed

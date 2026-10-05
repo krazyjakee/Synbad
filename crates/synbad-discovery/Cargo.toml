@@ -14,6 +14,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 mdns-sd = { workspace = true }
+if-addrs = "0.13"
 uuid = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }

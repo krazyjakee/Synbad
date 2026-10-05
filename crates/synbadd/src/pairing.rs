@@ -375,7 +375,9 @@ async fn run_session_inner(
     };
     {
         let mut store = deps.trust.lock().await;
-        store.upsert(trusted.clone())?;
+        store
+            .upsert(trusted.clone())
+            .context("persisting trusted-peers.json before completing pairing")?;
     }
     let _ = deps.events.send(Event::PairingCompleted { peer: trusted });
     tracing::info!(?session_id, peer = %peer_hello.machine_id, "pairing complete");
@@ -411,4 +413,100 @@ fn new_session_id() -> String {
         synbad_discovery::now_unix(),
         N.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    async fn check_pairing_persistence(fail_save: bool) {
+        let root = std::env::temp_dir().join(format!("synbad-pairing-{}", new_session_id()));
+        let mut nodes = Vec::new();
+        for name in ["alpha", "beta"] {
+            let dir = root.join(name);
+            let identity = Arc::new(Identity::load_or_create(&dir.join("identity")).unwrap());
+            let path = dir.join("trusted-peers.json");
+            let trust = TrustedPeerStore::load(&path).unwrap();
+            let (events, rx) = broadcast::channel(16);
+            nodes.push((
+                Arc::new(SessionDeps {
+                    identity,
+                    trust: Arc::new(tokio::sync::Mutex::new(trust)),
+                    events,
+                    display_name: name.into(),
+                }),
+                rx,
+                path,
+            ));
+        }
+        if fail_save {
+            std::fs::create_dir(&nodes[0].2).unwrap();
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let outgoing = TcpStream::connect(address).await.unwrap();
+        let (incoming, client_addr) = listener.accept().await.unwrap();
+        let (accept_a, confirm_a) = oneshot::channel();
+        let (accept_b, confirm_b) = oneshot::channel();
+        accept_a.send(true).unwrap();
+        accept_b.send(true).unwrap();
+        let task_a = tokio::spawn(run_session(
+            "outbound".into(),
+            outgoing,
+            address,
+            nodes[0].0.clone(),
+            confirm_a,
+            Some(nodes[1].0.identity.machine_id.to_string()),
+        ));
+        let task_b = tokio::spawn(run_session(
+            "inbound".into(),
+            incoming,
+            client_addr,
+            nodes[1].0.clone(),
+            confirm_b,
+            None,
+        ));
+        for (index, (deps, rx, path)) in nodes.iter_mut().enumerate() {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match rx.recv().await.unwrap() {
+                        Event::PairingCompleted { peer } => {
+                            assert!(!(fail_save && index == 0));
+                            // Reload immediately when the completion is observed,
+                            // without waiting for the session task to finish.
+                            let disk = TrustedPeerStore::load(path).unwrap();
+                            assert_eq!(
+                                disk.get(&peer.machine_id).unwrap().public_key_hex,
+                                peer.public_key_hex
+                            );
+                            break;
+                        }
+                        Event::PairingFailed { reason, .. } => {
+                            assert!(fail_save && index == 0, "{reason}");
+                            assert!(reason.contains("persisting trusted-peers.json"));
+                            assert!(deps.trust.lock().await.list().is_empty());
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(task_a.await.unwrap().is_err(), fail_save);
+        task_b.await.unwrap().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pairing_persists_before_announcing_completion() {
+        check_pairing_persistence(false).await;
+    }
+
+    #[tokio::test]
+    async fn pairing_save_failure_never_announces_completion_or_establishes_trust() {
+        check_pairing_persistence(true).await;
+    }
 }

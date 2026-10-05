@@ -9,8 +9,9 @@ Two ways to install Synbad:
 1. **Prebuilt installers** from the [GitHub Releases page][releases] —
    `.deb` / `.AppImage` for Linux, `.dmg` for macOS, `.msi` for Windows.
    These are produced by [`.github/workflows/release.yml`](../.github/workflows/release.yml)
-   and wire up autostart the same way the scripts below do. **Unsigned**
-   for now: Gatekeeper / SmartScreen will warn on first launch.
+   and wire up autostart the same way the scripts below do. Tagged macOS
+   releases use Developer ID signing when configured and stable ad-hoc signing
+   otherwise; Windows installers remain unsigned.
 2. **From-source scripts** in this directory — useful for dev installs and
    for distros where the prebuilt artifacts don't fit. Each script is
    idempotent; re-run it to upgrade an existing install in place.
@@ -26,6 +27,13 @@ the install scripts:
 [`linux/synbad.desktop`](linux/synbad.desktop),
 [`macos/Info.plist`](macos/Info.plist),
 [`windows/synbad.wxs`](windows/synbad.wxs).
+
+macOS builds bundle native arm64 or Intel Deskflow helpers with Synbad's
+teardown patch. Apple Silicon hardware selects the arm64 release even if
+the previous Synbad process is running under Rosetta. Updates replace the
+complete signed app. See [macOS build and signing](macos/README.md) for
+dependencies and required release secrets, and [Core provenance](deskflow/README.md)
+for the pinned source and corresponding source archives.
 
 [releases]: https://github.com/krazyjakee/Synbad/releases
 

@@ -92,8 +92,11 @@ each machine's role.
    log tail shows the Core's connect messages.
 
 A client that can't reach its server shows *Reconnecting* and keeps
-retrying (every 10 s at most) until the server comes back — no restart
-needed. **Stop** turns sharing off and is remembered across restarts until
+retrying until the server comes back. A Core that stays alive without
+connecting is terminated after 30 seconds. After five consecutive failures,
+retries pause for 60 seconds, doubling to a five-minute cap; **Start** or
+**Restart** gives it a fresh retry budget. **Stop** turns sharing off and is
+remembered across restarts until
 you click **Start** again.
 
 ## Troubleshooting
@@ -103,12 +106,19 @@ you click **Start** again.
 | Peer doesn't appear in the discovered list | mDNS blocked on the LAN, or both machines on different VLANs / VPNs | Add the peer manually via *Add peer* in the GUI |
 | Pairing fails with "session timed out" | Firewall is blocking TCP/24850 (default service port) | Open the port, or set a different `service_port` in `~/.config/synbad/config.toml` |
 | Pairing fails with "user declined" | One side hit Decline (often: code mismatch) | Try again from a known-trusted network |
-| Core crashes immediately on Start | Missing runtime libraries (Qt6 on Linux, etc) | `journalctl --user -u synbadd -f` on Linux; `/tmp/synbadd.err.log` on macOS |
+| Core crashes immediately on Start | Runtime or Core startup failure | GUI log tail; persistent `core.log` and `daemon.log` in Synbad's local data directory |
 | Configs out of sync between peers | A peer is offline or the firewall is blocking TCP/24851 (sync port) | Wait for the peer to come back; sync resumes automatically |
 | Want to forget a paired peer | Revoke trust in the GUI (or remove `~/.config/synbad/trusted-peers.json` to forget all) | After revoking, the peer must re-pair |
 | Want to rotate this machine's identity | Stop `synbadd`, delete `~/.config/synbad/identity/`, restart | Every peer must re-pair with you afterward |
 
 ## Files Synbad reads/writes
+
+`core.log` captures both Core output streams, and `daemon.log` records
+watchdog, exit and retry decisions. Each log is capped at 2 MiB with three
+backups (`.1`–`.3`), for at most 8 MiB per log. A GUI-launched daemon also
+has a capped `synbadd.log`. Logs live under `~/.local/share/synbad/` on
+Linux, `~/Library/Application Support/dev.synbad.synbad/` on macOS,
+or `%LOCALAPPDATA%\synbad\synbad\data\` on Windows (XDG overrides apply).
 
 ```text
 ~/.config/synbad/

@@ -1,0 +1,247 @@
+diff --git a/src/lib/deskflow/App.cpp b/src/lib/deskflow/App.cpp
+index e907b7a..76a42aa 100644
+--- a/src/lib/deskflow/App.cpp
++++ b/src/lib/deskflow/App.cpp
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include "deskflow/App.h"
++#include "net/SocketMultiplexer.h"
+ 
+ #include "DisplayInvalidException.h"
+ #include "arch/Arch.h"
+@@ -263,8 +264,18 @@ void App::handleIpcMessage(const Event &e, void *) {
+ void App::runEventsLoop(void *) {
+   m_events->loop();
+ 
++  // Carbon destroys this thread's event queue on return. Join socket
++  // callbacks while the queue still exists, before stopping Cocoa.
++  if (getSocketMultiplexer() != nullptr) {
++    getSocketMultiplexer()->stop();
++  }
++
+ #if defined(MAC_OS_X_VERSION_10_7)
+ 
++  // Replace the Carbon buffer under EventQueue's mutex while its owning
++  // thread is still alive. Remaining non-socket producers then post into
++  // the simple buffer, never into a queue belonging to a departed thread.
++  m_events->adoptBuffer(nullptr);
+   stopCocoaLoop();
+ 
+ #endif
+diff --git a/src/lib/deskflow/ClientApp.cpp b/src/lib/deskflow/ClientApp.cpp
+index c9f6c03..d60c263 100644
+--- a/src/lib/deskflow/ClientApp.cpp
++++ b/src/lib/deskflow/ClientApp.cpp
+@@ -481,6 +481,14 @@ int ClientApp::mainLoop() {
+ 
+   DAEMON_RUNNING(false);
+ 
++#if defined(MAC_OS_X_VERSION_10_7)
++  // The Cocoa loop stops after the event loop finishes. Join it before
++  // destroying the screen and its Carbon event queue.
++  thread.wait();
++#endif
++  // No socket callback may enqueue into the screen buffer after this.
++  multiplexer.stop();
++
+   // close down
+   LOG((CLOG_DEBUG1 "stopping client"));
+   stopClient();
+diff --git a/src/lib/deskflow/ServerApp.cpp b/src/lib/deskflow/ServerApp.cpp
+index 90c40e2..a62486c 100644
+--- a/src/lib/deskflow/ServerApp.cpp
++++ b/src/lib/deskflow/ServerApp.cpp
+@@ -747,6 +747,14 @@ int ServerApp::mainLoop() {
+ 
+   DAEMON_RUNNING(false);
+ 
++#if defined(MAC_OS_X_VERSION_10_7)
++  // The Cocoa loop stops after the event loop finishes. Join it before
++  // destroying the screen and its Carbon event queue.
++  thread.wait();
++#endif
++  // No socket callback may enqueue into the screen buffer after this.
++  multiplexer.stop();
++
+   // close down
+   LOG((CLOG_DEBUG1 "stopping server"));
+   m_events->removeHandler(
+diff --git a/src/lib/net/SocketMultiplexer.cpp b/src/lib/net/SocketMultiplexer.cpp
+index 384854d..2f05981 100644
+--- a/src/lib/net/SocketMultiplexer.cpp
++++ b/src/lib/net/SocketMultiplexer.cpp
+@@ -54,10 +54,7 @@ SocketMultiplexer::SocketMultiplexer()
+ }
+ 
+ SocketMultiplexer::~SocketMultiplexer() {
+-  m_thread->cancel();
+-  m_thread->unblockPollSocket();
+-  m_thread->wait();
+-  delete m_thread;
++  stop();
+   delete m_jobsReady;
+   delete m_jobListLock;
+   delete m_jobListLockLocked;
+@@ -72,6 +69,35 @@ SocketMultiplexer::~SocketMultiplexer() {
+   }
+ }
+ 
++void SocketMultiplexer::stop() {
++  if (m_thread == nullptr) {
++    return;
++  }
++  m_thread->cancel();
++  m_thread->unblockPollSocket();
++  m_thread->wait();
++  // pollSocket()/job callbacks can unwind on cancellation while owning
++  // these logical locks. The old destructor just deleted them; stop()
++  // must release the departed worker's locks for subsequent socket cleanup.
++  {
++    Lock lock(m_mutex);
++    if (m_jobListLocker != nullptr && *m_jobListLocker == *m_thread) {
++      delete m_jobListLocker;
++      m_jobListLocker = nullptr;
++      *m_jobListLock = false;
++      m_jobListLock->broadcast();
++    }
++    if (m_jobListLockLocker != nullptr && *m_jobListLockLocker == *m_thread) {
++      delete m_jobListLockLocker;
++      m_jobListLockLocker = nullptr;
++      *m_jobListLockLocked = false;
++      m_jobListLockLocked->broadcast();
++    }
++  }
++  delete m_thread;
++  m_thread = nullptr;
++}
++
+ void SocketMultiplexer::addSocket(ISocket *socket, ISocketMultiplexerJob *job) {
+   assert(socket != NULL);
+   assert(job != NULL);
+@@ -79,8 +105,10 @@ void SocketMultiplexer::addSocket(ISocket *socket, ISocketMultiplexerJob *job) {
+   // prevent other threads from locking the job list
+   lockJobListLock();
+ 
+-  // break thread out of poll
+-  m_thread->unblockPollSocket();
++  // Socket cleanup can remove jobs after stop() joined the worker.
++  if (m_thread != nullptr) {
++    m_thread->unblockPollSocket();
++  }
+ 
+   // lock the job list
+   lockJobList();
+@@ -113,8 +141,10 @@ void SocketMultiplexer::removeSocket(ISocket *socket) {
+   // prevent other threads from locking the job list
+   lockJobListLock();
+ 
+-  // break thread out of poll
+-  m_thread->unblockPollSocket();
++  // Socket cleanup can remove jobs after stop() joined the worker.
++  if (m_thread != nullptr) {
++    m_thread->unblockPollSocket();
++  }
+ 
+   // lock the job list
+   lockJobList();
+diff --git a/src/lib/net/SocketMultiplexer.h b/src/lib/net/SocketMultiplexer.h
+index ff1d663..d428466 100644
+--- a/src/lib/net/SocketMultiplexer.h
++++ b/src/lib/net/SocketMultiplexer.h
+@@ -45,6 +45,9 @@ public:
+   //! @name manipulators
+   //@{
+ 
++  // Join the worker before screen/event-buffer teardown. Safe to repeat.
++  void stop();
++
+   void addSocket(ISocket *, ISocketMultiplexerJob *);
+ 
+   void removeSocket(ISocket *);
+diff --git a/src/lib/platform/OSXEventQueueBuffer.cpp b/src/lib/platform/OSXEventQueueBuffer.cpp
+index fb6af3a..bac8537 100644
+--- a/src/lib/platform/OSXEventQueueBuffer.cpp
++++ b/src/lib/platform/OSXEventQueueBuffer.cpp
+@@ -86,6 +86,10 @@ OSXEventQueueBuffer::getEvent(Event &event, UInt32 &dataID) {
+ }
+ 
+ bool OSXEventQueueBuffer::addEvent(UInt32 dataID) {
++  // Events can arrive before the Carbon queue is initialized.
++  if (m_carbonEventQueue == nullptr) {
++    return false;
++  }
+   EventRef event;
+   OSStatus error = CreateEvent(
+       kCFAllocatorDefault, 'Syne', dataID, 0, kEventAttributeNone, &event);
+diff --git a/src/test/unittests/base/CoreTeardownTests.cpp b/src/test/unittests/base/CoreTeardownTests.cpp
+new file mode 100644
+index 0000000..a8ef4b2
+--- /dev/null
++++ b/src/test/unittests/base/CoreTeardownTests.cpp
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include "base/EventQueue.h"
++#include "arch/Arch.h"
++#include "arch/XArch.h"
++#include "net/ISocketMultiplexerJob.h"
++#include "net/SocketMultiplexer.h"
++#include "net/TCPSocket.h"
++#include <gtest/gtest.h>
++#include <memory>
++#include <atomic>
++#include <chrono>
++#include <thread>
++
++TEST(CoreTeardownTests, stopIsIdempotentAndSocketCleanupIsSafe) {
++  EventQueue events;
++  SocketMultiplexer multiplexer;
++  auto socket = std::make_unique<TCPSocket>(&events, &multiplexer);
++  multiplexer.stop();
++  multiplexer.removeSocket(socket.get());
++  socket.reset();
++  multiplexer.stop();
++}
++
++namespace {
++class CancelledSocketJob : public ISocketMultiplexerJob {
++public:
++  explicit CancelledSocketJob(std::atomic<bool> &entered)
++      : m_socket(ARCH->newSocket(IArchNetwork::kINET, IArchNetwork::kDGRAM)),
++        m_entered(entered) {}
++  ~CancelledSocketJob() override { ARCH->closeSocket(m_socket); }
++  ArchSocket getSocket() const override { return m_socket; }
++  bool isReadable() const override { return false; }
++  bool isWritable() const override { return true; }
++  ISocketMultiplexerJob *run(bool, bool, bool) override {
++    m_entered = true;
++    throw XThreadCancel();
++  }
++private:
++  ArchSocket m_socket;
++  std::atomic<bool> &m_entered;
++};
++}
++
++TEST(CoreTeardownTests, cancelledCallbackDoesNotStrandCleanupLocks) {
++  EventQueue events;
++  SocketMultiplexer multiplexer;
++  auto socket = std::make_unique<TCPSocket>(&events, &multiplexer);
++  std::atomic<bool> entered(false);
++  multiplexer.addSocket(socket.get(), new CancelledSocketJob(entered));
++  for (int attempt = 0; attempt < 50 && !entered; ++attempt) {
++    std::this_thread::sleep_for(std::chrono::milliseconds(5));
++  }
++  EXPECT_TRUE(entered);
++  multiplexer.stop();
++  multiplexer.removeSocket(socket.get());
++  socket.reset();
++}
++
++#ifdef __APPLE__
++#include "platform/OSXEventQueueBuffer.h"
++TEST(CoreTeardownTests, uninitializedCarbonQueueRejectsEvents) {
++  OSXEventQueueBuffer buffer(nullptr);
++  EXPECT_FALSE(buffer.addEvent(42));
++}
++#endif

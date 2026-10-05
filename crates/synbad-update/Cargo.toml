@@ -8,6 +8,7 @@ publish.workspace = true
 description = "GitHub release self-updater for the Synbad daemon and GUI."
 
 [dependencies]
+synbad-config = { path = "../synbad-config" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

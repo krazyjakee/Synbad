@@ -42,7 +42,7 @@ jobs:
             # (vs. job-level env) keeps RUSTFLAGS empty on the other runners
             # so we don't churn their rust-cache keys.
             rustflags: "-C link-arg=-fuse-ld=mold"
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             archive: tar.gz
             gui_features: ""
@@ -116,7 +116,7 @@ jobs:
           # opus + pkg-config let audiopus_sys link the system libopus
           # instead of building its bundled copy via cmake, which fails on
           # aarch64-apple-darwin.
-          brew install --quiet librsvg opus pkg-config
+          brew install --quiet librsvg opus pkg-config cmake ninja qt openssl@3
 
       # rust-cache must run *after* RUSTFLAGS is in scope (set at job-env above)
       # so the cache key reflects the flags we'll actually compile with.
@@ -172,6 +172,61 @@ jobs:
           echo "stage=${stage}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
+      - name: Build patched native macOS Core
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          core_arch="${{ matrix.target }}"
+          core_arch="${core_arch%-apple-darwin}"
+          [ "$core_arch" != aarch64 ] || core_arch=arm64
+          bash dist/macos/build-core.sh dist/core-native "$core_arch"
+
+      - name: Generate icons (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash assets/scripts/generate-icons.sh
+
+      - name: Build .app + .dmg (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          SYNBAD_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          REQUIRE_DEVELOPER_ID: ${{ secrets.MACOS_SIGN_IDENTITY != '' }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.stage.outputs.version }}"
+          arch_suffix="${{ matrix.target }}"
+          arch_suffix="${arch_suffix%-apple-darwin}"
+          app="dist/Synbad.app"
+          rm -rf "$app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/synbad-gui" "$app/Contents/MacOS/"
+          cp "target/${{ matrix.target }}/release/synbadd"    "$app/Contents/MacOS/"
+          cp dist/core-native/deskflow-client dist/core-native/deskflow-server "$app/Contents/MacOS/"
+          cp dist/core-native/DESKFLOW-LICENSE "$app/Contents/Resources/"
+          cp dist/core-native/DESKFLOW-LICENSE-EXCEPTION "$app/Contents/Resources/"
+          bash dist/macos/import-signing.sh
+          if [ -z "$SYNBAD_SIGN_IDENTITY" ]; then
+            echo "::notice::Developer ID is not configured; using stable ad-hoc signing identifiers."
+          fi
+          chmod +x "$app/Contents/MacOS/synbad-gui" "$app/Contents/MacOS/synbadd"
+          cp assets/synbad.icns "$app/Contents/Resources/synbad.icns"
+          sed "s/@VERSION@/${version}/g" dist/macos/Info.plist > "$app/Contents/Info.plist"
+          bash dist/macos/sign.sh "$app"
+          cp -R "$app" "dist/${{ steps.stage.outputs.stage }}/Synbad.app"
+          cp "$app/Contents/MacOS/"* "dist/${{ steps.stage.outputs.stage }}/"
+          core_asset="dist/deskflow-core-${version}-${{ matrix.target }}.tar.gz"
+          tar -czf "$core_asset" -C "$app/Contents/MacOS" deskflow-client deskflow-server -C "$(pwd)/dist/core-native" DESKFLOW-LICENSE DESKFLOW-LICENSE-EXCEPTION
+          shasum -a 256 "$core_asset" > "$core_asset.sha256"
+          cp dist/core-native/deskflow-source-*.tar.gz dist/
+          dmg="dist/Synbad-${version}-${arch_suffix}.dmg"
+          # UDZO = compressed; -ov overwrites if the file exists from a retry.
+          # The app and all helpers are signed before either distribution.
+          hdiutil create -volname "Synbad" -srcfolder "$app" -ov -format UDZO "$dmg"
+          shasum -a 256 "$dmg" > "${dmg}.sha256"
+
       - name: Archive (tar.gz)
         if: matrix.archive == 'tar.gz'
         shell: bash
@@ -192,11 +247,6 @@ jobs:
       # --- Native installers ----------------------------------------------
       # Raster + per-platform icons (.ico / .icns) are produced from the SVG
       # master on demand; we don't commit the binary outputs.
-      - name: Generate icons (Linux/macOS)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: bash assets/scripts/generate-icons.sh
-
       - name: Install cargo-deb + AppImage tools (Linux)
         if: runner.os == 'Linux'
         uses: taiki-e/install-action@v2
@@ -260,29 +310,6 @@ jobs:
           ARCH=x86_64 /tmp/appimagetool "$appdir" "$out"
           shasum -a 256 "$out" > "${out}.sha256"
 
-      - name: Build .app + .dmg (macOS)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ steps.stage.outputs.version }}"
-          arch_suffix="${{ matrix.target }}"
-          arch_suffix="${arch_suffix%-apple-darwin}"
-          app="dist/Synbad.app"
-          rm -rf "$app"
-          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-          cp "target/${{ matrix.target }}/release/synbad-gui" "$app/Contents/MacOS/"
-          cp "target/${{ matrix.target }}/release/synbadd"    "$app/Contents/MacOS/"
-          chmod +x "$app/Contents/MacOS/synbad-gui" "$app/Contents/MacOS/synbadd"
-          cp assets/synbad.icns "$app/Contents/Resources/synbad.icns"
-          sed "s/@VERSION@/${version}/g" dist/macos/Info.plist > "$app/Contents/Info.plist"
-          dmg="dist/Synbad-${version}-${arch_suffix}.dmg"
-          # UDZO = compressed; -ov overwrites if the file exists from a retry.
-          # The DMG is unsigned — first launch will require a right-click
-          # "Open" to bypass Gatekeeper until we wire up notarization.
-          hdiutil create -volname "Synbad" -srcfolder "$app" -ov -format UDZO "$dmg"
-          shasum -a 256 "$dmg" > "${dmg}.sha256"
-
       - name: Generate icon (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -330,6 +357,13 @@ jobs:
           $hash = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLower()
           "$hash  $(Split-Path $msi -Leaf)" | Out-File -Encoding ascii "$msi.sha256"
 
+      - name: Remove temporary signing keychain
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          keychain="$RUNNER_TEMP/synbad-signing/signing.keychain-db"
+          [ ! -f "$keychain" ] || security delete-keychain "$keychain"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.stage.outputs.stage }}
@@ -342,6 +376,9 @@ jobs:
             dist/*.AppImage.sha256
             dist/*.dmg
             dist/*.dmg.sha256
+            dist/deskflow-core-*.tar.gz
+            dist/deskflow-core-*.tar.gz.sha256
+            dist/deskflow-source-*.tar.gz
             dist/*.msi
             dist/*.msi.sha256
           # Per-platform globs only resolve on their own runner; `warn` keeps
@@ -376,6 +413,9 @@ jobs:
             artifacts/*.AppImage.sha256
             artifacts/*.dmg
             artifacts/*.dmg.sha256
+            artifacts/deskflow-core-*.tar.gz
+            artifacts/deskflow-core-*.tar.gz.sha256
+            artifacts/deskflow-source-*.tar.gz
             artifacts/*.msi
             artifacts/*.msi.sha256
           generate_release_notes: true
