@@ -7,6 +7,8 @@ destruction, replaces the Carbon buffer before its owning thread exits,
 makes worker shutdown idempotent, and rejects events before
 the Carbon queue is initialized. Socket removal remains safe after shutdown,
 including cancellation while a callback holds the worker's cleanup locks.
+The patch also disables forced Ninja response files on macOS, where Apple's
+archiver does not accept that Windows-oriented upstream workaround.
 
 `dist/macos/build-core.sh` builds native arm64 or x86_64 split executables.
 The Core and its GPL license ship beside the daemon; the release also includes

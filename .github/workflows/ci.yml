@@ -42,6 +42,16 @@ jobs:
         env:
           SYNBAD_CORE_TESTS: "ON"
         run: bash dist/macos/build-core.sh core-test '${{ matrix.arch }}'
+      - name: Verify stable signing of native helpers and app
+        run: |
+          app="core-sign-test/Synbad.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp core-test/deskflow-client core-test/deskflow-server "$app/Contents/MacOS/"
+          # Reuse native Mach-O fixtures to test all four signing identities.
+          cp core-test/deskflow-client "$app/Contents/MacOS/synbad-gui"
+          cp core-test/deskflow-server "$app/Contents/MacOS/synbadd"
+          sed 's/@VERSION@/0.0.0/g' dist/macos/Info.plist > "$app/Contents/Info.plist"
+          bash dist/macos/sign.sh "$app"
 
   fmt:
     name: rustfmt

@@ -1,3 +1,25 @@
+diff --git a/cmake/Definitions.cmake b/cmake/Definitions.cmake
+index b9e918e..94308c9 100644
+--- a/cmake/Definitions.cmake
++++ b/cmake/Definitions.cmake
+@@ -175,6 +175,9 @@ macro(configure_bin_names)
+ endmacro()
+ 
+ macro(configure_ninja)
++  # Apple's ar does not accept @response files. Keep the Windows-oriented
++  # workaround away from native macOS builds.
++  if(NOT APPLE)
+   # use response files so that ninja can compile on windows, otherwise you get
+   # an error when linking qt: "The input line is too long."
+   set(CMAKE_C_USE_RESPONSE_FILE_FOR_OBJECTS 1)
+@@ -184,6 +187,7 @@ macro(configure_ninja)
+   set(CMAKE_NINJA_FORCE_RESPONSE_FILE
+       1
+       CACHE INTERNAL "")
++  endif()
+ endmacro()
+ 
+ macro(configure_options)
 diff --git a/src/lib/deskflow/App.cpp b/src/lib/deskflow/App.cpp
 index e907b7a..76a42aa 100644
 --- a/src/lib/deskflow/App.cpp
