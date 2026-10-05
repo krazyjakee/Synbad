@@ -413,9 +413,6 @@ jobs:
             artifacts/*.AppImage.sha256
             artifacts/*.dmg
             artifacts/*.dmg.sha256
-            artifacts/deskflow-core-*.tar.gz
-            artifacts/deskflow-core-*.tar.gz.sha256
-            artifacts/deskflow-source-*.tar.gz
             artifacts/*.msi
             artifacts/*.msi.sha256
           generate_release_notes: true

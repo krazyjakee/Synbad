@@ -22,8 +22,8 @@ cmake -S "$work/source" -B "$work/build" -G Ninja \
   -DBUILD_GUI=OFF -DBUILD_INSTALLER=OFF -DBUILD_TESTS="${SYNBAD_CORE_TESTS:-OFF}"
 cmake --build "$work/build" --target deskflow-server deskflow-client --parallel 3
 if [ "${SYNBAD_CORE_TESTS:-OFF}" = ON ]; then
-  cmake --build "$work/build" --target unittests --parallel 3
-  "$work/build/bin/unittests" --gtest_filter='CoreTeardownTests.*'
+  cmake --build "$work/build" --target core-teardown-tests --parallel 3
+  "$work/build/bin/core-teardown-tests"
 fi
 for name in deskflow-server deskflow-client; do
   cp "$work/build/bin/$name" "$out/$name"

@@ -211,6 +211,24 @@ index c8c0a42..ba4dade 100644
  
  int getSecureInputEventPID();
  String getProcessName(int pid);
+diff --git a/src/test/unittests/CMakeLists.txt b/src/test/unittests/CMakeLists.txt
+index 5adc2ee..08b80c7 100644
+--- a/src/test/unittests/CMakeLists.txt
++++ b/src/test/unittests/CMakeLists.txt
+@@ -18,3 +18,13 @@ config_test()
+ set(target ${UNIT_TESTS_BIN})
+ add_executable(${target} ${sources})
+ target_link_libraries(${target} ${test_libs})
++
++# Synbad runs the Core lifecycle checks independently of the upstream GUI
++# and mock tests, so current GoogleMock changes cannot mask teardown failures.
++add_executable(core-teardown-tests
++  main.cpp
++  base/CoreTeardownTests.cpp
++  ${shared_sources})
++set(core_test_libs ${test_libs})
++list(REMOVE_ITEM core_test_libs gui ${GMOCK_LIB})
++target_link_libraries(core-teardown-tests ${core_test_libs})
 diff --git a/src/test/unittests/base/CoreTeardownTests.cpp b/src/test/unittests/base/CoreTeardownTests.cpp
 new file mode 100644
 index 0000000..a8ef4b2
