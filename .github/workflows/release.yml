@@ -219,7 +219,9 @@ jobs:
           bash dist/macos/sign.sh "$app"
           cp -R "$app" "dist/${{ steps.stage.outputs.stage }}/Synbad.app"
           cp "$app/Contents/MacOS/"* "dist/${{ steps.stage.outputs.stage }}/"
-          core_asset="dist/deskflow-core-${version}-${{ matrix.target }}.tar.gz"
+          # Old updaters match any archive containing the Rust target triple.
+          # Core archives must use a different name so they select Synbad.
+          core_asset="dist/deskflow-core-${version}-macos-${arch_suffix}.tar.gz"
           tar -czf "$core_asset" -C "$app/Contents/MacOS" deskflow-client deskflow-server -C "$(pwd)/dist/core-native" DESKFLOW-LICENSE DESKFLOW-LICENSE-EXCEPTION
           shasum -a 256 "$core_asset" > "$core_asset.sha256"
           cp dist/core-native/deskflow-source-*.tar.gz dist/
@@ -245,6 +247,10 @@ jobs:
           Compress-Archive -Path "${{ steps.stage.outputs.stage }}" -DestinationPath "${{ steps.stage.outputs.stage }}.zip"
           (Get-FileHash "${{ steps.stage.outputs.stage }}.zip" -Algorithm SHA256).Hash + "  ${{ steps.stage.outputs.stage }}.zip" `
             | Out-File -Encoding ascii "${{ steps.stage.outputs.stage }}.zip.sha256"
+
+      - name: Verify macOS update compatibility
+        if: runner.os == 'macOS'
+        run: python3 dist/macos/verify-update.py dist '${{ steps.stage.outputs.version }}' '${{ matrix.target }}'
 
       # --- Native installers ----------------------------------------------
       # Raster + per-platform icons (.ico / .icns) are produced from the SVG

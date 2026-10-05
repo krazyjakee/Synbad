@@ -4513,7 +4513,7 @@ dependencies = [
 
 [[package]]
 name = "synbad-audio"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4538,7 +4538,7 @@ dependencies = [
 
 [[package]]
 name = "synbad-config"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "directories",
  "serde",
@@ -4548,7 +4548,7 @@ dependencies = [
 
 [[package]]
 name = "synbad-crypto"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -4566,7 +4566,7 @@ dependencies = [
 
 [[package]]
 name = "synbad-discovery"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "ed25519-dalek",
  "hex",
@@ -4585,7 +4585,7 @@ dependencies = [
 
 [[package]]
 name = "synbad-gui"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -4607,7 +4607,7 @@ dependencies = [
 
 [[package]]
 name = "synbad-ipc"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "directories",
  "interprocess",
@@ -4622,7 +4622,7 @@ dependencies = [
 
 [[package]]
 name = "synbad-sync"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -4641,7 +4641,7 @@ dependencies = [
 
 [[package]]
 name = "synbad-update"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "flate2",
@@ -4657,7 +4657,7 @@ dependencies = [
 
 [[package]]
 name = "synbadd"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "anyhow",
  "ar",

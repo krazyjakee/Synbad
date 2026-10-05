@@ -179,7 +179,7 @@ pub fn check(current_version: &str) -> Result<CheckResult> {
         .ok_or_else(|| anyhow!("no published (non-draft) releases with a semver tag found"))?;
 
     let target = host_target()?;
-    let asset = pick_asset(&release.assets, target).ok_or_else(|| {
+    let asset = pick_asset(&release.assets, &release.tag_name, target).ok_or_else(|| {
         anyhow!(
             "no release asset matches host target `{target}` in release {}",
             release.tag_name
@@ -665,27 +665,22 @@ fn host_target() -> Result<&'static str> {
     }
 }
 
-/// Choose the asset whose name embeds `target` and whose extension matches
-/// what the extractor knows how to handle on this platform. `.tar.gz` and
+/// Choose the complete Synbad archive for this release and target. Matching
+/// only the target also selects Deskflow-only archives, which contain neither
+/// Synbad executable. Asset ordering from GitHub must not affect selection.
+/// The extension matches what the extractor knows how to handle. `.tar.gz` and
 /// `.tgz` are accepted on Unix; `.zip` on Windows. Auxiliary artifacts
 /// (.deb, .AppImage, .dmg, .msi, .sha256) are ignored — those are for
 /// fresh installs, not in-place self-updates.
-fn pick_asset<'a>(assets: &'a [GhAsset], target: &str) -> Option<&'a GhAsset> {
-    let prefer_zip = cfg!(windows);
-    assets.iter().find(|a| {
-        if !a.name.contains(target) {
-            return false;
-        }
-        let lname = a.name.to_ascii_lowercase();
-        if lname.ends_with(".sha256") {
-            return false;
-        }
-        if prefer_zip {
-            lname.ends_with(".zip")
-        } else {
-            lname.ends_with(".tar.gz") || lname.ends_with(".tgz")
-        }
-    })
+fn pick_asset<'a>(assets: &'a [GhAsset], tag: &str, target: &str) -> Option<&'a GhAsset> {
+    let version = tag.trim().trim_start_matches('v');
+    let base = format!("synbad-{version}-{target}");
+    let prefer_zip = target.ends_with("-pc-windows-msvc");
+    let expected = format!("{base}.{}", if prefer_zip { "zip" } else { "tar.gz" });
+    let alternate = format!("{base}.tgz");
+    assets
+        .iter()
+        .find(|a| a.name == expected || (!prefer_zip && a.name == alternate))
 }
 
 /// Make a fresh per-process temp directory under the system tempdir. Avoids
@@ -793,7 +788,7 @@ mod tests {
         } else {
             "x86_64-unknown-linux-gnu"
         };
-        let pick = pick_asset(&assets, triple).expect("asset");
+        let pick = pick_asset(&assets, "v0.2.0", triple).expect("asset");
         assert!(pick.name.contains(triple));
     }
 
@@ -817,8 +812,40 @@ mod tests {
         } else {
             "x86_64-unknown-linux-gnu"
         };
-        let pick = pick_asset(&assets, triple).expect("asset");
+        let pick = pick_asset(&assets, "v0.2.0", triple).expect("asset");
         assert_eq!(pick.browser_download_url, "tar");
+    }
+
+    #[test]
+    fn mac_update_selects_complete_app_regardless_of_asset_order() {
+        for target in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+            let mut assets = [
+                format!("deskflow-core-0.1.12-{target}.tar.gz"),
+                format!("synbad-0.1.12-{target}.tar.gz.sha256"),
+                format!("synbad-0.1.11-{target}.tar.gz"),
+                format!("synbad-0.1.12-{target}-source.tar.gz"),
+                format!("synbad-0.1.12-{target}.tar.gz"),
+            ]
+            .into_iter()
+            .map(|name| GhAsset {
+                browser_download_url: name.clone(),
+                name,
+                size: 1,
+            })
+            .collect::<Vec<_>>();
+            let expected = format!("synbad-0.1.12-{target}.tar.gz");
+            assert_eq!(
+                pick_asset(&assets, "v0.1.12", target).unwrap().name,
+                expected
+            );
+            assets.reverse();
+            assert_eq!(
+                pick_asset(&assets, "0.1.12", target).unwrap().name,
+                expected
+            );
+            assets.remove(0);
+            assert!(pick_asset(&assets, "v0.1.12", target).is_none());
+        }
     }
 
     #[test]

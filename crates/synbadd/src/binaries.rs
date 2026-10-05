@@ -312,7 +312,10 @@ impl Resolver {
         if let Some(core) = resolve(&dir) {
             return Ok(core);
         }
-        let asset = format!("deskflow-core-{version}-{arch}-apple-darwin.tar.gz");
+        // Older Synbad updaters match any archive containing the Rust target
+        // triple. Keep the Core-only archive out of that match so those
+        // clients can still upgrade to a complete Synbad release.
+        let asset = format!("deskflow-core-{version}-macos-{arch}.tar.gz");
         let url =
             format!("https://github.com/krazyjakee/Synbad/releases/download/v{version}/{asset}");
         let _ = progress
