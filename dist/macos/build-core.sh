@@ -16,7 +16,7 @@ git -C "$work/source" apply "$repo/dist/deskflow/teardown.patch"
 cmake -S "$work/source" -B "$work/build" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="$arch" \
   -DCMAKE_OSX_SYSROOT="$(xcrun --show-sdk-path)" \
-  -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
   -DCMAKE_PREFIX_PATH="$(brew --prefix qt)" \
   -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
   -DBUILD_GUI=OFF -DBUILD_INSTALLER=OFF -DBUILD_TESTS="${SYNBAD_CORE_TESTS:-OFF}"

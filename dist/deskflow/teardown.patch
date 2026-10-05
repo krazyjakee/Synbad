@@ -196,6 +196,21 @@ index fb6af3a..bac8537 100644
    EventRef event;
    OSStatus error = CreateEvent(
        kCFAllocatorDefault, 'Syne', dataID, 0, kEventAttributeNone, &event);
+diff --git a/src/lib/platform/OSXScreen.mm b/src/lib/platform/OSXScreen.mm
+index c8c0a42..ba4dade 100644
+--- a/src/lib/platform/OSXScreen.mm
++++ b/src/lib/platform/OSXScreen.mm
+@@ -66,9 +66,7 @@ enum {
+ 	kDeskflowMouseScrollAxisY = 'saxy'
+ };
+ 
+-enum {
+-	kCarbonLoopWaitTimeout = 10
+-};
++constexpr double kCarbonLoopWaitTimeout = 10.0;
+ 
+ int getSecureInputEventPID();
+ String getProcessName(int pid);
 diff --git a/src/test/unittests/base/CoreTeardownTests.cpp b/src/test/unittests/base/CoreTeardownTests.cpp
 new file mode 100644
 index 0000000..a8ef4b2

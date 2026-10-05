@@ -1,6 +1,6 @@
 # macOS builds and signing
 
-The source installer builds Synbad and the patched Deskflow Core natively,
+macOS 12 or newer is required. The source installer builds Synbad and the patched Deskflow Core natively,
 including when launched from a Rosetta terminal. Install Xcode command-line
 tools, Rust/rustup, and native Homebrew dependencies first:
 
