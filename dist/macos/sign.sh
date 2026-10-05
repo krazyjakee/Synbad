@@ -12,8 +12,10 @@ if [ "${REQUIRE_DEVELOPER_ID:-false}" = true ]; then
 fi
 flags=(--force --sign "$identity")
 if [ "$identity" != - ]; then flags+=(--options runtime --timestamp); fi
-for item in 'synbadd:dev.synbad.synbadd' 'synbad-gui:dev.synbad.synbad' \
-            'deskflow-client:dev.synbad.deskflow.client' 'deskflow-server:dev.synbad.deskflow.server'; do
+# codesign recognizes the bundle when given its main executable. Intel
+# linker outputs are unsigned, so sign every helper before that executable.
+for item in 'deskflow-client:dev.synbad.deskflow.client' 'deskflow-server:dev.synbad.deskflow.server' \
+            'synbadd:dev.synbad.synbadd' 'synbad-gui:dev.synbad.synbad'; do
   case "${item%%:*}" in
     synbadd|synbad-gui)
       codesign "${flags[@]}" --entitlements "$sign_dir/audio-input.entitlements" --identifier "${item#*:}" "$app/Contents/MacOS/${item%%:*}"
