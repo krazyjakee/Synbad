@@ -5,6 +5,24 @@ repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"/../.. && pwd)"
 out="${1:?output directory required}"
 arch="${2:?arm64 or x86_64 required}"
 case "$arch" in arm64|x86_64) ;; *) exit 2 ;; esac
+# Deskflow 1.17's Carbon input queue stalls when linked against the Tahoe
+# SDK, including on older deployment targets. Select the SDK explicitly;
+# changing CMAKE_OSX_DEPLOYMENT_TARGET alone does not avoid the regression.
+# https://github.com/input-leap/input-leap/issues/2367
+require_compatible_sdk() {
+  case "$1" in
+    12.*|13.*|14.*|15.*) ;;
+    *)
+      echo "Deskflow Core requires a macOS 12–15 SDK; SDK '$1' is unsupported for this build." >&2
+      echo "Select Xcode 16.4 with DEVELOPER_DIR, or set SYNBAD_CORE_SDK_PATH to a macOS 15 SDK." >&2
+      exit 1
+      ;;
+  esac
+}
+core_sdk="${SYNBAD_CORE_SDK_PATH:-$(xcrun --show-sdk-path)}"
+core_sdk_version="$(xcrun --sdk "$core_sdk" --show-sdk-version)"
+require_compatible_sdk "$core_sdk_version"
+echo "Building native $arch Core with macOS SDK $core_sdk_version ($core_sdk)"
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
 work="$(mktemp -d)"
@@ -15,7 +33,7 @@ git -C "$work/source" apply --check "$repo/dist/deskflow/teardown.patch"
 git -C "$work/source" apply "$repo/dist/deskflow/teardown.patch"
 cmake -S "$work/source" -B "$work/build" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="$arch" \
-  -DCMAKE_OSX_SYSROOT="$(xcrun --show-sdk-path)" \
+  -DCMAKE_OSX_SYSROOT="$core_sdk" \
   -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
   -DCMAKE_PREFIX_PATH="$(brew --prefix qt)" \
   -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)" \
@@ -28,6 +46,11 @@ fi
 for name in deskflow-server deskflow-client; do
   cp "$work/build/bin/$name" "$out/$name"
   lipo "$out/$name" -verify_arch "$arch"
+  # Verify the linked executable, since its SDK stamp controls runtime
+  # compatibility behavior even on macOS 26. Fail before packaging a bad Core.
+  built_sdk="$(xcrun vtool -show-build "$out/$name" | awk '$1 == "sdk" {print $2}')"
+  require_compatible_sdk "$built_sdk"
+  echo "$name linked against macOS SDK $built_sdk"
   # A release must work on machines without Homebrew; the Core's OpenSSL
   # is static and all remaining dependencies must be Apple system libraries.
   if otool -L "$out/$name" | tail -n +2 | awk '{print $1}' | grep -Ev '^(/System/Library/|/usr/lib/)' ; then

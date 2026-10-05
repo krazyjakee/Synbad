@@ -48,7 +48,7 @@ jobs:
             gui_features: ""
             daemon_features: ""
             rustflags: ""
-          - os: macos-latest
+          - os: macos-15
             target: aarch64-apple-darwin
             archive: tar.gz
             gui_features: ""
@@ -175,6 +175,8 @@ jobs:
       - name: Build patched native macOS Core
         if: runner.os == 'macOS'
         shell: bash
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
         run: |
           core_arch="${{ matrix.target }}"
           core_arch="${core_arch%-apple-darwin}"

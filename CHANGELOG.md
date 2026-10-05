@@ -10,6 +10,15 @@ All notable changes to Synbad land here. Format follows
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-10-05
+
+### Fixed
+- macOS Core builds use Xcode 16.4 / SDK 15.5 on both native architectures.
+  The macOS 26 SDK introduced multi-second mouse and keyboard dispatch lag
+  in the pinned Deskflow Core, despite its older deployment target.
+  Source builds reject incompatible SDKs before replacing an app, and
+  packaging verifies the SDK stamp in each linked Core executable.
+
 ## [0.1.11] - 2026-10-05
 
 ### Fixed

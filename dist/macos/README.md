@@ -9,6 +9,21 @@ brew install cmake ninja qt openssl@3 opus pkg-config librsvg
 bash dist/macos/install.sh
 ```
 
+The pinned Deskflow 1.17 Core must be linked with a macOS 12–15 SDK.
+Building it with the macOS 26 SDK causes multi-second mouse and keyboard
+lag, even when the deployment target remains 12.0
+([upstream report](https://github.com/input-leap/input-leap/issues/2367)).
+CI and releases select Xcode 16.4 / SDK 15.5 for both native architectures,
+and verify the SDK stamp in each linked executable before packaging.
+For source installs with a newer default Xcode, select the compatible tools:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer bash dist/macos/install.sh
+```
+
+Alternatively, set `SYNBAD_CORE_SDK_PATH` to an installed macOS 15 SDK.
+An incompatible SDK stops the build before any app is replaced.
+
 For local installs, `sign.sh` defaults to ad-hoc signing with fixed
 identifiers. To use a certificate already in the keychain, set
 `SYNBAD_SIGN_IDENTITY` to its Developer ID Application identity before

@@ -11,6 +11,10 @@ The patch also disables forced Ninja response files on macOS, where Apple's
 archiver does not accept that Windows-oriented upstream workaround.
 The Carbon-loop timeout uses a numeric constant compatible with current
 Clang's C++20 checks. The macOS deployment target is upstream's 12.0 baseline.
+Core builds select Xcode 16.4 / macOS SDK 15.5 and verify the SDK stamp in
+both executables. The older deployment target alone does not prevent the
+macOS 26 SDK's Carbon input-dispatch regression
+([upstream report](https://github.com/input-leap/input-leap/issues/2367)).
 
 `dist/macos/build-core.sh` builds native arm64 or x86_64 split executables.
 The Core and its GPL license ship beside the daemon; the release also includes
